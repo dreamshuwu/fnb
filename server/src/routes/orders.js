@@ -1,6 +1,6 @@
 import { Router } from 'express';
-import { Models } from '../models.js';
-import { authenticate, rbac, tenant, isSupervisor } from '../middleware/auth.js';
+import { query, getRow, insert, toOrder, toStore, toPayment, stringifyJSON, parseJSON } from '../db.js';
+import { authenticate, rbac, tenant } from '../middleware/auth.js';
 import { createOrderSchema, orderItemSchema, checkoutSchema, voidSchema } from '../validators.js';
 import { emitToStore } from '../sockets.js';
 
@@ -20,70 +20,83 @@ function orderNo() {
   return `T${ymd}-${rand}`;
 }
 
+async function getOrder(id, orgId, storeId) {
+  const r = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [id, orgId, storeId]);
+  return r ? toOrder(r) : null;
+}
+
 router.post('/', async (req, res) => {
   const p = createOrderSchema.parse(req.body);
-  const store = await Models.Store.findById(req.user.storeId);
+  const { orgId, storeId } = tenant(req);
+  const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
+  const taxRate = Number(store?.tax_rate || 0);
   const items = p.items.map((i) => ({ ...i, status: 'pending' }));
-  const { subtotal, tax, total } = computeTotals(items, store.taxRate);
-  const order = await Models.Order.create({
-    ...tenant(req),
-    orderNo: orderNo(),
-    type: p.type,
-    tableId: p.tableId,
-    customerName: p.customerName,
-    phone: p.phone,
-    items,
-    subtotal,
-    tax,
-    total,
-    discount: 0,
-    createdBy: req.user._id,
-  });
+  const { subtotal, tax, total } = computeTotals(items, taxRate);
+  const id = await insert(
+    `INSERT INTO orders
+      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, tax, total, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      orgId, storeId, orderNo(), p.type, p.tableId ? Number(p.tableId) : null,
+      p.customerName ?? null, p.phone ?? null, stringifyJSON(items),
+      subtotal, tax, total, req.user.id,
+    ]
+  );
   if (p.type === 'dine_in' && p.tableId) {
-    await Models.Table.updateOne(
-      { _id: p.tableId, ...tenant(req) },
-      { status: 'occupied', currentOrderId: order._id }
+    await query(
+      'UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?',
+      ['occupied', id, Number(p.tableId), orgId, storeId]
     );
   }
-  res.status(201).json(order);
+  res.status(201).json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [id])));
 });
 
 router.get('/', async (req, res) => {
-  const f = tenant(req);
-  if (req.query.status) f.status = req.query.status;
-  if (req.query.type) f.type = req.query.type;
-  const list = await Models.Order.find(f).sort('-createdAt').lean();
-  res.json(list);
+  const { orgId, storeId } = tenant(req);
+  const params = [orgId, storeId];
+  let sql = 'SELECT * FROM orders WHERE org_id=? AND store_id=?';
+  if (req.query.status) { sql += ' AND status=?'; params.push(req.query.status); }
+  if (req.query.type) { sql += ' AND type=?'; params.push(req.query.type); }
+  sql += ' ORDER BY created_at DESC';
+  const list = await query(sql, params);
+  res.json(list.map(toOrder));
 });
 
 router.get('/:id', async (req, res) => {
-  const o = await Models.Order.findOne({ _id: req.params.id, ...tenant(req) }).lean();
+  const { orgId, storeId } = tenant(req);
+  const o = await getOrder(req.params.id, orgId, storeId);
   if (!o) return res.status(404).json({ error: 'not found' });
   res.json(o);
 });
 
 router.post('/:id/items', async (req, res) => {
   const p = orderItemSchema.parse(req.body);
-  const order = await Models.Order.findOne({ _id: req.params.id, ...tenant(req) });
-  if (!order) return res.status(404).json({ error: 'not found' });
-  if (order.status !== 'open') return res.status(400).json({ error: 'order not open' });
-  order.items.push({ ...p, status: 'pending' });
-  const store = await Models.Store.findById(req.user.storeId);
-  Object.assign(order, computeTotals(order.items, store.taxRate));
-  await order.save();
-  res.json(order);
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.status !== 'open') return res.status(400).json({ error: 'order not open' });
+  const items = parseJSON(row.items);
+  items.push({ ...p, status: 'pending' });
+  const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
+  const totals = computeTotals(items, Number(store?.tax_rate || 0));
+  await query(
+    'UPDATE orders SET items=?, subtotal=?, tax=?, total=? WHERE id=?',
+    [stringifyJSON(items), totals.subtotal, totals.tax, totals.total, row.id]
+  );
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
 router.put('/:id/status', async (req, res) => {
   const { status } = req.body || {};
-  const order = await Models.Order.findOne({ _id: req.params.id, ...tenant(req) });
-  if (!order) return res.status(404).json({ error: 'not found' });
-  if (status === 'kitchen' && order.status === 'open') {
-    order.status = 'kitchen';
-    await order.save();
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (status === 'kitchen' && row.status === 'open') {
+    await query('UPDATE orders SET status=? WHERE id=?', ['kitchen', row.id]);
     const io = req.app.get('io');
-    emitToStore(io, req.user.storeId, 'order:created', order);
-    emitToStore(io, req.user.storeId, 'kds:ticket', order);
+    const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+    emitToStore(io, storeId, 'order:created', order);
+    emitToStore(io, storeId, 'kds:ticket', order);
     return res.json(order);
   }
   return res.status(400).json({ error: 'invalid transition' });
@@ -92,107 +105,93 @@ router.put('/:id/status', async (req, res) => {
 async function deductInventory(order, user, io) {
   const low = [];
   for (const it of order.items) {
-    const mi = await Models.MenuItem.findById(it.itemId);
-    if (!mi || !mi.trackInventory || !mi.inventoryItemId) continue;
-    const inv = await Models.InventoryItem.findById(mi.inventoryItemId);
+    const mi = await getRow('SELECT * FROM menu_items WHERE id=?', [Number(it.itemId)]);
+    if (!mi || !mi.track_inventory || !mi.inventory_item_id) continue;
+    const inv = await getRow('SELECT * FROM inventory_items WHERE id=?', [mi.inventory_item_id]);
     if (!inv) continue;
-    const before = inv.quantity;
+    const before = Number(inv.quantity || 0);
     const after = Math.max(0, before - it.qty);
-    inv.quantity = after;
-    await inv.save();
-    await Models.StockMovement.create({
-      ...tenant({ user }),
-      itemId: inv._id,
-      type: 'sale',
-      delta: -it.qty,
-      before,
-      after,
-      refOrderId: order._id,
-      createdBy: user._id,
-    });
-    if (after < inv.threshold) low.push({ itemId: String(inv._id), name: inv.name, quantity: after });
+    await query('UPDATE inventory_items SET quantity=? WHERE id=?', [after, inv.id]);
+    await insert(
+      `INSERT INTO stock_movements (org_id, store_id, item_id, type, delta, before, after, ref_order_id, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [user.orgId, user.storeId, inv.id, 'sale', -it.qty, before, after, order.id, user.id]
+    );
+    if (after < Number(inv.threshold || 0)) low.push({ itemId: String(inv.id), name: inv.name, quantity: after });
   }
   if (low.length) emitToStore(io, user.storeId, 'inventory:low', low);
 }
 
-async function buildReceipt(order) {
-  const store = await Models.Store.findById(order.storeId);
-  const payments = await Models.Payment.find({ orderId: order._id });
-  return {
-    storeName: store.name,
-    orderNo: order.orderNo,
-    items: order.items,
-    subtotal: order.subtotal,
-    tax: order.tax,
-    total: order.total,
-    payments,
-    createdAt: order.createdAt,
-  };
-}
-
 router.post('/:id/checkout', async (req, res) => {
   const p = checkoutSchema.parse(req.body);
-  const order = await Models.Order.findOne({ _id: req.params.id, ...tenant(req) });
-  if (!order) return res.status(404).json({ error: 'not found' });
-  if (order.status === 'paid' || order.status === 'void') return res.status(400).json({ error: 'already closed' });
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.status === 'paid' || row.status === 'void') return res.status(400).json({ error: 'already closed' });
   const paidSum = p.payments.reduce((s, x) => s + x.amount, 0);
-  if (paidSum + (p.tip || 0) < order.total) return res.status(400).json({ error: 'amount not covered' });
+  if (paidSum + (p.tip || 0) < Number(row.total || 0)) return res.status(400).json({ error: 'amount not covered' });
   for (const pm of p.payments) {
-    await Models.Payment.create({
-      ...tenant(req),
-      orderId: order._id,
-      method: pm.method,
-      amount: pm.amount,
-      tip: 0,
-      createdBy: req.user._id,
-    });
-  }
-  order.status = 'paid';
-  await order.save();
-  const io = req.app.get('io');
-  await deductInventory(order, req.user, io);
-  emitToStore(io, req.user.storeId, 'order:closed', String(order._id));
-  if (order.tableId) {
-    await Models.Table.updateOne(
-      { _id: order.tableId, ...tenant(req) },
-      { status: 'needs_clean', currentOrderId: null }
+    await insert(
+      `INSERT INTO payments (org_id, store_id, order_id, method, amount, tip, created_by)
+       VALUES (?,?,?,?,?,?,?)`,
+      [orgId, storeId, row.id, pm.method, pm.amount, 0, req.user.id]
     );
   }
-  const receipt = await buildReceipt(order);
-  res.json({ order, receipt });
+  await query('UPDATE orders SET status=? WHERE id=?', ['paid', row.id]);
+  const io = req.app.get('io');
+  const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  await deductInventory(order, req.user, io);
+  emitToStore(io, storeId, 'order:closed', String(order.id));
+  if (order.tableId) {
+    await query(
+      'UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?',
+      ['needs_clean', null, Number(order.tableId), orgId, storeId]
+    );
+  }
+  const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
+  const payments = await query('SELECT * FROM payments WHERE order_id=?', [row.id]);
+  res.json({
+    order,
+    receipt: {
+      storeName: store?.name || 'Store',
+      orderNo: order.orderNo,
+      items: order.items,
+      subtotal: order.subtotal,
+      tax: order.tax,
+      total: order.total,
+      payments: payments.map(toPayment),
+      createdAt: order.createdAt,
+    },
+  });
 });
 
-// 发起取消请求(任意收银角色),需主管审批
 router.post('/:id/void', async (req, res) => {
   const p = voidSchema.parse(req.body);
-  const order = await Models.Order.findOne({ _id: req.params.id, ...tenant(req) });
-  if (!order) return res.status(404).json({ error: 'not found' });
-  if (['paid', 'void', 'void_pending'].includes(order.status)) {
-    return res.status(400).json({ error: 'cannot void this order' });
-  }
-  order.status = 'void_pending';
-  order.voidRequestedBy = req.user._id;
-  order.voidReason = p.reason;
-  await order.save();
-  res.json(order);
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (['paid', 'void', 'void_pending'].includes(row.status)) return res.status(400).json({ error: 'cannot void this order' });
+  await query(
+    'UPDATE orders SET status=?, void_requested_by=?, void_reason=? WHERE id=?',
+    ['void_pending', req.user.id, p.reason, row.id]
+  );
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
-// 主管审批取消
 router.post('/:id/void/approve', rbac('admin', 'manager'), async (req, res) => {
-  const order = await Models.Order.findOne({ _id: req.params.id, ...tenant(req) });
-  if (!order) return res.status(404).json({ error: 'not found' });
-  if (order.status !== 'void_pending') return res.status(400).json({ error: 'not pending' });
-  order.status = 'void';
-  order.voidApprovedBy = req.user._id;
-  await order.save();
-  emitToStore(req.app.get('io'), req.user.storeId, 'order:closed', String(order._id));
-  if (order.tableId) {
-    await Models.Table.updateOne(
-      { _id: order.tableId, ...tenant(req) },
-      { status: 'free', currentOrderId: null }
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.status !== 'void_pending') return res.status(400).json({ error: 'not pending' });
+  await query('UPDATE orders SET status=?, void_approved_by=? WHERE id=?', ['void', req.user.id, row.id]);
+  emitToStore(req.app.get('io'), storeId, 'order:closed', String(row.id));
+  if (row.table_id) {
+    await query(
+      'UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?',
+      ['free', null, row.table_id, orgId, storeId]
     );
   }
-  res.json(order);
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
 export default router;

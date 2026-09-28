@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { Models } from './models.js';
+import { pool, query, insert, stringifyJSON } from './db.js';
 
 const DEMO_USERS = [
   { phone: '1000000000', name: 'Admin', role: 'admin', password: 'admin123' },
@@ -10,41 +10,72 @@ const DEMO_USERS = [
 ];
 
 export async function seedIfEmpty() {
-  const orgCount = await Models.Organization.countDocuments();
-  if (orgCount > 0) return;
+  const [{ c }] = await query('SELECT COUNT(*) AS c FROM organizations');
+  if (c > 0) return;
 
-  const org = await Models.Organization.create({ name: 'Demo Brand', slug: 'demo' });
-  const store = await Models.Store.create({ orgId: org._id, name: 'Demo Store', currency: 'CNY' });
+  const orgId = await insert(
+    'INSERT INTO organizations (name, slug, plan) VALUES (?,?,?)',
+    ['Demo Brand', 'demo', 'free']
+  );
+  const storeId = await insert(
+    'INSERT INTO stores (org_id, name, currency, tax_rate) VALUES (?,?,?,?)',
+    [orgId, 'Demo Store', 'CNY', 0]
+  );
 
   for (const u of DEMO_USERS) {
     const passwordHash = await bcrypt.hash(u.password, 10);
-    await Models.User.create({
-      orgId: org._id, storeId: store._id, name: u.name, phone: u.phone, role: u.role, passwordHash,
-    });
+    await insert(
+      `INSERT INTO users (org_id, store_id, name, phone, role, password_hash, is_active)
+       VALUES (?,?,?,?,?,?,1)`,
+      [orgId, storeId, u.name, u.phone, u.role, passwordHash]
+    );
   }
 
-  const cat = await Models.MenuCategory.create({ orgId: org._id, storeId: store._id, name: '饮品', sortOrder: 1 });
-  const food = await Models.MenuCategory.create({ orgId: org._id, storeId: store._id, name: '主食', sortOrder: 2 });
-  const coffee = await Models.MenuItem.create({
-    orgId: org._id, storeId: store._id, categoryId: cat._id, name: '美式咖啡', price: 18,
-    modifierGroups: [{ name: '杯型', type: 'single', required: true, options: [{ label: '大杯', priceDelta: 3 }, { label: '小杯', priceDelta: 0 }] }],
-  });
-  await Models.MenuItem.create({ orgId: org._id, storeId: store._id, categoryId: food._id, name: '牛肉饭', price: 38 });
+  const catId = await insert(
+    'INSERT INTO menu_categories (org_id, store_id, name, sort_order) VALUES (?,?,?,?)',
+    [orgId, storeId, '饮品', 1]
+  );
+  const foodId = await insert(
+    'INSERT INTO menu_categories (org_id, store_id, name, sort_order) VALUES (?,?,?,?)',
+    [orgId, storeId, '主食', 2]
+  );
+  const coffeeId = await insert(
+    `INSERT INTO menu_items (org_id, store_id, category_id, name, price, modifier_groups)
+     VALUES (?,?,?,?,?,?)`,
+    [orgId, storeId, catId, '美式咖啡', 18, stringifyJSON([
+      { name: '杯型', type: 'single', required: true,
+        options: [{ label: '大杯', priceDelta: 3 }, { label: '小杯', priceDelta: 0 }] },
+    ])]
+  );
+  await insert(
+    'INSERT INTO menu_items (org_id, store_id, category_id, name, price) VALUES (?,?,?,?,?)',
+    [orgId, storeId, foodId, '牛肉饭', 38]
+  );
 
   for (const n of ['A1', 'A2', 'B1']) {
-    await Models.Table.create({ orgId: org._id, storeId: store._id, number: n, zone: '大厅', seats: 4 });
+    await insert(
+      'INSERT INTO tables (org_id, store_id, number, zone, seats) VALUES (?,?,?,?,?)',
+      [orgId, storeId, n, '大厅', 4]
+    );
   }
 
-  const inv = await Models.InventoryItem.create({ orgId: org._id, storeId: store._id, name: '咖啡豆', unit: 'kg', quantity: 5, threshold: 2 });
-  await Models.MenuItem.findByIdAndUpdate(coffee._id, { trackInventory: true, inventoryItemId: inv._id });
+  const invId = await insert(
+    'INSERT INTO inventory_items (org_id, store_id, name, unit, quantity, threshold) VALUES (?,?,?,?,?,?)',
+    [orgId, storeId, '咖啡豆', 'kg', 5, 2]
+  );
+  await query(
+    'UPDATE menu_items SET track_inventory = 1, inventory_item_id = ? WHERE id = ?',
+    [invId, coffeeId]
+  );
 
   console.log('[seed] org/store + 5 users + sample menu/tables/inventory created');
 }
 
 // 单独运行:node src/seed.js
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const mongoose = (await import('mongoose')).default;
-  await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/fnbpos');
-  await seedIfEmpty();
-  process.exit(0);
+  (async () => {
+    await seedIfEmpty();
+    await pool.end();
+    process.exit(0);
+  })();
 }

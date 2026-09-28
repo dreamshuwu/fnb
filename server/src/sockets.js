@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { Models } from './models.js';
+import { getRow, query, toOrder } from './db.js';
 import { JWT_SECRET } from './middleware/auth.js';
 
 export function initSockets(io) {
@@ -7,7 +7,7 @@ export function initSockets(io) {
     try {
       const token = socket.handshake.auth?.token;
       const decoded = jwt.verify(token, JWT_SECRET);
-      const user = await Models.User.findById(decoded.sub);
+      const user = await getRow('SELECT * FROM users WHERE id = ?', [Number(decoded.sub)]);
       if (!user) return next(new Error('unauthorized'));
       socket.user = user;
       next();
@@ -17,12 +17,14 @@ export function initSockets(io) {
   });
 
   io.on('connection', async (socket) => {
-    const { orgId, storeId } = socket.user;
-    const room = `store:${storeId}`;
+    const { org_id, store_id } = socket.user;
+    const room = `store:${store_id}`;
     socket.join(room);
-    // 连接时把当前在厨房的订单快照发给该客户端(KDS 用)
-    const snapshot = await Models.Order.find({ orgId, storeId, status: 'kitchen' }).lean();
-    socket.emit('kds:snapshot', snapshot);
+    const snapshot = await query(
+      'SELECT * FROM orders WHERE org_id=? AND store_id=? AND status=? ORDER BY created_at DESC',
+      [org_id, store_id, 'kitchen']
+    );
+    socket.emit('kds:snapshot', snapshot.map(toOrder));
   });
 }
 

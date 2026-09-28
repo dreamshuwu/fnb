@@ -1,11 +1,11 @@
 import jwt from 'jsonwebtoken';
-import { Models } from '../models.js';
+import { getUserById, normalizeUser } from '../db.js';
 
 export const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
 export function signTokens(user) {
   const payload = {
-    sub: String(user._id),
+    sub: String(user.id ?? user._id),
     orgId: String(user.orgId),
     storeId: String(user.storeId),
     role: user.role,
@@ -20,7 +20,7 @@ export async function authenticate(req, res, next) {
   if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
   try {
     const decoded = jwt.verify(header.slice(7), JWT_SECRET);
-    const user = await Models.User.findById(decoded.sub);
+    const user = await getUserById(decoded.sub);
     if (!user || !user.isActive) return res.status(401).json({ error: 'unauthorized' });
     req.user = user;
     next();
@@ -29,7 +29,6 @@ export async function authenticate(req, res, next) {
   }
 }
 
-// 角色权限控制;supervisor = manager / admin 可审批取消
 export function rbac(...roles) {
   return (req, res, next) => {
     if (!roles.includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
@@ -46,7 +45,7 @@ export function tenant(req, extra = {}) {
 
 export function publicUser(u) {
   return {
-    id: String(u._id),
+    id: String(u.id ?? u._id),
     name: u.name,
     role: u.role,
     orgId: String(u.orgId),
