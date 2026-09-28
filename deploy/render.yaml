@@ -1,6 +1,10 @@
 # Render 后端服务配置（免费版 web service）
 # 用法：登录 https://render.com → New → Blueprint → 连接 GitHub 仓库 dreamshuwu/fnb
-#       → 选择本文件 → 部署。MONGODB_URI / JWT_SECRET 在 Render 控制台手动填。
+#       → 选择本文件 → 部署。DB_* / JWT_SECRET 在 Render 控制台手动填。
+#
+# 说明：后端已改为 MySQL(mysql2)，不再使用 MongoDB。
+#       DB_HOST 需为「可公网访问」的 MySQL（如 Aiven / PlanetScale / 自有 VPS 的 MySQL），
+#       不能是你 cPanel 内网私有的 127.0.0.1（Render 无法连到你的 cPanel 内网）。
 services:
   - type: web
     name: fnb-pos-api
@@ -14,10 +18,16 @@ services:
         value: "20"
       - key: PORT
         value: "4000"
-      - key: USE_MEMORY_DB
-        value: "0"
-      - key: MONGODB_URI
-        sync: false   # 手动填 MongoDB Atlas 连接串
+      - key: DB_HOST
+        sync: false   # 手动填可公网访问的 MySQL 主机
+      - key: DB_PORT
+        value: "3306"
+      - key: DB_USER
+        sync: false   # 手动填 MySQL 用户
+      - key: DB_PASSWORD
+        sync: false   # 手动填 MySQL 密码
+      - key: DB_NAME
+        value: "fnbpos"
       - key: JWT_SECRET
         sync: false   # 手动填一个长随机串
       - key: CLIENT_ORIGIN

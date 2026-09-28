@@ -2,6 +2,11 @@
 # 作用：React 是单页应用，所有前端路由都回退到 index.html
 RewriteEngine On
 
+# 不要把 API 与 Socket.IO 请求交给前端 index.html
+# （当后端与前端同域、挂在 /api 或 /socket.io 路径下时必须排除）
+RewriteCond %{REQUEST_URI} ^/(api|socket\.io) [NC]
+RewriteRule ^ - [L]
+
 # 已存在的文件/目录直接返回
 RewriteCond %{REQUEST_FILENAME} -f [OR]
 RewriteCond %{REQUEST_FILENAME} -d
