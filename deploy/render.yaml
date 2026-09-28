@@ -1,0 +1,24 @@
+# Render 后端服务配置（免费版 web service）
+# 用法：登录 https://render.com → New → Blueprint → 连接 GitHub 仓库 dreamshuwu/fnb
+#       → 选择本文件 → 部署。MONGODB_URI / JWT_SECRET 在 Render 控制台手动填。
+services:
+  - type: web
+    name: fnb-pos-api
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: node src/index.js
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: PORT
+        value: "4000"
+      - key: USE_MEMORY_DB
+        value: "0"
+      - key: MONGODB_URI
+        sync: false   # 手动填 MongoDB Atlas 连接串
+      - key: JWT_SECRET
+        sync: false   # 手动填一个长随机串
+      - key: CLIENT_ORIGIN
+        value: "https://fnb.beyourdiary.com"

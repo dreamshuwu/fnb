@@ -1,0 +1,11 @@
+# 放到 cPanel 的 public_html（或域名根目录）里，命名为 .htaccess
+# 作用：React 是单页应用，所有前端路由都回退到 index.html
+RewriteEngine On
+
+# 已存在的文件/目录直接返回
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# 其它请求交给 React（SPA 前端路由）
+RewriteRule ^ index.html [L]

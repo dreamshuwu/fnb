@@ -5,7 +5,9 @@ export default function KDSPage() {
   const [tickets, setTickets] = useState([]);
 
   useEffect(() => {
-    const socket = io({ auth: { token: localStorage.getItem('token') } });
+    // 跨域部署时通过 VITE_SOCKET_URL / VITE_API_URL 指向后端；留空则同源
+    const socketUrl = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || undefined;
+    const socket = io(socketUrl, { auth: { token: localStorage.getItem('token') } });
     socket.on('kds:snapshot', (list) => setTickets(list));
     socket.on('kds:ticket', (o) =>
       setTickets((prev) => [o, ...prev.filter((t) => t._id !== o._id)])

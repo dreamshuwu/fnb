@@ -1,6 +1,7 @@
 import axios from 'axios';
 
-export const api = axios.create({ baseURL: '/api' });
+// 生产可经 VITE_API_URL 指向独立后端（如 Render），留空则同源 /api
+export const api = axios.create({ baseURL: import.meta.env.VITE_API_URL || '/api' });
 
 api.interceptors.request.use((cfg) => {
   const t = localStorage.getItem('token');
