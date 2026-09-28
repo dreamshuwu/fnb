@@ -24,14 +24,6 @@ app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }));
 app.use(express.json());
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
-app.use('/api/auth', authRoutes);
-app.use('/api/menu', menuRoutes);
-app.use('/api/tables', tableRoutes);
-app.use('/api/orders', orderRoutes);
-app.use('/api/payments', paymentRoutes);
-app.use('/api/inventory', inventoryRoutes);
-app.use('/api/reports', reportRoutes);
-app.use('/api/shifts', shiftRoutes);
 
 // ---- 单机/共享主机部署:由同一个 Node 进程直接托管前端静态文件(SPA) ----
 // 这样无需单独静态服务器、子域或 .htaccess;前端用同源 /api 调接口。
@@ -50,17 +42,35 @@ if (fs.existsSync(publicDir)) {
 const server = http.createServer(app);
 const { Server } = await import('socket.io');
 const io = new Server(server, { cors: { origin: process.env.CLIENT_ORIGIN || '*' } });
-const { initSockets } = await import('./sockets.js');
-initSockets(io);
 app.set('io', io);
 
 const PORT = process.env.PORT || 4000;
-initSchema()
-  .then(() => seedIfEmpty())
-  .then(() => {
-    server.listen(PORT, () => console.log(`[api] listening on :${PORT}`));
-  })
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  });
+
+// 开发预览模式(免 MySQL):DEV_NO_DB=1 时用一个内存假数据后端,便于本地/预览直接看完整界面
+if (process.env.DEV_NO_DB === '1') {
+  const { seedDev, createDevRouter, initDevSockets } = await import('./devMode.js');
+  seedDev();
+  app.use('/api', createDevRouter(io));
+  initDevSockets(io);
+  server.listen(PORT, () => console.log(`[dev-mode] listening on :${PORT} (no MySQL)`));
+} else {
+  app.use('/api/auth', authRoutes);
+  app.use('/api/menu', menuRoutes);
+  app.use('/api/tables', tableRoutes);
+  app.use('/api/orders', orderRoutes);
+  app.use('/api/payments', paymentRoutes);
+  app.use('/api/inventory', inventoryRoutes);
+  app.use('/api/reports', reportRoutes);
+  app.use('/api/shifts', shiftRoutes);
+  const { initSockets } = await import('./sockets.js');
+  initSockets(io);
+  initSchema()
+    .then(() => seedIfEmpty())
+    .then(() => {
+      server.listen(PORT, () => console.log(`[api] listening on :${PORT}`));
+    })
+    .catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
+}
