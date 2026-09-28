@@ -1,0 +1,13 @@
+# Safety net for shared cPanel deployments where the domain's
+# Document Root is (mis)configured to the repository root instead of `server/`.
+#
+# Without this, LiteSpeed happily lists apps/, deploy/, scripts/, server/,
+# DEPLOY.md, docker-compose.yml, package.json to the whole internet
+# (this has happened — see screenshot of "Index of /" at fnb.beyourdiary.com).
+#
+# The PROPER fix is to change the domain Document Root to `server/` in
+# cPanel → Domains → Manage (see DEPLOY.md → "看到 Index of /"). This .htaccess
+# only stops the directory listing while you fix that; it does NOT proxy to
+# the Node App — the cPanel-generated proxy lives in `server/.htaccess`.
+
+Options -Indexes

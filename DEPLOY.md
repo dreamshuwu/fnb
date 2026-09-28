@@ -27,18 +27,22 @@
    - **Application root：指向 `server/` 目录**（例如 `fnb/server`，即含 `package.json`/`src` 的那个目录）
    - **Application URL：你的域名根**，例如 `fnb.beyourdiary.com`（不要选子域、也不要在路径里加 `/api`）
    - **Startup file：`src/index.js`**
-3. 在该应用的 **Environment Variables** 里填：
+3. **⚠️ 把域名的 Document Root 也指到 `server/`**（这是最容易踩的坑 —— 见下方"看到 Index of /"）。
+   cPanel → **Domains** → 找到 `fnb.beyourdiary.com` → **Manage** → 把
+   **Document Root** 改成 `/home/<你的cPanel用户>/fnb-pos/server`（即 Application root 的绝对路径）。
+   改完后再到 Node.js App 页面点一次 **Restart**，让 cPanel 把代理 `.htaccess` 重新写到正确的 document root。
+4. 在该应用的 **Environment Variables** 里填：
    - `DB_HOST=127.0.0.1`  `DB_PORT=3306`  `DB_USER=beyourdi_cms`  `DB_PASSWORD=<密码>`  `DB_NAME=beyourdi_fnb`
    - `JWT_SECRET=` 一长串随机串（生产务必改）
    - `CLIENT_ORIGIN=https://fnb.beyourdiary.com`（同源可省略；填了更严谨）
    - （可选）`WEB_DIST_PATH`：前端静态目录，默认 `server/public`，一般不用改
-4. 打开 cPanel **Terminal**（或在文件管理器里用 “Terminal”），安装依赖并启动：
+5. 打开 cPanel **Terminal**（或在文件管理器里用 "Terminal"），安装依赖并启动：
    ```bash
    cd fnb/server
    npm install
    # 回到 Node.js App 页面点 Restart；首次启动会自动建表 + 写入演示数据
    ```
-5. 打开 `https://fnb.beyourdiary.com` → 登录页。
+6. 打开 `https://fnb.beyourdiary.com` → 登录页。
 
 > 关键点：Application URL 选**域名根**后，cPanel 会把整个域名的请求都代理给这个 Node App，
 > 由它同时处理 `/api`、Socket.IO 和前端页面。所以**完全不需要** `.htaccess`、
@@ -71,7 +75,23 @@
 生产前务必改密码（`server/src/seed.js` 里，或直接在数据库 `users` 表改 `password_hash`）。
 
 ## 常见问题
+- **打开域名看到 "Index of /"（LiteSpeed 把整个仓库目录列出来了，例如 `apps/` `server/` `DEPLOY.md` 都被公开）**：
+  这是**最常见的坑**，意味着你的域名 Document Root 指到了仓库根 `fnb-pos/`，而不是 `server/`，
+  所以 cPanel 的 Node.js App 代理根本没参与。修复三步：
+  1. cPanel → **Domains** → 找到 `fnb.beyourdiary.com` → **Manage** → 把
+     **Document Root** 改成 `/home/<你的cPanel用户>/fnb-pos/server`（即 Application root 的绝对路径）。
+  2. 确认 cPanel → **Setup Node.js App** 里该 App 存在且正确：
+     - Application root = `fnb-pos/server`
+     - Application URL = `fnb.beyourdiary.com`（域名根，不是子域、不是 `/api` 路径）
+     - Startup file = `src/index.js`
+     - 环境变量（`DB_*` / `JWT_SECRET` / `CLIENT_ORIGIN`）已填
+     - 已 `npm install`、已点过 **Restart**
+  3. cPanel → **LiteSpeed Web Cache Manager**（或 Cachewall）→ Flush All，清缓存后再访问。
+  
+  应急缓解（在改 Document Root 之前）：仓库根已自带 `.htaccess`（含 `Options -Indexes`），
+  `git pull` 后即可立即阻止目录列表暴露公网 —— 但这只是止血，Node App 仍不会被代理，
+  真正看到界面必须做完上面三步。
 - **页面打不开 / 一直转圈**：Node App 没起来。看 cPanel Node.js App 的日志；确认 `npm install` 已跑过、点过 Restart。
-- **登录报错 401 / 接口 404**：确认 Application URL 是域名根（方案 A），且没有用 `.htaccess` 把 `/api` 拦掉。
+- **登录报错 401 / 接口 404**：确认 Application URL 是域名根（方案 A），且 Document Root 已改为 `server/`（参见上一条）。
 - **数据库连不上**：确认 `beyourdi_cms` 已授权 `beyourdi_fnb`，且 `DB_HOST` 用 `127.0.0.1`（cPanel 内网）。
 - **健康检查**：访问 `https://<你的域名>/api/health` 应返回 `{"ok":true}`。
