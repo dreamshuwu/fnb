@@ -17,6 +17,7 @@ import paymentRoutes from './routes/payments.js';
 import inventoryRoutes from './routes/inventory.js';
 import reportRoutes from './routes/reports.js';
 import shiftRoutes from './routes/shifts.js';
+import businessRoutes from './routes/business.js';
 
 const app = express();
 app.use(helmet());
@@ -61,6 +62,7 @@ if (process.env.DEV_NO_DB === '1') {
   app.use('/api/payments', paymentRoutes);
   app.use('/api/inventory', inventoryRoutes);
   app.use('/api/reports', reportRoutes);
+  app.use('/api', businessRoutes);
   app.use('/api/shifts', shiftRoutes);
   const { initSockets } = await import('./sockets.js');
   initSockets(io);

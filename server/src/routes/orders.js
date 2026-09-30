@@ -31,15 +31,18 @@ router.post('/', async (req, res) => {
   const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
   const taxRate = Number(store?.tax_rate || 0);
   const items = p.items.map((i) => ({ ...i, status: 'pending' }));
-  const { subtotal, tax, total } = computeTotals(items, taxRate);
+  const { subtotal, tax, total: grossTotal } = computeTotals(items, taxRate);
+  const discount = Math.min(Number(p.discount || 0), subtotal);
+  const total = Math.max(0, grossTotal - discount);
+  const openShift = await getRow('SELECT id FROM shifts WHERE org_id=? AND store_id=? AND cashier_id=? AND status=? ORDER BY id DESC LIMIT 1', [orgId, storeId, req.user.id, 'open']);
   const id = await insert(
     `INSERT INTO orders
-      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, tax, total, created_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, tax, total, created_by, shift_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       orgId, storeId, orderNo(), p.type, p.tableId ? Number(p.tableId) : null,
       p.customerName ?? null, p.phone ?? null, stringifyJSON(items),
-      subtotal, tax, total, req.user.id,
+      subtotal, discount, tax, total, req.user.id, openShift?.id ?? null,
     ]
   );
   if (p.type === 'dine_in' && p.tableId) {
@@ -91,15 +94,18 @@ router.put('/:id/status', async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
-  if (status === 'kitchen' && row.status === 'open') {
-    await query('UPDATE orders SET status=? WHERE id=?', ['kitchen', row.id]);
-    const io = req.app.get('io');
-    const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  const transitions = { open: ['kitchen'], kitchen: ['preparing', 'ready'], preparing: ['ready'], ready: ['served'] };
+  if (!transitions[row.status]?.includes(status)) return res.status(400).json({ error: 'invalid transition' });
+  await query('UPDATE orders SET status=? WHERE id=?', [status, row.id]);
+  const io = req.app.get('io');
+  const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  if (status === 'kitchen' || status === 'preparing' || status === 'ready') {
     emitToStore(io, storeId, 'order:created', order);
     emitToStore(io, storeId, 'kds:ticket', order);
-    return res.json(order);
+  } else if (status === 'served') {
+    emitToStore(io, storeId, 'order:closed', String(order.id));
   }
-  return res.status(400).json({ error: 'invalid transition' });
+  return res.json(order);
 });
 
 async function deductInventory(order, user, io) {

@@ -4,7 +4,7 @@ import { api } from '../api/client.js';
 
 const CATEGORY_COLORS = ['#d7e48e', '#f4bd63', '#f3e95d', '#ef9cca', '#9ed6e9', '#52d065', '#60a4eb', '#e79bd1', '#a99ece'];
 const PAGE_SIZE = 12;
-const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], status: 'draft', orderId: null });
+const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null });
 
 export default function CashierPage() {
   const [tree, setTree] = useState({ categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [] });
@@ -19,14 +19,15 @@ export default function CashierPage() {
   const [activePageId, setActivePageId] = useState(1);
   const [multiplier, setMultiplier] = useState(1);
   const [paymentOrder, setPaymentOrder] = useState(null);
-  const [paymentMethod, setPaymentMethod] = useState('cash');
-  const [amountTendered, setAmountTendered] = useState('');
+  const [paymentRows, setPaymentRows] = useState([{ method: 'cash', amount: '' }]);
   const [settlement, setSettlement] = useState(null);
   const [receipt, setReceipt] = useState(null);
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
-  const total = cart.reduce((s, c) => s + c.unitPrice * c.qty, 0);
+  const discount = Number(activePage?.discount || 0);
+  const grossTotal = cart.reduce((s, c) => s + c.unitPrice * c.qty, 0);
+  const total = Math.max(0, grossTotal - discount);
 
   const loadTree = async () => {
     const r = await api.get('/menu/tree');
@@ -77,6 +78,12 @@ export default function CashierPage() {
   };
   const changeQty = (idx, d) => updateActiveCart((prev) => prev.map((c, i) => (i === idx ? { ...c, qty: Math.max(0, c.qty + d) } : c)).filter((c) => c.qty > 0));
 
+  const applyDiscount = () => {
+    if (!cart.length) return;
+    const value = Number(prompt(`当前金额 ¥${grossTotal.toFixed(2)}，请输入折扣金额:`, String(discount || 0)));
+    if (!Number.isFinite(value) || value < 0) return;
+    setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, discount: Math.min(value, grossTotal) } : p));
+  };
   const createPage = () => {
     const id = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
     setPages((prev) => [...prev, newPage(id)]);
@@ -95,13 +102,11 @@ export default function CashierPage() {
   const sendCurrentPage = async () => {
     if (!cart.length) return;
     if (mode === 'dine_in' && !tableId) { alert('请选择桌台'); return; }
-    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart });
+    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount });
     await api.put(`/orders/${r.data._id}/status`, { status: 'kitchen' });
-    setPages((prev) => {
-      const nextId = prev.reduce((max, p) => Math.max(max, p.id), 0) + 1;
-      return [...prev.map((p) => p.id === activePageId ? { ...p, status: 'sent', orderId: r.data._id, label: `${p.label} · Sent` } : p), newPage(nextId)];
-    });
-    setActivePageId((prev) => prev + 1);
+    const nextId = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
+    setPages((prev) => [...prev.map((p) => p.id === activePageId ? { ...p, status: 'sent', orderId: r.data._id, label: `${p.label} · Sent` } : p), newPage(nextId)]);
+    setActivePageId(nextId);
     setTableId('');
     loadActive();
     loadTables();
@@ -109,21 +114,21 @@ export default function CashierPage() {
 
   const openPayment = (order) => {
     setPaymentOrder(order);
-    setPaymentMethod('cash');
-    setAmountTendered(String(Number(order.total).toFixed(2)));
+    setPaymentRows([{ method: 'cash', amount: String(Number(order.total).toFixed(2)) }]);
   };
-  const confirmPayment = () => {
+  const confirmPayment = (rows) => {
     if (!paymentOrder) return;
-    const tendered = Number(amountTendered);
-    if (!Number.isFinite(tendered) || tendered < Number(paymentOrder.total)) { alert('实收金额不足'); return; }
+    const cleanRows = rows.filter((row) => Number(row.amount) > 0).map((row) => ({ ...row, amount: Number(row.amount) }));
+    const tendered = cleanRows.reduce((sum, row) => sum + row.amount, 0);
+    if (!Number.isFinite(tendered) || tendered < Number(paymentOrder.total)) { alert('付款总额不足'); return; }
     // Payment 这里只确认金额；真正 checkout/扣库存/释放桌位在 Settlement 完成时执行。
     setPaymentOrder(null);
-    setSettlement({ order: paymentOrder, method: paymentMethod, tendered, change: tendered - Number(paymentOrder.total) });
+    setSettlement({ order: paymentOrder, rows: cleanRows, tendered, change: tendered - Number(paymentOrder.total) });
   };
   const completeSettlement = async () => {
     if (!settlement) return;
-    const result = await api.post(`/orders/${settlement.order._id}/checkout`, { payments: [{ method: settlement.method, amount: settlement.tendered }], tip: 0 });
-    setReceipt({ ...result.data.receipt, payments: [{ method: settlement.method, amount: settlement.tendered }] });
+    const result = await api.post(`/orders/${settlement.order._id}/checkout`, { payments: settlement.rows, tip: 0 });
+    setReceipt({ ...result.data.receipt, payments: settlement.rows });
     setSettlement(null);
     loadActive();
     loadTables();
@@ -151,8 +156,8 @@ export default function CashierPage() {
           <button onClick={() => updateActiveCart(() => [])}>Del</button>
           <button onClick={() => setMultiplier(1)}>Pax</button>
           <button onClick={() => updateActiveCart((c) => c.slice(0, -1))}>X Dish</button>
-          <button>Pre-Disc</button>
-          <button onClick={() => updateActiveCart(() => [])}>Void</button>
+          <button onClick={applyDiscount}>Pre-Disc</button>
+          <button onClick={() => { updateActiveCart(() => []); setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, discount: 0 } : p)); }}>Void</button>
           <div className="cashier-multiplier">{[1, 2, 3, 4, 5, 6].map((n) => <button key={n} onClick={() => setMultiplier(n)} className={multiplier === n ? 'bg-yellow-200' : ''}>x{n}</button>)}</div>
           <div className="text-[10px] text-center text-indigo-900">下次点单 x{multiplier}</div>
         </div>
@@ -177,7 +182,7 @@ export default function CashierPage() {
             {cart.map((c, idx) => <div key={idx} className="cashier-order-row"><span>{idx + 1}</span><span title={c.name}><b>{c.code}</b><br />{c.name}</span><span>{c.qty}</span><span>¥{(c.unitPrice * c.qty).toFixed(2)}<br /><button onClick={() => changeQty(idx, 1)}>+</button><button onClick={() => changeQty(idx, -1)}>−</button></span></div>)}
             {!cart.length && <div className="text-center text-indigo-800 p-5 text-xs">{activePage.status === 'sent' ? '已发送到厨房' : '请选择菜单项目'}</div>}
           </div>
-          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
+          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
           <div className="cashier-keypad">{['Enter', '7', '8', '9', 'Back', '4', '5', '6', 'Up', '1', '2', '3', 'Down', '0', '.', 'Clear'].map((n) => <button key={n}>{n}</button>)}</div>
         </div>
       </div>
@@ -187,21 +192,22 @@ export default function CashierPage() {
       </div>
       <div className="cashier-orders-strip"><h3>收银端待处理订单 / Kitchen 已收到</h3><div className="cashier-open-orders">{active.map((o) => <div key={o._id} className="cashier-open-card"><b>{o.orderNo}</b> · ¥{o.total}<br />{o.items.reduce((s, i) => s + i.qty, 0)} items <button onClick={() => openPayment(o)}>Payment</button> <button onClick={() => requestVoid(o)}>Void</button></div>)}{!active.length && <span className="text-slate-500 text-xs">Send 后订单会立即显示在这里</span>}</div></div>
 
-      {paymentOrder && <PaymentModal order={paymentOrder} method={paymentMethod} setMethod={setPaymentMethod} tendered={amountTendered} setTendered={setAmountTendered} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} />}
+      {paymentOrder && <PaymentModal order={paymentOrder} rows={paymentRows} setRows={setPaymentRows} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} />}
       {settlement && <SettlementModal settlement={settlement} onComplete={completeSettlement} onClose={() => setSettlement(null)} />}
       {receipt && <ReceiptModal receipt={receipt} onClose={() => setReceipt(null)} />}
     </div>
   );
 }
 
-function PaymentModal({ order, method, setMethod, tendered, setTendered, onConfirm, onClose }) {
-  const amount = Number(tendered || 0);
-  const change = Math.max(0, amount - Number(order.total));
-  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Payment · {order.orderNo}</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="payment-amount-box"><small>AMOUNT DUE</small><strong>¥{Number(order.total).toFixed(2)}</strong></div><div className="payment-field"><label>Payment Type<select value={method} onChange={(e) => setMethod(e.target.value)}><option value="cash">Cash</option><option value="tab">Credit / Account</option></select></label><label>Amount Tendered<input type="number" min="0" step="0.01" value={tendered} onChange={(e) => setTendered(e.target.value)} /></label></div><div className="payment-change">Change <strong>¥{change.toFixed(2)}</strong></div><div className="payment-denoms">{[1, 5, 10, 20, 50, 100].map((n) => <button key={n} onClick={() => setTendered(String(n))}>¥{n}</button>)}</div><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onConfirm}>Confirm Payment</button><button className="legacy-btn pink" onClick={onClose}>Cancel</button></div></div></section></div>;
+function PaymentModal({ order, rows, setRows, onConfirm, onClose }) {
+  const tendered = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const change = Math.max(0, tendered - Number(order.total));
+  const updateRow = (index, patch) => setRows(rows.map((row, i) => i === index ? { ...row, ...patch } : row));
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Payment · {order.orderNo}</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="payment-amount-box"><small>AMOUNT DUE</small><strong>¥{Number(order.total).toFixed(2)}</strong></div>{rows.map((row, index) => <div className="payment-field" key={index}><label>Payment Type<select value={row.method} onChange={(e) => updateRow(index, { method: e.target.value })}><option value="cash">Cash</option><option value="card">Card</option><option value="tab">Credit / Account</option><option value="cheque">Cheque</option></select></label><label>Amount<input type="number" min="0" step="0.01" value={row.amount} onChange={(e) => updateRow(index, { amount: e.target.value })} /></label></div>)}<button className="payment-add-row" onClick={() => setRows([...rows, { method: 'card', amount: '' }])}>+ Split Payment</button><div className="payment-change">Total Tendered <strong>¥{tendered.toFixed(2)}</strong></div><div className="payment-change">Change <strong>¥{change.toFixed(2)}</strong></div><div className="payment-denoms">{[1, 5, 10, 20, 50, 100].map((n) => <button key={n} onClick={() => updateRow(0, { amount: String(n) })}>¥{n}</button>)}</div><div className="legacy-window-actions"><button className="legacy-btn green" onClick={() => onConfirm(rows)}>Confirm Payment</button><button className="legacy-btn pink" onClick={onClose}>Cancel</button></div></div></section></div>;
 }
 
 function SettlementModal({ settlement, onComplete, onClose }) {
-  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Settlement · Complete Sale</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="settlement-success">Payment recorded</div><div className="settlement-summary"><div><span>Order</span><strong>{settlement.order.orderNo}</strong></div><div><span>Amount Due</span><strong>¥{Number(settlement.order.total).toFixed(2)}</strong></div><div><span>Tendered</span><strong>¥{settlement.tendered.toFixed(2)}</strong></div><div><span>Change</span><strong className="change-value">¥{settlement.change.toFixed(2)}</strong></div><div><span>Payment Type</span><strong>{settlement.method === 'cash' ? 'Cash' : 'Credit / Account'}</strong></div></div><p className="settlement-note">确认 Settlement 后，这张单会完成结算、扣减库存、释放桌位并可打印小票。</p><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onComplete}>Complete Settlement</button><button className="legacy-btn pink" onClick={onClose}>Back</button></div></div></section></div>;
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Settlement · Complete Sale</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="settlement-success">Payment recorded</div><div className="settlement-summary"><div><span>Order</span><strong>{settlement.order.orderNo}</strong></div><div><span>Amount Due</span><strong>¥{Number(settlement.order.total).toFixed(2)}</strong></div><div><span>Tendered</span><strong>¥{settlement.tendered.toFixed(2)}</strong></div><div><span>Change</span><strong className="change-value">¥{settlement.change.toFixed(2)}</strong></div><div><span>Payment Type</span><strong>{settlement.rows.map((row) => `${row.method}: ¥${Number(row.amount).toFixed(2)}`).join(' + ')}</strong></div></div><p className="settlement-note">确认 Settlement 后，这张单会完成结算、扣减库存、释放桌位并可打印小票。</p><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onComplete}>Complete Settlement</button><button className="legacy-btn pink" onClick={onClose}>Back</button></div></div></section></div>;
 }
 
 function ReceiptModal({ receipt, onClose }) {

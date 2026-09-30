@@ -24,6 +24,7 @@ export default function Layout() {
   const go = (item) => {
     if (item.to) navigate(item.to);
     else if (item.feature === 'drawer') alert('钱箱开启指令已发送（浏览器版会在硬件连接后执行）');
+    else if (['cash-in', 'withdraw', 'payment', 'credit-note', 'received', 'close-shift', 'attendance', 'reports'].includes(item.feature)) navigate(`/operations?tab=${item.feature === 'close-shift' ? 'shifts' : item.feature === 'reports' ? 'reports' : item.feature === 'cash-in' || item.feature === 'withdraw' || item.feature === 'payment' || item.feature === 'credit-note' || item.feature === 'received' ? 'finance' : item.feature}`);
     else navigate(`/desktop?feature=${item.feature}`);
   };
 

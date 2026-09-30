@@ -172,7 +172,7 @@ export async function initSchema() {
       table_id INT,
       customer_name VARCHAR(255),
       phone VARCHAR(64),
-      status ENUM('open','kitchen','paid','void_pending','void') DEFAULT 'open',
+      status ENUM('open','kitchen','preparing','ready','served','paid','void_pending','void') DEFAULT 'open',
       items TEXT,
       subtotal DECIMAL(12,2) DEFAULT 0,
       discount DECIMAL(12,2) DEFAULT 0,
@@ -192,7 +192,7 @@ export async function initSchema() {
       org_id INT NOT NULL,
       store_id INT NOT NULL,
       order_id INT,
-      method ENUM('cash','tab') DEFAULT 'cash',
+      method ENUM('cash','card','tab','cheque','credit') DEFAULT 'cash',
       amount DECIMAL(12,2) NOT NULL DEFAULT 0,
       tip DECIMAL(12,2) DEFAULT 0,
       status VARCHAR(32) DEFAULT 'paid',
@@ -235,10 +235,60 @@ export async function initSchema() {
       open_amount DECIMAL(12,2) DEFAULT 0,
       close_amount DECIMAL(12,2) DEFAULT 0,
       expected_amount DECIMAL(12,2) DEFAULT 0,
+      difference_amount DECIMAL(12,2) DEFAULT 0,
       status ENUM('open','closed') DEFAULT 'open',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (cashier_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS members (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      org_id INT NOT NULL, store_id INT NOT NULL,
+      member_no VARCHAR(64), name VARCHAR(255) NOT NULL, phone VARCHAR(64),
+      credit_balance DECIMAL(12,2) DEFAULT 0, points INT DEFAULT 0,
+      status VARCHAR(32) DEFAULT 'active', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (member_no), INDEX (phone)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS member_topups (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      member_id INT NOT NULL, receipt_no VARCHAR(64), amount DECIMAL(12,2) NOT NULL,
+      created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (member_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS points_ledger (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      member_id INT NOT NULL, delta INT NOT NULL, reason VARCHAR(255), created_by INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (member_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS cash_movements (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      type VARCHAR(32) NOT NULL, voucher_no VARCHAR(64), pay_to VARCHAR(255),
+      amount DECIMAL(12,2) NOT NULL, reason TEXT, method VARCHAR(32) DEFAULT 'cash',
+      created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (type), INDEX (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS credit_notes (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      credit_no VARCHAR(64), customer_name VARCHAR(255), order_no VARCHAR(64),
+      reason TEXT, gst TINYINT(1) DEFAULT 0, items TEXT, status VARCHAR(32) DEFAULT 'open',
+      created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS attendance_records (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      user_id INT, user_name VARCHAR(255), action VARCHAR(32), code VARCHAR(64), note TEXT,
+      event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id), INDEX (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS suppliers (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64), name VARCHAR(255) NOT NULL, phone VARCHAR(64), contact VARCHAR(255),
+      status VARCHAR(32) DEFAULT 'active', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS purchase_orders (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      po_no VARCHAR(64), supplier_id INT, items TEXT, total DECIMAL(12,2) DEFAULT 0,
+      status VARCHAR(32) DEFAULT 'open', received_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (supplier_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
   for (const s of stmts) await query(s);

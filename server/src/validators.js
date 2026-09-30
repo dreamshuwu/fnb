@@ -77,11 +77,12 @@ export const createOrderSchema = z.object({
   tableId: z.string().optional(),
   customerName: z.string().optional(),
   phone: z.string().optional(),
+  discount: z.number().min(0).optional(),
   items: z.array(orderItemSchema).min(1),
 });
 
 export const checkoutSchema = z.object({
-  payments: z.array(z.object({ method: z.enum(['cash', 'tab']), amount: z.number() })).min(1),
+  payments: z.array(z.object({ method: z.enum(['cash', 'card', 'tab', 'cheque', 'credit']), amount: z.number().min(0) })).min(1),
   tip: z.number().optional(),
 });
 

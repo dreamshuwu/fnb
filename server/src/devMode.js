@@ -7,7 +7,9 @@ import { signTokens, JWT_SECRET } from './middleware/auth.js';
 
 const store = {
   users: [], categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [],
-  tables: [], orders: [], inventory: [], payments: [], seq: 1,
+  tables: [], orders: [], inventory: [], payments: [],
+  members: [], memberTopups: [], pointsLedger: [], cashMovements: [], creditNotes: [],
+  attendance: [], shifts: [], suppliers: [], purchaseOrders: [], settings: [], seq: 1,
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -99,6 +101,10 @@ function seedDev() {
   for (const n of ['A1', 'A2', 'B1']) {
     store.tables.push({ id: nid(), orgId: '1', storeId: '1', number: n, zone: '大厅', seats: 4, status: 'free', currentOrderId: null });
   }
+  store.members.push({ id: nid(), orgId: '1', storeId: '1', memberNo: 'M0001', name: 'Demo Member', phone: '0123456789', creditBalance: 0, points: 120, status: 'active', createdAt: now() });
+  store.suppliers.push({ id: nid(), orgId: '1', storeId: '1', code: 'SUP-001', name: 'Demo Supplier', phone: '', contact: '', status: 'active', createdAt: now() });
+  store.shifts.push({ id: nid(), orgId: '1', storeId: '1', cashierId: '3', openAmount: 0, expectedAmount: 0, closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null });
+  store.settings.push({ id: nid(), orgId: '1', storeId: '1', key: 'taxRate', value: 0 });
 }
 
 // ---- mappers(与 db.js 输出保持一致,前端按这些字段渲染) ----
@@ -127,11 +133,16 @@ const toInventoryItem = (inv) => ({
 const toOrder = (o) => ({
   _id: o.id, id: o.id, orgId: o.orgId, storeId: o.storeId, orderNo: o.orderNo, type: o.type,
   tableId: o.tableId == null ? null : String(o.tableId), customerName: o.customerName, phone: o.phone, status: o.status,
-  items: o.items || [], subtotal: Number(o.subtotal || 0), discount: 0, tax: Number(o.tax || 0), total: Number(o.total || 0),
-  createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: null,
-  voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: null, voidReason: o.voidReason || null,
+  items: o.items || [], subtotal: Number(o.subtotal || 0), discount: Number(o.discount || 0), tax: Number(o.tax || 0), total: Number(o.total || 0),
+  createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: o.shiftId == null ? null : String(o.shiftId),
+  voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: o.voidApprovedBy == null ? null : String(o.voidApprovedBy), voidReason: o.voidReason || null,
   createdAt: o.createdAt, updatedAt: o.updatedAt || o.createdAt,
 });
+const toMember = (m) => ({ _id: m.id, id: m.id, memberNo: m.memberNo, name: m.name, phone: m.phone, creditBalance: Number(m.creditBalance || 0), points: Number(m.points || 0), status: m.status, createdAt: m.createdAt });
+const toMovement = (m) => ({ _id: m.id, id: m.id, type: m.type, voucherNo: m.voucherNo, payTo: m.payTo, amount: Number(m.amount || 0), reason: m.reason, method: m.method, createdBy: m.createdBy, createdAt: m.createdAt });
+const toAttendance = (a) => ({ _id: a.id, id: a.id, userId: a.userId, userName: a.userName, action: a.action, code: a.code, time: a.time, note: a.note || '' });
+const toShift = (s) => ({ _id: s.id, id: s.id, cashierId: s.cashierId, openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0), closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0), status: s.status, openedAt: s.openedAt, closedAt: s.closedAt });
+const toSupplier = (s) => ({ _id: s.id, id: s.id, code: s.code, name: s.name, phone: s.phone, contact: s.contact, status: s.status, createdAt: s.createdAt });
 
 function computeTotals(items, taxRate = 0) {
   const subtotal = items.reduce((s, i) => s + Number(i.unitPrice) * Number(i.qty), 0);
@@ -330,11 +341,13 @@ export function createDevRouter(io) {
   r.post('/orders', (req, res) => {
     const b = req.body;
     const items = (b.items || []).map((i) => ({ ...i, status: 'pending' }));
-    const { subtotal, tax, total } = computeTotals(items, 0);
+    const { subtotal, tax, total: grossTotal } = computeTotals(items, 0);
+    const discount = Math.max(0, Number(b.discount || 0));
+    const total = Math.max(0, grossTotal - discount);
     const o = {
       id: nid(), orgId: '1', storeId: '1', orderNo: orderNo(), type: b.type || 'dine_in',
       tableId: b.tableId ? String(b.tableId) : null, customerName: b.customerName || null, phone: b.phone || null,
-      status: 'open', items, subtotal, tax, total, createdBy: req.user.id, voidReason: null,
+      status: 'open', items, subtotal, discount, tax, total, createdBy: req.user.id, shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
       createdAt: now(), updatedAt: now(),
     };
     store.orders.push(o);
@@ -362,6 +375,8 @@ export function createDevRouter(io) {
       return res.json(toOrder(o));
     }
     o.status = req.body.status || o.status; o.updatedAt = now();
+    if (o.status === 'served') io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
+    else io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
     res.json(toOrder(o));
   });
   r.post('/orders/:id/checkout', (req, res) => {
@@ -438,6 +453,94 @@ export function createDevRouter(io) {
     const byMethod = {};
     for (const p of store.payments) byMethod[p.method] = (byMethod[p.method] || 0) + Number(p.amount || 0);
     res.json({ date: now(), total, orderCount: paid.length, byMethod, saleMovements: 0 });
+  });
+
+  // ---- 会员 / 会员充值 / 积分 / Knock Off ----
+  r.get('/members', (req, res) => res.json(store.members.map(toMember)));
+  r.post('/members', (req, res) => {
+    const b = req.body || {};
+    const m = { id: nid(), orgId: '1', storeId: '1', memberNo: b.memberNo || `M${String(store.members.length + 1).padStart(4, '0')}`, name: b.name || '', phone: b.phone || '', creditBalance: Number(b.creditBalance || 0), points: Number(b.points || 0), status: 'active', createdAt: now() };
+    store.members.push(m); res.status(201).json(toMember(m));
+  });
+  r.put('/members/:id', (req, res) => {
+    const m = store.members.find((x) => x.id === req.params.id);
+    if (!m) return res.status(404).json({ error: 'not found' });
+    Object.assign(m, { memberNo: req.body.memberNo ?? m.memberNo, name: req.body.name ?? m.name, phone: req.body.phone ?? m.phone, status: req.body.status ?? m.status });
+    res.json(toMember(m));
+  });
+  r.post('/members/:id/top-up', (req, res) => {
+    const m = store.members.find((x) => x.id === req.params.id);
+    const amount = Number(req.body.amount || 0);
+    if (!m || amount <= 0) return res.status(400).json({ error: 'invalid member or amount' });
+    m.creditBalance += amount;
+    const topup = { id: nid(), memberId: m.id, receiptNo: `TU${Date.now()}`, amount, createdAt: now(), createdBy: req.user.id };
+    store.memberTopups.push(topup); res.json({ member: toMember(m), topup });
+  });
+  r.get('/members/:id/ledger', (req, res) => res.json({ topups: store.memberTopups.filter((x) => x.memberId === req.params.id), points: store.pointsLedger.filter((x) => x.memberId === req.params.id) }));
+  r.post('/members/:id/points', (req, res) => {
+    const m = store.members.find((x) => x.id === req.params.id); const delta = Number(req.body.delta || 0);
+    if (!m) return res.status(404).json({ error: 'not found' });
+    m.points = Math.max(0, m.points + delta); const row = { id: nid(), memberId: m.id, delta, reason: req.body.reason || 'manual', createdAt: now() }; store.pointsLedger.push(row); res.json({ member: toMember(m), entry: row });
+  });
+  r.post('/members/:id/knock-off', (req, res) => {
+    const m = store.members.find((x) => x.id === req.params.id); const amount = Number(req.body.amount || 0);
+    if (!m || amount <= 0 || amount > m.creditBalance) return res.status(400).json({ error: 'invalid amount' });
+    m.creditBalance -= amount; res.json({ member: toMember(m), knockedOff: amount, receiptNo: `RV${Date.now()}` });
+  });
+
+  // ---- Cash In / Withdraw / Payment / Received / Credit Note ----
+  r.get('/finance/movements', (req, res) => res.json(store.cashMovements.map(toMovement)));
+  r.post('/finance/movements', (req, res) => {
+    const b = req.body || {}; const amount = Number(b.amount || 0);
+    if (amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
+    const row = { id: nid(), type: b.type || 'cash_in', voucherNo: b.voucherNo || `V${Date.now()}`, payTo: b.payTo || '', amount, reason: b.reason || b.for || '', method: b.method || 'cash', createdBy: req.user.id, createdAt: now() };
+    store.cashMovements.unshift(row); res.status(201).json(toMovement(row));
+  });
+  r.get('/finance/credit-notes', (req, res) => res.json(store.creditNotes));
+  r.post('/finance/credit-notes', (req, res) => {
+    const b = req.body || {}; const row = { id: nid(), creditNo: b.creditNo || `CN${Date.now()}`, customerName: b.customerName || '', orderNo: b.orderNo || '', reason: b.reason || '', gst: !!b.gst, items: b.items || [], status: 'open', createdBy: req.user.id, createdAt: now() };
+    store.creditNotes.unshift(row); res.status(201).json(row);
+  });
+
+  // ---- Attendance ----
+  r.get('/attendance', (req, res) => res.json(store.attendance.map(toAttendance)));
+  r.post('/attendance', (req, res) => {
+    const action = req.body.action || 'sign_in';
+    const row = { id: nid(), userId: req.user.id, userName: req.user.name, action, code: req.body.code || '', note: req.body.note || '', time: now() };
+    store.attendance.unshift(row); res.status(201).json(toAttendance(row));
+  });
+
+  // ---- Shift / Close Shift Settlement ----
+  r.get('/shifts/current', (req, res) => {
+    let s = store.shifts.find((x) => x.status === 'open');
+    if (!s) { s = { id: nid(), orgId: '1', storeId: '1', cashierId: req.user.id, openAmount: 0, expectedAmount: 0, closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null }; store.shifts.push(s); }
+    const paid = store.orders.filter((o) => o.status === 'paid' && o.shiftId === s.id);
+    s.expectedAmount = s.openAmount + paid.reduce((sum, o) => sum + Number(o.total || 0), 0);
+    res.json({ shift: toShift(s), paidOrders: paid.map(toOrder), byMethod: Object.fromEntries(Object.entries(store.payments.filter((p) => paid.some((o) => o.id === p.orderId)).reduce((a, p) => { a[p.method] = (a[p.method] || 0) + Number(p.amount); return a; }, {}))) });
+  });
+  r.post('/shifts/open', (req, res) => { const s = { id: nid(), orgId: '1', storeId: '1', cashierId: req.user.id, openAmount: Number(req.body.openAmount || 0), expectedAmount: Number(req.body.openAmount || 0), closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null }; store.shifts.push(s); res.status(201).json(toShift(s)); });
+  r.post('/shifts/:id/close', (req, res) => {
+    const s = store.shifts.find((x) => x.id === req.params.id); if (!s || s.status !== 'open') return res.status(404).json({ error: 'open shift not found' });
+    s.closeAmount = Number(req.body.closeAmount || 0); const paid = store.orders.filter((o) => o.status === 'paid' && o.shiftId === s.id); s.expectedAmount = s.openAmount + paid.reduce((sum, o) => sum + Number(o.total || 0), 0); s.difference = s.closeAmount - s.expectedAmount; s.status = 'closed'; s.closedAt = now(); res.json(toShift(s));
+  });
+
+  // ---- Suppliers / Purchase Order / GRN ----
+  r.get('/suppliers', (req, res) => res.json(store.suppliers.map(toSupplier)));
+  r.post('/suppliers', (req, res) => { const b = req.body || {}; const s = { id: nid(), orgId: '1', storeId: '1', code: b.code || `SUP-${store.suppliers.length + 1}`, name: b.name || '', phone: b.phone || '', contact: b.contact || '', status: 'active', createdAt: now() }; store.suppliers.push(s); res.status(201).json(toSupplier(s)); });
+  r.get('/purchases', (req, res) => res.json(store.purchaseOrders));
+  r.post('/purchases', (req, res) => { const b = req.body || {}; const p = { id: nid(), poNo: b.poNo || `PO${Date.now()}`, supplierId: b.supplierId || null, items: b.items || [], total: Number(b.total || 0), status: 'open', createdAt: now() }; store.purchaseOrders.unshift(p); res.status(201).json(p); });
+  r.post('/purchases/:id/receive', (req, res) => { const p = store.purchaseOrders.find((x) => x.id === req.params.id); if (!p) return res.status(404).json({ error: 'not found' }); p.status = 'received'; p.receivedAt = now(); for (const item of p.items || []) { const inv = store.inventory.find((x) => x.id === String(item.itemId)); if (inv) inv.quantity += Number(item.qty || 0); } res.json(p); });
+
+  // ---- 通用报表查询，供 ReportsPage / 后台使用 ----
+  r.get('/reports/query', (req, res) => {
+    const type = req.query.type || 'sales_by_date';
+    const paid = store.orders.filter((o) => o.status === 'paid');
+    const rows = type === 'sales_by_product'
+      ? Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const k = i.code || i.name; a[k] = a[k] || { code: k, name: i.name, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {}))
+      : type === 'sales_by_payment'
+        ? Object.entries(store.payments.reduce((a, p) => { a[p.method] = (a[p.method] || 0) + Number(p.amount); return a; }, {})).map(([method, amount]) => ({ method, amount }))
+        : paid.map((o) => ({ orderNo: o.orderNo, date: o.createdAt, subtotal: o.subtotal, discount: o.discount, tax: o.tax, total: o.total, status: o.status }));
+    res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, total: paid.reduce((s, o) => s + Number(o.total || 0), 0), count: paid.length });
   });
 
   return r;

@@ -37,7 +37,8 @@ export default function DesktopPage() {
     if (key === 'tables') return navigate('/tables');
     if (key === 'menu') return navigate('/menu');
     if (key === 'inventory') return navigate('/inventory');
-    if (key === 'reports') return navigate('/desktop?feature=reports');
+    if (key === 'reports') return navigate('/operations?tab=reports');
+    if (key === 'cash-in' || key === 'close-shift') return navigate(`/operations?tab=${key === 'close-shift' ? 'shifts' : 'finance'}`);
     navigate(`/desktop?feature=${key}`);
   };
 
