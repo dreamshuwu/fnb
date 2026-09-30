@@ -41,25 +41,45 @@ export default function DesktopPage() {
     navigate(`/desktop?feature=${key}`);
   };
 
-  return (
-    <div className="legacy-desktop">
-      <div className="legacy-brand-mark">SMPOS <small>F&amp;B MANAGEMENT SYSTEM</small></div>
-      <div className="legacy-desktop-title">Food and Beverage Management</div>
-      <div className="legacy-desktop-copy">COMPUTERISED POINT OF SALE</div>
-      <div className="legacy-clock">{clock.toLocaleDateString('en-GB')} {clock.toLocaleTimeString('en-GB')}</div>
+  const actions = [
+    ['sales', 'Sales', 'Start a new order', 'accent'],
+    ['cash-in', 'Cash In', 'Record cash received', 'mint'],
+    ['close-shift', 'Close Shift', 'Settle the current shift', 'gold'],
+    ['reports', 'Reports', 'Open sales reports', 'lavender'],
+    ['tables', 'Floor Plan', 'View tables and sales', 'sky'],
+    ['menu', 'Menu Control', 'Edit products and prices', 'rose'],
+  ];
 
-      <div className="legacy-center-panel">
-        <div className="legacy-panel-line" />
-        <div className="legacy-panel-caption">READY</div>
-        <div className="legacy-panel-subtitle">Please select a function from the menu</div>
-      </div>
-      <div className="legacy-keyboard"><VirtualKeyboard /></div>
-      <div className="legacy-status-bar"><span>● System Ready</span><span>User: {localStorage.getItem('userName') || 'Cashier'}</span><span>Store: Demo Store</span></div>
+  return (
+    <div className="modern-dashboard">
+      <section className="modern-welcome">
+        <div>
+          <div className="modern-eyebrow">SMPOS / OPERATIONS</div>
+          <h1>Good evening, {localStorage.getItem('userName') || 'Cashier'}</h1>
+          <p>Your store is ready for service. Choose a workspace to continue.</p>
+        </div>
+        <div className="modern-time"><strong>{clock.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</strong><span>{clock.toLocaleDateString('en-GB', { weekday: 'long', day: '2-digit', month: 'short' })}</span></div>
+      </section>
+
+      <section className="modern-status-row">
+        <div className="modern-status-card"><span className="status-dot green" /><div><small>Service status</small><strong>Ready to trade</strong></div></div>
+        <div className="modern-status-card"><span className="status-icon">$</span><div><small>Today&apos;s sales</small><strong>¥0.00</strong></div></div>
+        <div className="modern-status-card"><span className="status-icon">▦</span><div><small>Open tables</small><strong>0 / 3</strong></div></div>
+        <div className="modern-status-card"><span className="status-icon">⌁</span><div><small>Shift</small><strong>Not closed</strong></div></div>
+      </section>
+
+      <section className="modern-section-heading"><div><h2>Quick workspace</h2><p>Frequently used operations</p></div><span>Demo Store</span></section>
+      <section className="modern-action-grid">
+        {actions.map(([key, title, subtitle, tone]) => <button key={key} className={`modern-action-card ${tone}`} onClick={() => goFeature(key)}><span className="modern-action-symbol">{key === 'sales' ? '+' : key === 'reports' ? '▥' : key === 'tables' ? '▦' : key === 'menu' ? '≡' : key === 'close-shift' ? '✓' : '$'}</span><span><strong>{title}</strong><small>{subtitle}</small></span><b>→</b></button>)}
+      </section>
+
+      <section className="modern-lower-grid">
+        <div className="modern-info-card"><div className="modern-card-heading"><span>Shift checklist</span><small>Today</small></div><div className="check-row done"><span>✓</span>Sign in as cashier<strong>Done</strong></div><div className="check-row"><span>2</span>Open the first table<strong>Next</strong></div><div className="check-row"><span>3</span>Close shift at the end<strong>Pending</strong></div></div>
+        <div className="modern-info-card accent-card"><div className="modern-card-heading"><span>Shortcut</span><small>Fast access</small></div><h3>Start taking orders</h3><p>Use the Sales screen for dine-in, takeaway and member orders.</p><button onClick={() => goFeature('sales')}>Open Sales <b>→</b></button></div>
+      </section>
 
       {feature === 'sales' && <SalesWindow onClose={() => navigate('/')} onCashier={() => navigate('/cashier')} />}
-      {feature && feature !== 'sales' && feature !== 'reports' && FEATURE_INFO[feature] && (
-        <FeatureWindow info={FEATURE_INFO[feature]} onClose={() => navigate('/')} />
-      )}
+      {feature && feature !== 'sales' && feature !== 'reports' && FEATURE_INFO[feature] && <FeatureWindow info={FEATURE_INFO[feature]} onClose={() => navigate('/')} />}
       {showReports && <ReportWindow onClose={() => navigate('/')} />}
     </div>
   );
