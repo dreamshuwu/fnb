@@ -48,23 +48,13 @@ export default function DesktopPage() {
       <div className="legacy-desktop-copy">COMPUTERISED POINT OF SALE</div>
       <div className="legacy-clock">{clock.toLocaleDateString('en-GB')} {clock.toLocaleTimeString('en-GB')}</div>
 
-      <div className="legacy-launch-grid">
-        <Shortcut title="Sales" color="green" onClick={() => goFeature('sales')} />
-        <Shortcut title="Cash In" color="yellow" onClick={() => goFeature('cash-in')} />
-        <Shortcut title="Withdraw" color="pink" onClick={() => goFeature('withdraw')} />
-        <Shortcut title="Payment" color="blue" onClick={() => goFeature('payment')} />
-        <Shortcut title="Credit Note" color="purple" onClick={() => goFeature('credit-note')} />
-        <Shortcut title="Received" color="green" onClick={() => goFeature('received')} />
-        <Shortcut title="Open Drawer" color="orange" onClick={() => alert('钱箱开启指令已发送（浏览器版会在硬件连接后执行）')} />
-        <Shortcut title="Close Shift" color="pink" onClick={() => goFeature('close-shift')} />
-        <Shortcut title="Daily Sales" color="yellow" onClick={() => goFeature('daily-sales')} />
-        <Shortcut title="Reports" color="blue" onClick={() => goFeature('reports')} />
-        <Shortcut title="Attendance" color="green" onClick={() => goFeature('attendance')} />
-        <Shortcut title="Password" color="purple" onClick={() => goFeature('password')} />
+      <div className="legacy-center-panel">
+        <div className="legacy-panel-line" />
+        <div className="legacy-panel-caption">READY</div>
+        <div className="legacy-panel-subtitle">Please select a function from the menu</div>
       </div>
-
-      <div className="legacy-home-hint">选择左侧功能，或点击上方快捷按钮开始操作</div>
       <div className="legacy-keyboard"><VirtualKeyboard /></div>
+      <div className="legacy-status-bar"><span>● System Ready</span><span>User: {localStorage.getItem('userName') || 'Cashier'}</span><span>Store: Demo Store</span></div>
 
       {feature === 'sales' && <SalesWindow onClose={() => navigate('/')} onCashier={() => navigate('/cashier')} />}
       {feature && feature !== 'sales' && feature !== 'reports' && FEATURE_INFO[feature] && (

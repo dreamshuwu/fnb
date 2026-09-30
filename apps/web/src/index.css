@@ -13,33 +13,29 @@ button { cursor: pointer; }
 
 /* Screenshot-inspired SMPOS shell: blue desktop + beveled lavender controls. */
 .legacy-login { min-height: 100vh; position: relative; overflow: hidden; background: radial-gradient(ellipse at 55% 30%, #4777f3 0, #2b5cdb 50%, #224dc4 100%); color: #10227e; padding: 8px; }.legacy-login-title { color: #e7edff; font-size: 11px; }.legacy-login-logo { width: 100%; text-align: center; margin-top: 70px; font: 100px Georgia, serif; letter-spacing: -6px; color: #0639bb; text-shadow: 2px 2px #70a7ff; }.legacy-login-logo small { display: block; font: 700 20px Tahoma, sans-serif; letter-spacing: 1px; color: #071b81; text-shadow: none; }.legacy-login-window { position: absolute; left: 50%; top: 43%; transform: translate(-50%, -50%); width: 340px; background: #c6c7f8; border: 2px solid #4749a6; box-shadow: 4px 5px 0 rgba(17,26,115,.35), inset 1px 1px #fff; }.legacy-login-window header { padding: 6px; color: #fff; background: linear-gradient(90deg, #1a36bd, #6974dd 60%, #283bb2); font-size: 12px; }.legacy-login-body { padding: 18px 28px; }.legacy-login-body label { display: grid; grid-template-columns: 90px 1fr; align-items: center; gap: 6px; font-size: 12px; margin: 9px 0; }.legacy-login-body input { height: 24px; border: 1px solid #7074c1; background: #eeeeff; padding: 3px; }.legacy-app-shell { min-height: 100vh; display: flex; background: #2f62db; }
-.legacy-sidebar { width: 178px; flex: 0 0 178px; padding: 8px 8px 10px; background: linear-gradient(90deg, #b1b0f3, #dde0ff 45%, #8d8fe9); border-right: 5px solid #1948c7; box-shadow: inset -2px 0 #e9e9ff; }
-.legacy-sidebar-title { font-size: 11px; color: #112f8e; border: 1px solid #2346af; background: #b5b8f7; padding: 4px; margin-bottom: 5px; line-height: 1.15; }
+.legacy-sidebar { width: 166px; flex: 0 0 166px; padding: 7px 7px 9px; background: linear-gradient(90deg, #a6a6ed 0%, #d9dbff 45%, #aaaaf0 100%); border-right: 4px solid #1b43bb; box-shadow: inset -2px 0 #f5f5ff; }
+.legacy-sidebar-title { font-size: 10px; color: #132b86; border: 1px solid #4b50b6; background: linear-gradient(#d9dcff, #a9abea); padding: 5px 4px; margin-bottom: 5px; line-height: 1.15; box-shadow: inset 1px 1px #fff; }
 .legacy-sidebar nav { display: flex; flex-direction: column; gap: 2px; }
-.legacy-nav-item { min-height: 34px; border: 1px solid #777bd1; border-radius: 2px; padding: 6px 7px; text-align: left; color: #14256d; background: linear-gradient(#dfe0ff, #a6a7e9); box-shadow: inset 1px 1px #fff; font-size: 13px; }
-.legacy-nav-item:hover, .legacy-nav-item.active { background: linear-gradient(#fff2ff, #f2a5d4); color: #1b1779; }
-.legacy-nav-item span { width: 21px; display: inline-block; color: #122b9e; }
-.legacy-nav-item.exit { margin-top: 8px; }
+.legacy-nav-item { min-height: 31px; border: 1px solid #7476c7; border-radius: 2px; padding: 5px 6px; text-align: left; color: #15256d; background: linear-gradient(#e8e9ff, #b5b7ef); box-shadow: inset 1px 1px #fff; font-size: 12px; transition: filter .12s ease; }
+.legacy-nav-item:hover, .legacy-nav-item.active { background: linear-gradient(#fff8ff, #f2add5); color: #1b1779; filter: brightness(1.03); }
+.legacy-nav-item span { width: 20px; display: inline-block; color: #122b9e; font-size: 11px; }
+.legacy-nav-item.exit { margin-top: 7px; }
 .legacy-user { margin-top: 18px; border-top: 1px solid #6e70c9; color: #1c2873; font-size: 12px; padding: 8px 4px; }
 .legacy-main { flex: 1; min-width: 0; min-height: 100vh; background: #3164df; padding: 7px; overflow: auto; }
 
-.legacy-desktop { min-height: calc(100vh - 14px); position: relative; overflow: hidden; color: #030d75; background: radial-gradient(ellipse at 55% 30%, #426ff1 0, #2c5ddd 48%, #2854cd 100%); border: 1px solid #173db2; }
-.legacy-desktop-title { position: absolute; top: 7px; left: 8px; font-size: 11px; color: #e6edff; text-shadow: 1px 1px #16349c; }
-.legacy-brand-mark { position: absolute; top: 64px; left: 29%; width: 43%; text-align: center; font-family: Georgia, serif; font-size: clamp(40px, 7vw, 92px); letter-spacing: -5px; color: #0639bb; text-shadow: 2px 2px 0 #65a5ff; opacity: .9; }
-.legacy-brand-mark small { display: block; font: 700 15px Tahoma, sans-serif; letter-spacing: 1px; color: #071b81; text-shadow: none; }
-.legacy-desktop-copy { position: absolute; top: 187px; left: 30%; width: 42%; text-align: center; font-size: 19px; font-family: Georgia, serif; color: #161e82; font-weight: 700; }
-.legacy-clock { position: absolute; right: 12px; top: 8px; font-size: 12px; color: #eaf0ff; }
-.legacy-launch-grid { position: absolute; left: 19px; top: 16px; display: grid; grid-template-columns: repeat(3, minmax(112px, 1fr)); gap: 6px; width: min(420px, 43%); opacity: .96; }
-.legacy-shortcut { height: 43px; text-align: left; padding: 5px 7px; color: #1f176e; border: 1px solid #4d43ae; box-shadow: inset 1px 1px #fff; border-radius: 2px; font-size: 12px; background: linear-gradient(#dfffe2, #88d6a5); }
-.legacy-shortcut:hover { filter: brightness(1.08); transform: translateY(-1px); }
-.legacy-shortcut.yellow { background: linear-gradient(#fffcc7, #e8d477); }
-.legacy-shortcut.pink { background: linear-gradient(#ffe1f4, #e68dbb); }
-.legacy-shortcut.blue { background: linear-gradient(#dceaff, #91aeea); }
-.legacy-shortcut.purple { background: linear-gradient(#f1dfff, #b68ad9); }
-.legacy-shortcut.orange { background: linear-gradient(#fff0cc, #e9a85d); }
-.shortcut-icon { margin-right: 6px; font-size: 9px; }
-.legacy-home-hint { position: absolute; right: 22px; top: 210px; color: #cddcff; font-size: 13px; }
-.legacy-keyboard { position: absolute; left: 22%; right: 23%; bottom: 20px; }
+.legacy-desktop { min-height: calc(100vh - 14px); position: relative; overflow: hidden; color: #10156c; background: linear-gradient(135deg, #4d78eb 0%, #3565dd 45%, #2b59d1 100%); border: 1px solid #183da9; box-shadow: inset 0 0 0 2px rgba(255,255,255,.12); }
+.legacy-desktop::after { content: ''; position: absolute; inset: 35px 18px 41px; pointer-events: none; border: 1px solid rgba(164,190,255,.18); box-shadow: inset 0 0 34px rgba(12,36,150,.16); }
+.legacy-desktop-title { position: absolute; z-index: 1; top: 7px; left: 8px; font-size: 11px; color: #e9efff; text-shadow: 1px 1px #16349c; }
+.legacy-brand-mark { position: absolute; z-index: 1; top: 74px; left: 25%; width: 52%; text-align: center; font-family: Georgia, serif; font-size: clamp(50px, 8vw, 100px); letter-spacing: -6px; color: #073abe; text-shadow: 2px 2px 0 #82b5ff, 0 0 12px rgba(15,38,160,.2); opacity: .94; }
+.legacy-brand-mark small { display: block; margin-top: 2px; font: 700 14px Tahoma, sans-serif; letter-spacing: 1.2px; color: #081d82; text-shadow: none; }
+.legacy-desktop-copy { position: absolute; z-index: 1; top: 196px; left: 25%; width: 52%; text-align: center; font-size: 18px; font-family: Georgia, serif; color: #151d86; font-weight: 700; letter-spacing: .3px; }
+.legacy-clock { position: absolute; z-index: 1; right: 12px; top: 8px; font-size: 11px; color: #edf2ff; }
+.legacy-center-panel { position: absolute; z-index: 1; top: 252px; left: 28%; width: 46%; text-align: center; color: #dce5ff; font-size: 12px; opacity: .9; }
+.legacy-panel-line { height: 1px; background: rgba(209,224,255,.5); box-shadow: 0 1px rgba(26,55,167,.45); }
+.legacy-panel-caption { margin-top: 9px; color: #eff4ff; font-size: 14px; letter-spacing: 2px; }
+.legacy-panel-subtitle { margin-top: 4px; color: #c7d7ff; font-size: 11px; }
+.legacy-keyboard { position: absolute; z-index: 1; left: 22%; right: 21%; bottom: 44px; opacity: .72; }
+.legacy-status-bar { position: absolute; z-index: 2; left: 8px; right: 8px; bottom: 7px; height: 25px; display: flex; justify-content: space-between; align-items: center; padding: 0 9px; color: #dfe7ff; background: rgba(37,69,181,.72); border: 1px solid rgba(185,205,255,.4); font-size: 10px; }
 .virtual-keyboard { opacity: .78; padding: 4px; border: 1px solid #4c67c8; background: rgba(86, 111, 227, .45); }
 .vk-row { display: flex; gap: 3px; margin: 3px 0; }
 .vk-row button { flex: 1; height: 27px; color: #18247c; border: 1px solid #7784d1; background: linear-gradient(#dfe4ff, #99a4eb); font-size: 11px; box-shadow: inset 1px 1px #f4f5ff; }
