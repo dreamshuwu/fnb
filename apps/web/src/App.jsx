@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './auth/AuthContext.jsx';
 import Layout from './components/Layout.jsx';
 import Login from './pages/Login.jsx';
+import DesktopPage from './pages/DesktopPage.jsx';
 import CashierPage from './pages/CashierPage.jsx';
 import KDSPage from './pages/KDSPage.jsx';
 import MenuPage from './pages/MenuPage.jsx';
@@ -31,7 +32,8 @@ export default function App() {
           </Require>
         }
       >
-        <Route index element={<CashierPage />} />
+        <Route index element={<DesktopPage />} />
+        <Route path="desktop" element={<DesktopPage />} />
         <Route path="cashier" element={<CashierPage />} />
         <Route
           path="kds"

@@ -8,39 +8,6 @@ export default function Login() {
   const [password, setPassword] = useState('cashier123');
   const [err, setErr] = useState('');
   const navigate = useNavigate();
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setErr('');
-    try {
-      const u = await login(phone, password);
-      navigate(u.role === 'kitchen' ? '/kds' : '/');
-    } catch {
-      setErr('登录失败,请检查手机 / 密码');
-    }
-  };
-
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-100">
-      <form onSubmit={submit} className="bg-white p-8 rounded shadow w-80 space-y-4">
-        <h1 className="text-xl font-bold">F&B POS 登录</h1>
-        <input
-          className="w-full border p-2 rounded"
-          placeholder="手机"
-          value={phone}
-          onChange={(e) => setPhone(e.target.value)}
-        />
-        <input
-          type="password"
-          className="w-full border p-2 rounded"
-          placeholder="密码"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-        {err && <div className="text-red-600 text-sm">{err}</div>}
-        <button className="w-full bg-blue-600 text-white p-2 rounded">登录</button>
-        <div className="text-xs text-slate-400">默认账号见 README(admin/manager/cashier/waiter/kitchen)</div>
-      </form>
-    </div>
-  );
+  const submit = async (e) => { e.preventDefault(); setErr(''); try { const u = await login(phone, password); navigate(u.role === 'kitchen' ? '/kds' : '/'); } catch { setErr('Login failed / invalid UserID or Password'); } };
+  return <div className="legacy-login"><div className="legacy-login-title">Food and Beverage Management</div><div className="legacy-login-logo">SMPOS<small>COMPUTERISED POINT OF SALE</small></div><form onSubmit={submit} className="legacy-login-window"><header>▣ User Login</header><div className="legacy-login-body"><label>UserID<input value={phone} onChange={(e) => setPhone(e.target.value)} /></label><label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>{err && <div className="text-red-700 text-xs">{err}</div>}<div className="legacy-window-actions"><button className="legacy-btn green">Login</button><button type="button" className="legacy-btn pink" onClick={() => setPassword('')}>Clear</button></div><div className="text-[10px] text-center text-indigo-900">Demo UserID: 1000000002 / cashier123</div></div></form></div>;
 }
