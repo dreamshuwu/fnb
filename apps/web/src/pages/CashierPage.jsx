@@ -112,20 +112,21 @@ export default function CashierPage() {
     setPaymentMethod('cash');
     setAmountTendered(String(Number(order.total).toFixed(2)));
   };
-  const confirmPayment = async () => {
+  const confirmPayment = () => {
     if (!paymentOrder) return;
     const tendered = Number(amountTendered);
     if (!Number.isFinite(tendered) || tendered < Number(paymentOrder.total)) { alert('实收金额不足'); return; }
-    const result = await api.post(`/orders/${paymentOrder._id}/checkout`, { payments: [{ method: paymentMethod, amount: tendered }], tip: 0 });
+    // Payment 这里只确认金额；真正 checkout/扣库存/释放桌位在 Settlement 完成时执行。
     setPaymentOrder(null);
-    setSettlement({ order: paymentOrder, receipt: result.data.receipt, method: paymentMethod, tendered, change: tendered - Number(paymentOrder.total) });
+    setSettlement({ order: paymentOrder, method: paymentMethod, tendered, change: tendered - Number(paymentOrder.total) });
+  };
+  const completeSettlement = async () => {
+    if (!settlement) return;
+    const result = await api.post(`/orders/${settlement.order._id}/checkout`, { payments: [{ method: settlement.method, amount: settlement.tendered }], tip: 0 });
+    setReceipt({ ...result.data.receipt, payments: [{ method: settlement.method, amount: settlement.tendered }] });
+    setSettlement(null);
     loadActive();
     loadTables();
-  };
-  const completeSettlement = () => {
-    if (!settlement) return;
-    setReceipt({ ...settlement.receipt, payments: [{ method: settlement.method, amount: settlement.tendered }] });
-    setSettlement(null);
   };
   const requestVoid = async (o) => { const reason = prompt('取消原因(需主管审批):'); if (!reason) return; await api.post(`/orders/${o._id}/void`, { reason }); loadActive(); };
 
