@@ -105,19 +105,19 @@ router.put('/:id/status', async (req, res) => {
 async function deductInventory(order, user, io) {
   const low = [];
   for (const it of order.items) {
-    const mi = await getRow('SELECT * FROM menu_items WHERE id=?', [Number(it.itemId)]);
-    if (!mi || !mi.track_inventory || !mi.inventory_item_id) continue;
-    const inv = await getRow('SELECT * FROM inventory_items WHERE id=?', [mi.inventory_item_id]);
-    if (!inv) continue;
-    const before = Number(inv.quantity || 0);
+    const vid = it.variantId || it.itemId;
+    if (!vid) continue;
+    const v = await getRow('SELECT * FROM menu_variants WHERE id=?', [Number(vid)]);
+    if (!v) continue;
+    const before = Number(v.stock_qty || 0);
     const after = Math.max(0, before - it.qty);
-    await query('UPDATE inventory_items SET quantity=? WHERE id=?', [after, inv.id]);
+    await query('UPDATE menu_variants SET stock_qty=? WHERE id=?', [after, v.id]);
     await insert(
       `INSERT INTO stock_movements (org_id, store_id, item_id, type, delta, before, after, ref_order_id, created_by)
        VALUES (?,?,?,?,?,?,?,?,?)`,
-      [user.orgId, user.storeId, inv.id, 'sale', -it.qty, before, after, order.id, user.id]
+      [user.orgId, user.storeId, v.id, 'sale', -it.qty, before, after, order.id, user.id]
     );
-    if (after < Number(inv.threshold || 0)) low.push({ itemId: String(inv.id), name: inv.name, quantity: after });
+    if (after < Number(v.stock_threshold || 0)) low.push({ itemId: String(v.id), name: v.name, quantity: after });
   }
   if (low.length) emitToStore(io, user.storeId, 'inventory:low', low);
 }

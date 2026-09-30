@@ -85,28 +85,70 @@ export async function initSchema() {
       org_id INT NOT NULL,
       store_id INT NOT NULL,
       name VARCHAR(255) NOT NULL,
+      color VARCHAR(32),
       sort_order INT,
       is_active TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX (org_id, store_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-    `CREATE TABLE IF NOT EXISTS menu_items (
+    `CREATE TABLE IF NOT EXISTS menu_bases (
       id INT AUTO_INCREMENT PRIMARY KEY,
       org_id INT NOT NULL,
       store_id INT NOT NULL,
       category_id INT,
       name VARCHAR(255) NOT NULL,
-      price DECIMAL(10,2) NOT NULL DEFAULT 0,
-      image_url VARCHAR(512),
-      modifier_groups TEXT,
-      track_inventory TINYINT(1) DEFAULT 0,
-      inventory_item_id INT,
-      is_sold_out TINYINT(1) DEFAULT 0,
+      base_price DECIMAL(10,2) DEFAULT 0,
+      sort_order INT,
       is_active TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (category_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS menu_modifiers (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      org_id INT NOT NULL,
+      store_id INT NOT NULL,
+      code VARCHAR(32) NOT NULL,
+      label VARCHAR(255),
+      default_delta DECIMAL(10,2) DEFAULT 0,
+      sort_order INT,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS menu_base_modifiers (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      org_id INT NOT NULL,
+      store_id INT NOT NULL,
+      base_id INT NOT NULL,
+      modifier_id INT NOT NULL,
+      delta DECIMAL(10,2),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY (base_id, modifier_id),
+      INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS menu_variants (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      org_id INT NOT NULL,
+      store_id INT NOT NULL,
+      base_id INT NOT NULL,
+      category_id INT,
+      code VARCHAR(32) NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      modifier_ids TEXT,
+      price DECIMAL(10,2) NOT NULL DEFAULT 0,
+      cost DECIMAL(10,2) DEFAULT 0,
+      stock_qty DECIMAL(12,3) DEFAULT 0,
+      stock_threshold DECIMAL(12,3) DEFAULT 0,
+      barcode VARCHAR(64),
+      sort_order INT,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (base_id), INDEX (category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS tables (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -226,17 +268,36 @@ export const toUser = (r) => ({
 });
 export const toMenuCategory = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id, name: r.name,
+  color: r.color || null,
   sortOrder: r.sort_order, isActive: !!r.is_active,
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
 });
-export const toMenuItem = (r) => ({
+export const toMenuBase = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
-  categoryId: r.category_id == null ? null : String(r.category_id), name: r.name,
-  price: Number(r.price || 0), imageUrl: r.image_url,
-  modifierGroups: parseJSON(r.modifier_groups),
-  trackInventory: !!r.track_inventory,
-  inventoryItemId: r.inventory_item_id == null ? null : String(r.inventory_item_id),
-  isSoldOut: !!r.is_sold_out, isActive: !!r.is_active,
+  categoryId: r.category_id == null ? null : String(r.category_id),
+  name: r.name, basePrice: Number(r.base_price || 0),
+  sortOrder: r.sort_order, isActive: !!r.is_active,
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+export const toModifier = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  code: r.code, label: r.label, defaultDelta: Number(r.default_delta || 0),
+  sortOrder: r.sort_order, isActive: !!r.is_active,
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+export const toBaseModifier = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  baseId: String(r.base_id), modifierId: String(r.modifier_id),
+  delta: r.delta == null ? null : Number(r.delta),
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+export const toVariant = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  baseId: String(r.base_id), categoryId: r.category_id == null ? null : String(r.category_id),
+  code: r.code, name: r.name, modifierIds: parseJSON(r.modifier_ids),
+  price: Number(r.price || 0), cost: r.cost == null ? 0 : Number(r.cost),
+  stockQty: Number(r.stock_qty || 0), stockThreshold: Number(r.stock_threshold || 0),
+  barcode: r.barcode, sortOrder: r.sort_order, isActive: !!r.is_active,
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
 });
 export const toTable = (r) => ({

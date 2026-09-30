@@ -8,19 +8,49 @@ export const loginSchema = z.object({
 
 export const categorySchema = z.object({
   name: z.string().min(1),
+  color: z.string().optional(),
   sortOrder: z.number().optional(),
   isActive: z.boolean().optional(),
 });
 
-export const itemSchema = z.object({
+// 基底（第一步点的东西）
+export const baseSchema = z.object({
   categoryId: z.string().optional(),
   name: z.string().min(1),
+  basePrice: z.number().min(0).optional(),
+  sortOrder: z.number().optional(),
+  isActive: z.boolean().optional(),
+});
+
+// 修饰/后缀（O/KOS/C/P/K/SP/SUSU/Tarik/DANGGUT…）
+export const modifierSchema = z.object({
+  code: z.string().min(1),
+  label: z.string().optional(),
+  defaultDelta: z.number().default(0),
+  sortOrder: z.number().optional(),
+  isActive: z.boolean().optional(),
+});
+
+// 基底↔修饰 关联（手工勾，可逐基底覆盖差价）
+export const baseModifierSchema = z.object({
+  baseId: z.string().min(1),
+  modifierId: z.string().min(1),
+  delta: z.number().nullable().optional(),
+});
+
+// 成品变体（手工逐条录入的核心表）
+export const variantSchema = z.object({
+  baseId: z.string().min(1),
+  categoryId: z.string().optional(),
+  code: z.string().min(1),
+  name: z.string().min(1),
+  modifierIds: z.array(z.string()).optional(),
   price: z.number().min(0),
-  imageUrl: z.string().optional(),
-  modifierGroups: z.array(z.any()).optional(),
-  trackInventory: z.boolean().optional(),
-  inventoryItemId: z.string().optional(),
-  isSoldOut: z.boolean().optional(),
+  cost: z.number().min(0).optional(),
+  stockQty: z.number().default(0),
+  stockThreshold: z.number().default(0),
+  barcode: z.string().optional(),
+  sortOrder: z.number().optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -32,11 +62,13 @@ export const tableSchema = z.object({
 });
 
 export const orderItemSchema = z.object({
-  itemId: z.string(),
+  variantId: z.string().optional(),
+  itemId: z.string().optional(), // 兼容别名
+  code: z.string().optional(),
   name: z.string(),
   unitPrice: z.number(),
+  cost: z.number().optional(),
   qty: z.number().min(1),
-  modifiers: z.array(z.string()).optional(),
   note: z.string().optional(),
 });
 
