@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { query, getRow, insert, toMenuCategory, toMenuBase, toModifier, toBaseModifier, toVariant, stringifyJSON } from '../db.js';
-import { authenticate, rbac, tenant } from '../middleware/auth.js';
+import { authenticate, rbac, tenant, requirePermission } from '../middleware/auth.js';
 import { categorySchema, baseSchema, modifierSchema, baseModifierSchema, variantSchema } from '../validators.js';
 
 const router = Router();
@@ -12,7 +12,7 @@ router.get('/categories', async (req, res) => {
   const list = await query('SELECT * FROM menu_categories WHERE org_id=? AND store_id=? ORDER BY sort_order', [orgId, storeId]);
   res.json(list.map(toMenuCategory));
 });
-router.post('/categories', rbac('admin', 'manager'), async (req, res) => {
+router.post('/categories', requirePermission('menu.edit'), async (req, res) => {
   const p = categorySchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const id = await insert(
@@ -21,7 +21,7 @@ router.post('/categories', rbac('admin', 'manager'), async (req, res) => {
   );
   res.status(201).json(toMenuCategory(await getRow('SELECT * FROM menu_categories WHERE id=?', [id])));
 });
-router.put('/categories/:id', rbac('admin', 'manager'), async (req, res) => {
+router.put('/categories/:id', requirePermission('menu.edit'), async (req, res) => {
   const p = categorySchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const sets = [], params = [];
@@ -33,7 +33,7 @@ router.put('/categories/:id', rbac('admin', 'manager'), async (req, res) => {
   await query(`UPDATE menu_categories SET ${sets.join(',')} WHERE id=? AND org_id=? AND store_id=?`, params);
   res.json(toMenuCategory(await getRow('SELECT * FROM menu_categories WHERE id=?', [req.params.id])));
 });
-router.delete('/categories/:id', rbac('admin', 'manager'), async (req, res) => {
+router.delete('/categories/:id', requirePermission('menu.edit'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   await query('DELETE FROM menu_categories WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   res.json({ ok: true });
@@ -48,7 +48,7 @@ router.get('/bases', async (req, res) => {
   sql += ' ORDER BY sort_order';
   res.json((await query(sql, params)).map(toMenuBase));
 });
-router.post('/bases', rbac('admin', 'manager'), async (req, res) => {
+router.post('/bases', requirePermission('menu.edit'), async (req, res) => {
   const p = baseSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const id = await insert(
@@ -57,7 +57,7 @@ router.post('/bases', rbac('admin', 'manager'), async (req, res) => {
   );
   res.status(201).json(toMenuBase(await getRow('SELECT * FROM menu_bases WHERE id=?', [id])));
 });
-router.put('/bases/:id', rbac('admin', 'manager'), async (req, res) => {
+router.put('/bases/:id', requirePermission('menu.edit'), async (req, res) => {
   const p = baseSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const sets = [], params = [];
@@ -70,7 +70,7 @@ router.put('/bases/:id', rbac('admin', 'manager'), async (req, res) => {
   await query(`UPDATE menu_bases SET ${sets.join(',')} WHERE id=? AND org_id=? AND store_id=?`, params);
   res.json(toMenuBase(await getRow('SELECT * FROM menu_bases WHERE id=?', [req.params.id])));
 });
-router.delete('/bases/:id', rbac('admin', 'manager'), async (req, res) => {
+router.delete('/bases/:id', requirePermission('menu.edit'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   await query('DELETE FROM menu_bases WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   res.json({ ok: true });
@@ -82,7 +82,7 @@ router.get('/modifiers', async (req, res) => {
   const list = await query('SELECT * FROM menu_modifiers WHERE org_id=? AND store_id=? ORDER BY sort_order', [orgId, storeId]);
   res.json(list.map(toModifier));
 });
-router.post('/modifiers', rbac('admin', 'manager'), async (req, res) => {
+router.post('/modifiers', requirePermission('menu.edit'), async (req, res) => {
   const p = modifierSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const id = await insert(
@@ -91,7 +91,7 @@ router.post('/modifiers', rbac('admin', 'manager'), async (req, res) => {
   );
   res.status(201).json(toModifier(await getRow('SELECT * FROM menu_modifiers WHERE id=?', [id])));
 });
-router.put('/modifiers/:id', rbac('admin', 'manager'), async (req, res) => {
+router.put('/modifiers/:id', requirePermission('menu.edit'), async (req, res) => {
   const p = modifierSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const sets = [], params = [];
@@ -104,7 +104,7 @@ router.put('/modifiers/:id', rbac('admin', 'manager'), async (req, res) => {
   await query(`UPDATE menu_modifiers SET ${sets.join(',')} WHERE id=? AND org_id=? AND store_id=?`, params);
   res.json(toModifier(await getRow('SELECT * FROM menu_modifiers WHERE id=?', [req.params.id])));
 });
-router.delete('/modifiers/:id', rbac('admin', 'manager'), async (req, res) => {
+router.delete('/modifiers/:id', requirePermission('menu.edit'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   await query('DELETE FROM menu_modifiers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   res.json({ ok: true });
@@ -118,7 +118,7 @@ router.get('/base-modifiers', async (req, res) => {
   if (req.query.baseId) { sql += ' AND base_id=?'; params.push(Number(req.query.baseId)); }
   res.json((await query(sql, params)).map(toBaseModifier));
 });
-router.post('/base-modifiers', rbac('admin', 'manager'), async (req, res) => {
+router.post('/base-modifiers', requirePermission('menu.edit'), async (req, res) => {
   const p = baseModifierSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   try {
@@ -131,7 +131,7 @@ router.post('/base-modifiers', rbac('admin', 'manager'), async (req, res) => {
     res.status(409).json({ error: 'already linked' });
   }
 });
-router.delete('/base-modifiers/:id', rbac('admin', 'manager'), async (req, res) => {
+router.delete('/base-modifiers/:id', requirePermission('menu.edit'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   await query('DELETE FROM menu_base_modifiers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   res.json({ ok: true });
@@ -147,7 +147,7 @@ router.get('/variants', async (req, res) => {
   sql += ' ORDER BY sort_order';
   res.json((await query(sql, params)).map(toVariant));
 });
-router.post('/variants', rbac('admin', 'manager'), async (req, res) => {
+router.post('/variants', requirePermission('menu.edit'), async (req, res) => {
   const p = variantSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const id = await insert(
@@ -163,7 +163,7 @@ router.post('/variants', rbac('admin', 'manager'), async (req, res) => {
   );
   res.status(201).json(toVariant(await getRow('SELECT * FROM menu_variants WHERE id=?', [id])));
 });
-router.put('/variants/:id', rbac('admin', 'manager'), async (req, res) => {
+router.put('/variants/:id', requirePermission('menu.edit'), async (req, res) => {
   const p = variantSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const sets = [], params = [];
@@ -182,7 +182,7 @@ router.put('/variants/:id', rbac('admin', 'manager'), async (req, res) => {
   await query(`UPDATE menu_variants SET ${sets.join(',')} WHERE id=? AND org_id=? AND store_id=?`, params);
   res.json(toVariant(await getRow('SELECT * FROM menu_variants WHERE id=?', [req.params.id])));
 });
-router.delete('/variants/:id', rbac('admin', 'manager'), async (req, res) => {
+router.delete('/variants/:id', requirePermission('menu.edit'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   await query('DELETE FROM menu_variants WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   res.json({ ok: true });

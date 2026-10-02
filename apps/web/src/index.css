@@ -238,3 +238,63 @@ body { margin: 0; background: #f4f6fb; }
 /* 返利台账:REASON 是长文本,单独给一列弹性宽度,避免每行换行高度不一 */
 .rebate-ledger-table .ops-row { grid-template-columns: 118px 58px 70px 82px 96px 48px minmax(120px, 1fr) 56px; }
 .rebate-ledger-table .ops-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------------------------------------------------------------------------
+   员工与权限(Back Office · Staff / Permission Matrix)
+   --------------------------------------------------------------------------- */
+.staff-table .ops-row { grid-template-columns: 84px minmax(120px, 1fr) 104px 108px 82px 132px 44px 76px minmax(300px, auto); }
+.staff-table .ops-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.staff-table .ops-row .ops-inline-actions { overflow: visible; }
+.staff-self { color: #fb6b53; font-size: 10px; font-weight: 700; }
+.staff-on { color: #237b5c; font-weight: 700; }
+.staff-off { color: #b0b8c6; font-weight: 700; }
+.staff-role { display: inline-block; padding: 3px 7px; border-radius: 20px; font-size: 10px; font-weight: 700; }
+.staff-role.admin { color: #7c3aed; background: #f1e9fe; }
+.staff-role.manager { color: #b45309; background: #fdf0dd; }
+.staff-role.cashier { color: #1d6fa5; background: #e5f1fa; }
+.staff-role.waiter { color: #0f766e; background: #e0f5f2; }
+.staff-role.kitchen { color: #9d174d; background: #fce8f1; }
+
+.perm-hint { align-self: center; color: #9aa4b5; font-size: 11px; }
+.perm-legend { margin-top: 12px; padding: 11px 14px; border-radius: 10px; color: #7e8ba1; background: #f7f9fc; font-size: 11px; }
+.perm-legend b { color: #25324a; }
+.perm-table .ops-row { grid-template-columns: minmax(250px, 1.7fr) repeat(5, minmax(112px, 1fr)); align-items: stretch; }
+.perm-table .ops-row.ops-head { min-height: 62px; }
+.perm-col-head { display: flex; flex-wrap: wrap; align-content: center; gap: 3px; }
+.perm-col-head b { width: 100%; color: #25324a; font-size: 11px; }
+.perm-col-head .mini-action { padding: 2px 5px; font-size: 8px; background: #8b97a8; }
+.perm-col-head .mini-action:nth-of-type(3) { background: #fb6b53; }
+.perm-locked { color: #35bd88; font-size: 9px; font-weight: 700; }
+.perm-group-row { min-height: 28px; color: #fb6b53; background: #fff8f6; font-size: 10px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase; }
+.perm-name { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; overflow: hidden; }
+.perm-name b { color: #25324a; font-size: 11px; font-weight: 700; }
+.perm-name small { color: #a3adbc; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perm-cell { display: flex; align-items: center; justify-content: center; }
+.perm-cell input { width: 16px; height: 16px; accent-color: #fb6b53; cursor: pointer; }
+.perm-cell input:disabled { accent-color: #35bd88; cursor: not-allowed; }
+.perm-table .ops-row:not(.ops-head):not(.perm-group-row):hover { background: #fbfcfe; }
+
+/* ---------------------------------------------------------------------------
+   登录页 PIN 快捷登录 + 桌面 Account(改密 / PIN / 换班)
+   --------------------------------------------------------------------------- */
+.login-mode-switch { display: flex; gap: 6px; padding: 8px 10px 0; }
+.login-mode-switch button { flex: 1; padding: 8px 10px; border: 1px solid #e3e8f0; border-radius: 8px; color: #728097; background: #fff; font-size: 11px; font-weight: 700; }
+.login-mode-switch button.active { color: #fff; border-color: #fb6b53; background: #fb6b53; }
+.account-switch { padding: 0 0 14px; }
+.pin-display { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 1px solid #e1e6ef; border-radius: 8px; background: #fafbfc; }
+.pin-display .dot { width: 11px; height: 11px; border: 1px solid #c8d1de; border-radius: 50%; background: #fff; }
+.pin-display .dot.on { border-color: #fb6b53; background: #fb6b53; }
+.pin-display small { margin-left: auto; color: #9aa4b5; font-size: 10px; }
+.pin-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 12px 0; }
+.pin-pad.inline { max-width: 300px; }
+.pin-key { height: 46px; border: 1px solid #e1e6ef; border-radius: 10px; color: #25324a; background: #fff; font-size: 17px; font-weight: 700; cursor: pointer; }
+.pin-key:hover { border-color: #fb6b53; color: #fb6b53; }
+.pin-key.warn { color: #b45309; background: #fdf7ec; font-size: 12px; }
+.account-note { margin-top: 10px; padding: 10px 12px; border-radius: 9px; color: #7e8ba1; background: #f7f9fc; font-size: 11px; line-height: 1.6; }
+.account-badge { margin-left: 8px; padding: 2px 8px; border-radius: 20px; color: #8b97a8; background: #eef1f6; font-size: 10px; font-weight: 700; vertical-align: middle; }
+.account-badge.on { color: #237b5c; background: #e9f8f2; }
+.account-msg { margin-top: 10px; padding: 9px 12px; border-radius: 9px; font-size: 11px; font-weight: 700; }
+.account-msg.ok { color: #237b5c; background: #e9f8f2; }
+.account-msg.error { color: #c84e3d; background: #fdecea; }
+.modern-action-empty { grid-column: 1 / -1; padding: 22px; border: 1px dashed #d9e0ea; border-radius: 14px; color: #8b97a8; background: #fbfcfe; font-size: 12px; text-align: center; }
+.cashier-void-locked { display: block; padding: 6px 9px; border-radius: 7px; color: #b45309; background: #fdf7ec; font-size: 10px; font-weight: 700; }

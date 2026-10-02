@@ -72,13 +72,29 @@ export async function initSchema() {
       name VARCHAR(255),
       phone VARCHAR(64) UNIQUE,
       email VARCHAR(255),
+      employee_no VARCHAR(64),
+      join_date DATE,
       password_hash VARCHAR(255),
       role ENUM('admin','manager','cashier','waiter','kitchen') DEFAULT 'cashier',
-      pin VARCHAR(32),
+      pin VARCHAR(255),
+      last_login_at TIMESTAMP NULL,
       is_active TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX (org_id), INDEX (store_id), INDEX (phone)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 角色权限矩阵:按键级权限按角色存一份覆盖值,未配置的角色回落到 permissions.js 默认值 ----
+    `CREATE TABLE IF NOT EXISTS role_permissions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      org_id INT NOT NULL,
+      store_id INT NOT NULL,
+      role VARCHAR(32) NOT NULL,
+      permissions TEXT,
+      updated_by INT,
+      updated_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_role_perm (org_id, store_id, role)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS menu_categories (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -469,6 +485,12 @@ export async function initSchema() {
     "ALTER TABLE rebates ADD COLUMN order_total DECIMAL(12,2) DEFAULT 0",
     "ALTER TABLE rebates ADD COLUMN percent DECIMAL(6,2) DEFAULT 0",
     "ALTER TABLE rebates ADD COLUMN expires_at TIMESTAMP NULL",
+    // 员工主档 + 权限矩阵
+    "ALTER TABLE users ADD COLUMN employee_no VARCHAR(64)",
+    "ALTER TABLE users ADD COLUMN join_date DATE",
+    "ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL",
+    // pin 从 VARCHAR(32) 扩到 VARCHAR(255):要存 bcrypt 哈希(60 字符),不能明文。
+    "ALTER TABLE users MODIFY COLUMN pin VARCHAR(255)",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -480,7 +502,13 @@ export function normalizeUser(r) {
   if (!r) return null;
   return {
     _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
-    name: r.name, phone: r.phone, role: r.role, email: r.email, pin: r.pin,
+    name: r.name, phone: r.phone, role: r.role, email: r.email,
+    employeeNo: r.employee_no || null,
+    joinDate: dt(r.join_date),
+    lastLoginAt: dt(r.last_login_at),
+    // pin 现在是 bcrypt 哈希:对外只说「有没有设 PIN」,绝不回传哈希。
+    hasPin: !!r.pin,
+    pinHash: r.pin || null,
     isActive: !!r.is_active, passwordHash: r.password_hash,
   };
 }
@@ -642,5 +670,27 @@ export const getUserByEmail = async (email) => {
   const r = await getRow('SELECT * FROM users WHERE email = ?', [email]);
   return normalizeUser(r);
 };
+
+// ---- 角色权限矩阵 ----
+/** 读出本店所有角色的权限覆盖值,形如 { manager: [...], cashier: [...] }。 */
+export async function getRolePermissionOverrides(orgId, storeId) {
+  const rows = await query(
+    'SELECT role, permissions FROM role_permissions WHERE org_id=? AND store_id=?',
+    [orgId, storeId],
+  );
+  const out = {};
+  for (const r of rows) out[r.role] = parseJSON(r.permissions);
+  return out;
+}
+
+/** 写入/更新某角色的权限覆盖值(upsert)。 */
+export async function setRolePermissions(orgId, storeId, role, permissions, by) {
+  await query(
+    `INSERT INTO role_permissions (org_id, store_id, role, permissions, updated_by, updated_by_name)
+     VALUES (?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE permissions=VALUES(permissions), updated_by=VALUES(updated_by), updated_by_name=VALUES(updated_by_name)`,
+    [orgId, storeId, role, stringifyJSON(permissions || []), by?.id ?? null, by?.name ?? null],
+  );
+}
 
 export default pool;

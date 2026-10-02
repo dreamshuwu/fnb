@@ -7,6 +7,9 @@ import { signTokens, JWT_SECRET } from './middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from './reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from './reportEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from './exporters.js';
+import {
+  ROLES, PERMISSION_GROUPS, ALL_PERMISSIONS, defaultPermissions, hasPermission, resolveRolePermissions,
+} from './permissions.js';
 
 const store = {
   users: [], categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [],
@@ -24,6 +27,8 @@ const store = {
   vouchers: [], voucherTxns: [], rebates: [],
   // 新增：日结
   dayEnds: [],
+  // 新增：角色权限矩阵覆盖值 { manager: [...], cashier: [...] }
+  rolePermissions: {},
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -59,14 +64,18 @@ const MODIFIERS = [
 function seedDev() {
   if (store.users.length) return;
   const demo = [
-    ['1000000000', 'Admin', 'admin', 'admin123'],
-    ['1000000001', 'Manager', 'manager', 'manager123'],
-    ['1000000002', 'Cashier', 'cashier', 'cashier123'],
-    ['1000000003', 'Waiter', 'waiter', 'waiter123'],
-    ['1000000004', 'Kitchen', 'kitchen', 'kitchen123'],
+    ['1000000000', 'Admin', 'admin', 'admin123', 'EMP-0001', '2023-01-01'],
+    ['1000000001', 'Manager', 'manager', 'manager123', 'EMP-0002', '2023-02-01'],
+    ['1000000002', 'Cashier', 'cashier', 'cashier123', 'EMP-0003', '2023-03-01'],
+    ['1000000003', 'Waiter', 'waiter', 'waiter123', 'EMP-0004', '2023-04-01'],
+    ['1000000004', 'Kitchen', 'kitchen', 'kitchen123', 'EMP-0005', '2023-05-01'],
   ];
-  for (const [phone, name, role, pw] of demo) {
-    store.users.push({ id: nid(), orgId: '1', storeId: '1', name, phone, role, password: bcrypt.hashSync(pw, 10), isActive: true });
+  for (const [phone, name, role, pw, empNo, joinDate] of demo) {
+    store.users.push({
+      id: nid(), orgId: '1', storeId: '1', name, phone, role, employeeNo: empNo,
+      joinDate, email: null, password: bcrypt.hashSync(pw, 10), pin: null,
+      lastLoginAt: null, isActive: true,
+    });
   }
   const catIds = {};
   for (const [name, color, sort] of CATS) {
@@ -210,11 +219,28 @@ function seedDev() {
   ]) {
     store.reportTemplates.push({ id: nid(), orgId: '1', storeId: '1', type: t[0], name: t[1], columns: t[2], isSystem: true, createdAt: now() });
   }
+
+  // 角色权限矩阵:与生产 seed 一致,先把默认值存一份,后台改动覆盖它。
+  for (const role of ROLES) {
+    store.rolePermissions[role] = defaultPermissions(role);
+  }
 }
 
 // ---- mappers(与 db.js 输出保持一致,前端按这些字段渲染) ----
 const toUser = (u) => ({ id: u.id, _id: u.id, name: u.name, phone: u.phone, role: u.role, orgId: u.orgId, storeId: u.storeId });
-const publicUser = (u) => ({ id: u.id, name: u.name, role: u.role, orgId: u.orgId, storeId: u.storeId, phone: u.phone });
+// publicUser 会回给前端:绝不带 password / pin 哈希,只说 hasPin。
+const publicUser = (u) => ({
+  id: u.id, name: u.name, role: u.role, orgId: u.orgId, storeId: u.storeId, phone: u.phone,
+  email: u.email || null, employeeNo: u.employeeNo || null, joinDate: u.joinDate || null,
+  lastLoginAt: u.lastLoginAt || null, hasPin: !!u.pin, isActive: u.isActive !== false,
+});
+// 后台员工主档:字段比 publicUser 多 isActive/employeeNo,同样不含任何哈希。
+const toStaff = (u) => ({
+  id: u.id, _id: u.id, orgId: u.orgId, storeId: u.storeId, name: u.name, phone: u.phone,
+  email: u.email || null, role: u.role, employeeNo: u.employeeNo || null,
+  joinDate: u.joinDate || null, lastLoginAt: u.lastLoginAt || null,
+  hasPin: !!u.pin, isActive: u.isActive !== false, createdAt: u.createdAt || null,
+});
 const toMenuCategory = (c) => ({ _id: c.id, id: c.id, orgId: c.orgId, storeId: c.storeId, name: c.name, color: c.color || null, sortOrder: c.sortOrder, isActive: !!c.isActive, createdAt: now(), updatedAt: now() });
 const toMenuBase = (b) => ({ _id: b.id, id: b.id, orgId: b.orgId, storeId: b.storeId, categoryId: b.categoryId == null ? null : String(b.categoryId), name: b.name, basePrice: Number(b.basePrice || 0), sortOrder: b.sortOrder, isActive: !!b.isActive, createdAt: now(), updatedAt: now() });
 const toModifier = (m) => ({ _id: m.id, id: m.id, orgId: m.orgId, storeId: m.storeId, code: m.code, label: m.label, defaultDelta: Number(m.defaultDelta || 0), sortOrder: m.sortOrder, isActive: !!m.isActive, createdAt: now(), updatedAt: now() });
@@ -473,6 +499,21 @@ function devAuthenticate(req, res, next) {
   }
 }
 
+// ---- 按键权限(dev 版,与 middleware/auth.js 口径一致) ----
+const devPinAttempts = new Map(); // PIN 登录失败节流
+function devPermissions(role) {
+  return resolveRolePermissions(role, store.rolePermissions);
+}
+function devRequirePerm(...keys) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+    const perms = devPermissions(req.user.role);
+    const missing = keys.filter((k) => !hasPermission(perms, k));
+    if (missing.length) return res.status(403).json({ error: 'forbidden', missing });
+    next();
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 报表数据集:把内存 store 整理成 reportEngine 需要的统一结构。
 // 关键在 enrich —— 订单行项目补上 category / station,订单补上桌号、收银员、会员。
@@ -562,8 +603,37 @@ export function createDevRouter(io) {
     const { phone, password } = req.body || {};
     const u = store.users.find((x) => x.phone === phone);
     if (!u || !bcrypt.compareSync(password || '', u.password)) return res.status(401).json({ error: 'invalid credentials' });
+    if (u.isActive === false) return res.status(403).json({ error: 'account disabled' });
+    u.lastLoginAt = now();
     const { access: accessToken, refresh: refreshToken } = signTokens(toUser(u));
-    res.json({ accessToken, refreshToken, user: publicUser(u) });
+    res.json({ accessToken, refreshToken, user: publicUser(u), permissions: devPermissions(u.role) });
+  });
+  // PIN 快捷登录(换班/收银台切换):带 phone 精确匹配,只带 storeId 时在本店已设 PIN 的员工里逐个比对。
+  r.post('/auth/pin-login', (req, res) => {
+    const { phone, storeId, pin } = req.body || {};
+    const raw = String(pin || '');
+    if (!/^\d{4,6}$/.test(raw)) return res.status(400).json({ error: 'invalid pin format' });
+    const key = String(phone || storeId || 'dev');
+    const a = devPinAttempts.get(key);
+    if (a?.until && a.until > Date.now()) {
+      const wait = Math.ceil((a.until - Date.now()) / 1000);
+      return res.status(429).json({ error: `too many attempts, retry in ${wait}s`, retryAfter: wait });
+    }
+    const candidates = phone
+      ? store.users.filter((x) => x.phone === String(phone))
+      : store.users.filter((x) => x.storeId === String(storeId || '1') && x.isActive !== false && x.pin);
+    const u = candidates.find((x) => x.pin && bcrypt.compareSync(raw, x.pin));
+    if (!u || u.isActive === false) {
+      const cur = devPinAttempts.get(key) || { count: 0, until: 0 };
+      cur.count += 1;
+      if (cur.count >= 5) { cur.until = Date.now() + 60_000; cur.count = 0; }
+      devPinAttempts.set(key, cur);
+      return res.status(401).json({ error: 'invalid pin' });
+    }
+    devPinAttempts.delete(key);
+    u.lastLoginAt = now();
+    const { access: accessToken, refresh: refreshToken } = signTokens(toUser(u));
+    res.json({ accessToken, refreshToken, user: publicUser(u), permissions: devPermissions(u.role) });
   });
   r.post('/auth/refresh', (req, res) => {
     const { access: accessToken, refresh: refreshToken } = signTokens(toUser(req.user));
@@ -571,15 +641,184 @@ export function createDevRouter(io) {
   });
 
   r.use(devAuthenticate);
-  r.get('/auth/me', (req, res) => res.json({ user: publicUser(req.user) }));
+  r.get('/auth/me', (req, res) => res.json({ user: publicUser(req.user), permissions: devPermissions(req.user.role) }));
+  r.get('/auth/permissions', (req, res) => res.json({ role: req.user.role, permissions: devPermissions(req.user.role) }));
+
+  // 改自己的密码:验旧密码 + 新旧不能相同
+  r.put('/auth/password', (req, res) => {
+    const { oldPassword, newPassword } = req.body || {};
+    if (!oldPassword || !newPassword) return res.status(400).json({ error: 'old and new password required' });
+    if (String(newPassword).length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+    const u = store.users.find((x) => x.id === String(req.user.id));
+    if (!u) return res.status(404).json({ error: 'user not found' });
+    if (!bcrypt.compareSync(String(oldPassword), u.password)) return res.status(401).json({ error: 'current password is incorrect' });
+    if (bcrypt.compareSync(String(newPassword), u.password)) return res.status(400).json({ error: 'new password must differ from the current one' });
+    u.password = bcrypt.hashSync(String(newPassword), 10);
+    res.json({ ok: true });
+  });
+
+  // 设置/清除自己的 PIN(需要密码确认)
+  r.put('/auth/pin', (req, res) => {
+    const { password, pin } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'password required' });
+    const u = store.users.find((x) => x.id === String(req.user.id));
+    if (!u) return res.status(404).json({ error: 'user not found' });
+    if (!bcrypt.compareSync(String(password), u.password)) return res.status(401).json({ error: 'password is incorrect' });
+    const raw = pin == null ? '' : String(pin).trim();
+    if (raw === '') { u.pin = null; return res.json({ ok: true, hasPin: false }); }
+    if (!/^\d{4,6}$/.test(raw)) return res.status(400).json({ error: 'pin must be 4-6 digits' });
+    u.pin = bcrypt.hashSync(raw, 10);
+    res.json({ ok: true, hasPin: true });
+  });
+
+  // ---- 权限矩阵 ----
+  r.get('/roles/permissions', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const roles = {};
+    for (const role of ROLES) roles[role] = devPermissions(role);
+    res.json({
+      catalog: PERMISSION_GROUPS, all: ALL_PERMISSIONS, roles,
+      defaults: ROLES.reduce((a, role) => (a[role] = defaultPermissions(role), a), {}),
+    });
+  });
+  r.put('/roles/:role/permissions', devRequirePerm('permission.manage'), (req, res) => {
+    const role = String(req.params.role);
+    if (!ROLES.includes(role)) return res.status(400).json({ error: 'unknown role' });
+    if (role === 'admin') return res.status(400).json({ error: 'admin permissions cannot be restricted' });
+    const list = Array.isArray(req.body?.permissions) ? req.body.permissions.map(String) : null;
+    if (!list) return res.status(400).json({ error: 'permissions must be an array' });
+    const unknown = list.filter((k) => !ALL_PERMISSIONS.includes(k));
+    if (unknown.length) return res.status(400).json({ error: `unknown permission: ${unknown.join(', ')}` });
+    const clean = [...new Set(list)];
+    store.rolePermissions[role] = clean;
+    res.json({ ok: true, role, permissions: clean });
+  });
+
+  // ---- 员工主档 CRUD ----
+  r.get('/users', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const role = req.query.role ? String(req.query.role) : null;
+    const status = req.query.status ? String(req.query.status) : null;
+    let list = store.users.slice();
+    if (q) list = list.filter((u) => [u.name, u.phone, u.employeeNo].some((v) => String(v || '').toLowerCase().includes(q)));
+    if (role) list = list.filter((u) => u.role === role);
+    if (status === 'active') list = list.filter((u) => u.isActive !== false);
+    if (status === 'inactive') list = list.filter((u) => u.isActive === false);
+    list.sort((a, b) => (Number(b.isActive !== false) - Number(a.isActive !== false)) || a.role.localeCompare(b.role) || String(a.name).localeCompare(String(b.name)));
+    res.json(list.map(toStaff));
+  });
+  r.post('/users', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    const phone = String(b.phone || '').trim();
+    const role = String(b.role || 'cashier');
+    if (!name) return res.status(400).json({ error: 'name required' });
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+    if (!ROLES.includes(role)) return res.status(400).json({ error: 'unknown role' });
+    if (req.user.role === 'manager' && role === 'admin') return res.status(403).json({ error: 'manager cannot create admin' });
+    if (String(b.password || '').length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+    if (store.users.some((u) => u.phone === phone)) return res.status(400).json({ error: 'phone already in use' });
+    const u = {
+      id: nid(), orgId: '1', storeId: '1', name, phone, email: b.email ? String(b.email) : null,
+      role, employeeNo: b.employeeNo ? String(b.employeeNo) : null, joinDate: b.joinDate ? String(b.joinDate) : null,
+      password: bcrypt.hashSync(String(b.password), 10), pin: null, lastLoginAt: null,
+      isActive: true, createdAt: now(),
+    };
+    store.users.push(u);
+    res.status(201).json(toStaff(u));
+  });
+  r.get('/users/:id', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const u = store.users.find((x) => x.id === req.params.id);
+    if (!u) return res.status(404).json({ error: 'not found' });
+    res.json(toStaff(u));
+  });
+  r.put('/users/:id', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const u = store.users.find((x) => x.id === req.params.id);
+    if (!u) return res.status(404).json({ error: 'not found' });
+    if (req.user.role === 'manager' && u.role === 'admin') return res.status(403).json({ error: 'manager cannot modify admin' });
+    const b = req.body || {};
+    if (b.name != null) { const v = String(b.name).trim(); if (!v) return res.status(400).json({ error: 'name required' }); u.name = v; }
+    if (b.phone != null) {
+      const v = String(b.phone).trim();
+      if (!v) return res.status(400).json({ error: 'phone required' });
+      if (store.users.some((x) => x.phone === v && x.id !== u.id)) return res.status(400).json({ error: 'phone already in use' });
+      u.phone = v;
+    }
+    if (b.email !== undefined) u.email = b.email ? String(b.email) : null;
+    if (b.employeeNo !== undefined) u.employeeNo = b.employeeNo ? String(b.employeeNo) : null;
+    if (b.joinDate !== undefined) u.joinDate = b.joinDate ? String(b.joinDate) : null;
+    if (b.role != null) {
+      const v = String(b.role);
+      if (!ROLES.includes(v)) return res.status(400).json({ error: 'unknown role' });
+      if (req.user.role === 'manager' && v === 'admin') return res.status(403).json({ error: 'manager cannot grant admin' });
+      if (u.role === 'admin' && v !== 'admin') {
+        const others = store.users.filter((x) => x.role === 'admin' && x.isActive !== false && x.id !== u.id).length;
+        if (others === 0) return res.status(400).json({ error: 'cannot demote the last admin' });
+      }
+      u.role = v;
+    }
+    res.json(toStaff(u));
+  });
+  r.put('/users/:id/status', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const u = store.users.find((x) => x.id === req.params.id);
+    if (!u) return res.status(404).json({ error: 'not found' });
+    if (req.user.role === 'manager' && u.role === 'admin') return res.status(403).json({ error: 'manager cannot modify admin' });
+    if (u.id === String(req.user.id)) return res.status(400).json({ error: 'cannot change your own status' });
+    const isActive = req.body?.isActive === undefined ? u.isActive === false : !!req.body.isActive;
+    if (!isActive && u.role === 'admin') {
+      const others = store.users.filter((x) => x.role === 'admin' && x.isActive !== false && x.id !== u.id).length;
+      if (others === 0) return res.status(400).json({ error: 'cannot disable the last admin' });
+    }
+    u.isActive = isActive;
+    res.json(toStaff(u));
+  });
+  r.put('/users/:id/password', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const u = store.users.find((x) => x.id === req.params.id);
+    if (!u) return res.status(404).json({ error: 'not found' });
+    if (req.user.role === 'manager' && u.role === 'admin') return res.status(403).json({ error: 'manager cannot modify admin' });
+    const np = String(req.body?.newPassword || '');
+    if (np.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+    u.password = bcrypt.hashSync(np, 10);
+    res.json({ ok: true });
+  });
+  r.put('/users/:id/pin', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const u = store.users.find((x) => x.id === req.params.id);
+    if (!u) return res.status(404).json({ error: 'not found' });
+    if (req.user.role === 'manager' && u.role === 'admin') return res.status(403).json({ error: 'manager cannot modify admin' });
+    const raw = req.body?.pin == null ? '' : String(req.body.pin).trim();
+    if (raw === '') { u.pin = null; return res.json({ ok: true, hasPin: false }); }
+    if (!/^\d{4,6}$/.test(raw)) return res.status(400).json({ error: 'pin must be 4-6 digits' });
+    u.pin = bcrypt.hashSync(raw, 10);
+    res.json({ ok: true, hasPin: true });
+  });
+  r.delete('/users/:id', (req, res) => {
+    if (!['admin', 'manager'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const u = store.users.find((x) => x.id === req.params.id);
+    if (!u) return res.status(404).json({ error: 'not found' });
+    if (u.id === String(req.user.id)) return res.status(400).json({ error: 'cannot delete your own account' });
+    if (req.user.role === 'manager' && u.role === 'admin') return res.status(403).json({ error: 'manager cannot modify admin' });
+    if (u.role === 'admin') {
+      const others = store.users.filter((x) => x.role === 'admin' && x.isActive !== false && x.id !== u.id).length;
+      if (others === 0) return res.status(400).json({ error: 'cannot delete the last admin' });
+    }
+    u.isActive = false;
+    res.json({ ok: true, deactivated: true });
+  });
 
   // ---- 菜单 CRUD ----
   r.get('/menu/categories', (req, res) => res.json(store.categories.map(toMenuCategory)));
-  r.post('/menu/categories', (req, res) => {
+  r.post('/menu/categories', devRequirePerm('menu.edit'), (req, res) => {
     const c = { id: nid(), orgId: '1', storeId: '1', name: req.body.name, color: req.body.color ?? null, sortOrder: req.body.sortOrder || store.categories.length + 1, isActive: true };
     store.categories.push(c); res.status(201).json(toMenuCategory(c));
   });
-  r.put('/menu/categories/:id', (req, res) => {
+  r.put('/menu/categories/:id', devRequirePerm('menu.edit'), (req, res) => {
     const c = store.categories.find((x) => x.id === req.params.id);
     if (!c) return res.status(404).json({ error: 'not found' });
     if (req.body.name !== undefined) c.name = req.body.name;
@@ -588,7 +827,7 @@ export function createDevRouter(io) {
     if (req.body.isActive !== undefined) c.isActive = req.body.isActive;
     res.json(toMenuCategory(c));
   });
-  r.delete('/menu/categories/:id', (req, res) => {
+  r.delete('/menu/categories/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.categories = store.categories.filter((x) => x.id !== req.params.id);
     res.json({ ok: true });
   });
@@ -598,11 +837,11 @@ export function createDevRouter(io) {
     if (req.query.category) list = list.filter((b) => b.categoryId === String(req.query.category));
     res.json(list.map(toMenuBase));
   });
-  r.post('/menu/bases', (req, res) => {
+  r.post('/menu/bases', devRequirePerm('menu.edit'), (req, res) => {
     const b = { id: nid(), orgId: '1', storeId: '1', categoryId: req.body.categoryId || null, name: req.body.name, basePrice: req.body.basePrice ?? 0, sortOrder: req.body.sortOrder || 1, isActive: true };
     store.bases.push(b); res.status(201).json(toMenuBase(b));
   });
-  r.put('/menu/bases/:id', (req, res) => {
+  r.put('/menu/bases/:id', devRequirePerm('menu.edit'), (req, res) => {
     const b = store.bases.find((x) => x.id === req.params.id);
     if (!b) return res.status(404).json({ error: 'not found' });
     Object.assign(b, {
@@ -614,17 +853,17 @@ export function createDevRouter(io) {
     });
     res.json(toMenuBase(b));
   });
-  r.delete('/menu/bases/:id', (req, res) => {
+  r.delete('/menu/bases/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.bases = store.bases.filter((x) => x.id !== req.params.id);
     res.json({ ok: true });
   });
 
   r.get('/menu/modifiers', (req, res) => res.json(store.modifiers.map(toModifier)));
-  r.post('/menu/modifiers', (req, res) => {
+  r.post('/menu/modifiers', devRequirePerm('menu.edit'), (req, res) => {
     const m = { id: nid(), orgId: '1', storeId: '1', code: req.body.code, label: req.body.label ?? null, defaultDelta: req.body.defaultDelta ?? 0, sortOrder: req.body.sortOrder || store.modifiers.length + 1, isActive: true };
     store.modifiers.push(m); res.status(201).json(toModifier(m));
   });
-  r.put('/menu/modifiers/:id', (req, res) => {
+  r.put('/menu/modifiers/:id', devRequirePerm('menu.edit'), (req, res) => {
     const m = store.modifiers.find((x) => x.id === req.params.id);
     if (!m) return res.status(404).json({ error: 'not found' });
     Object.assign(m, {
@@ -634,7 +873,7 @@ export function createDevRouter(io) {
     });
     res.json(toModifier(m));
   });
-  r.delete('/menu/modifiers/:id', (req, res) => {
+  r.delete('/menu/modifiers/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.modifiers = store.modifiers.filter((x) => x.id !== req.params.id);
     res.json({ ok: true });
   });
@@ -644,11 +883,11 @@ export function createDevRouter(io) {
     if (req.query.baseId) list = list.filter((x) => x.baseId === String(req.query.baseId));
     res.json(list.map(toBaseModifier));
   });
-  r.post('/menu/base-modifiers', (req, res) => {
+  r.post('/menu/base-modifiers', devRequirePerm('menu.edit'), (req, res) => {
     const bm = { id: nid(), orgId: '1', storeId: '1', baseId: String(req.body.baseId), modifierId: String(req.body.modifierId), delta: req.body.delta == null ? null : req.body.delta };
     store.baseModifiers.push(bm); res.status(201).json(toBaseModifier(bm));
   });
-  r.delete('/menu/base-modifiers/:id', (req, res) => {
+  r.delete('/menu/base-modifiers/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.baseModifiers = store.baseModifiers.filter((x) => x.id !== req.params.id);
     res.json({ ok: true });
   });
@@ -666,7 +905,7 @@ export function createDevRouter(io) {
     if (!v) return res.status(404).json({ error: 'barcode not found' });
     res.json(toVariant(v));
   });
-  r.post('/menu/variants', (req, res) => {
+  r.post('/menu/variants', devRequirePerm('menu.edit'), (req, res) => {
     const b = req.body;
     const v = {
       id: nid(), orgId: '1', storeId: '1', baseId: String(b.baseId), categoryId: b.categoryId || null,
@@ -676,7 +915,7 @@ export function createDevRouter(io) {
     };
     store.variants.push(v); res.status(201).json(toVariant(v));
   });
-  r.put('/menu/variants/:id', (req, res) => {
+  r.put('/menu/variants/:id', devRequirePerm('menu.edit'), (req, res) => {
     const v = store.variants.find((x) => x.id === req.params.id);
     if (!v) return res.status(404).json({ error: 'not found' });
     Object.assign(v, {
@@ -690,7 +929,7 @@ export function createDevRouter(io) {
     });
     res.json(toVariant(v));
   });
-  r.delete('/menu/variants/:id', (req, res) => {
+  r.delete('/menu/variants/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.variants = store.variants.filter((x) => x.id !== req.params.id);
     res.json({ ok: true });
   });
@@ -734,7 +973,7 @@ export function createDevRouter(io) {
     if (!o) return res.status(404).json({ error: 'not found' });
     res.json(toOrder(o));
   });
-  r.post('/orders', (req, res) => {
+  r.post('/orders', devRequirePerm('order.create'), (req, res) => {
     const b = req.body;
     const items = (b.items || []).map((i) => ({ ...i, status: 'pending' }));
     const totals = computeOrderTotals(items, b.discount || 0);
@@ -758,7 +997,7 @@ export function createDevRouter(io) {
     }
     res.status(201).json(toOrder(o));
   });
-  r.post('/orders/:id/items', (req, res) => {
+  r.post('/orders/:id/items', devRequirePerm('order.create'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status !== 'open') return res.status(400).json({ error: 'order not open' });
@@ -768,7 +1007,7 @@ export function createDevRouter(io) {
     res.json(toOrder(o));
   });
   // 整单替换明细（取单后编辑再送厨房用）
-  r.put('/orders/:id/items', (req, res) => {
+  r.put('/orders/:id/items', devRequirePerm('order.create'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!['open', 'hold'].includes(o.status)) return res.status(400).json({ error: 'order not editable' });
@@ -794,7 +1033,7 @@ export function createDevRouter(io) {
     res.json(toOrder(o));
   });
   // ---- 转台:把进行中的订单移到另一张桌 ----
-  r.post('/orders/:id/transfer', (req, res) => {
+  r.post('/orders/:id/transfer', devRequirePerm('order.transfer'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!RUNNING_STATUS.includes(o.status)) return res.status(400).json({ error: 'only running orders can be transferred' });
@@ -823,7 +1062,7 @@ export function createDevRouter(io) {
   });
 
   // ---- 并台:把多张进行中的单合并到第一张(或指定的主单) ----
-  r.post('/orders/merge', (req, res) => {
+  r.post('/orders/merge', devRequirePerm('order.merge'), (req, res) => {
     const ids = (req.body.orderIds || []).map(String);
     if (ids.length < 2) return res.status(400).json({ error: 'need at least 2 orders' });
     const list = ids.map((id) => store.orders.find((x) => x.id === id)).filter(Boolean);
@@ -873,7 +1112,7 @@ export function createDevRouter(io) {
 
   // ---- 销售员 ----
   r.get('/sales-persons', (req, res) => res.json(store.users.filter((u) => u.isActive).map((u) => ({ id: u.id, name: u.name, role: u.role, code: u.phone }))));
-  r.put('/orders/:id/sales-person', (req, res) => {
+  r.put('/orders/:id/sales-person', devRequirePerm('order.sales_person'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     o.salesPersonId = req.body.salesPersonId ? String(req.body.salesPersonId) : null;
@@ -881,7 +1120,7 @@ export function createDevRouter(io) {
     res.json(toOrder(o));
   });
   // 结账前挂/换会员:返利抵扣必须基于订单上的会员,所以允许在 Payment 之前补挂。
-  r.put('/orders/:id/member', (req, res) => {
+  r.put('/orders/:id/member', devRequirePerm('payment.settle'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status === 'paid' || o.status === 'void') return res.status(400).json({ error: 'cannot change member on a closed order' });
@@ -892,7 +1131,7 @@ export function createDevRouter(io) {
     res.json(toOrder(o));
   });
 
-  r.post('/orders/:id/checkout', (req, res) => {
+  r.post('/orders/:id/checkout', devRequirePerm('payment.settle'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status === 'paid' || o.status === 'void') return res.status(400).json({ error: 'already closed' });
@@ -998,7 +1237,7 @@ export function createDevRouter(io) {
       },
     });
   });
-  r.post('/orders/:id/void', (req, res) => {
+  r.post('/orders/:id/void', devRequirePerm('order.void'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (['paid', 'void', 'void_pending'].includes(o.status)) return res.status(400).json({ error: 'cannot void this order' });
@@ -1006,7 +1245,7 @@ export function createDevRouter(io) {
     if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'free'; t.currentOrderId = null; } }
     res.json(toOrder(o));
   });
-  r.post('/orders/:id/void/approve', (req, res) => {
+  r.post('/orders/:id/void/approve', devRequirePerm('order.void_approve'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status !== 'void_pending') return res.status(400).json({ error: 'not pending' });
@@ -1015,7 +1254,7 @@ export function createDevRouter(io) {
     if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'free'; t.currentOrderId = null; } }
     res.json(toOrder(o));
   });
-  r.post('/orders/:id/void/reject', (req, res) => {
+  r.post('/orders/:id/void/reject', devRequirePerm('order.void_approve'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status !== 'void_pending') return res.status(400).json({ error: 'not pending' });
@@ -1026,7 +1265,7 @@ export function createDevRouter(io) {
 
   // ---- 挂单 Hold / 取单 Recall ----
   r.get('/holds', (req, res) => res.json(store.orders.filter((o) => o.status === 'hold').map(toOrder)));
-  r.post('/orders/:id/hold', (req, res) => {
+  r.post('/orders/:id/hold', devRequirePerm('order.hold'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!['open', 'hold'].includes(o.status)) return res.status(400).json({ error: 'only open orders can be held' });
@@ -1037,7 +1276,7 @@ export function createDevRouter(io) {
     io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
     res.json(toOrder(o));
   });
-  r.post('/orders/:id/recall', (req, res) => {
+  r.post('/orders/:id/recall', devRequirePerm('order.hold'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status !== 'hold') return res.status(400).json({ error: 'order is not on hold' });
@@ -1048,7 +1287,7 @@ export function createDevRouter(io) {
 
   // ---- 反结算 Unsettle：把已结算单退回未结算 ----
   r.get('/unsettles', (req, res) => res.json(store.unsettles));
-  r.post('/orders/:id/unsettle', (req, res) => {
+  r.post('/orders/:id/unsettle', devRequirePerm('order.unsettle'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!['paid', 'refunded'].includes(o.status)) return res.status(400).json({ error: 'only settled orders can be unsettled' });
@@ -1076,7 +1315,7 @@ export function createDevRouter(io) {
     if (!o) return res.status(404).json({ error: 'not found' });
     res.json(buildDocument(o, req.query.kind || 'bill'));
   });
-  r.post('/orders/:id/reprint', (req, res) => {
+  r.post('/orders/:id/reprint', devRequirePerm('reprint'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     const kind = req.body?.kind || 'bill';
@@ -1108,7 +1347,7 @@ export function createDevRouter(io) {
   r.get('/orders/:id/splits', (req, res) => {
     res.json(store.orders.filter((o) => String(o.splitFromOrderId) === String(req.params.id)).map(toOrder));
   });
-  r.post('/orders/:id/split', (req, res) => {
+  r.post('/orders/:id/split', devRequirePerm('order.split'), (req, res) => {
     const parent = store.orders.find((x) => x.id === req.params.id);
     if (!parent) return res.status(404).json({ error: 'not found' });
     if (!['open', 'kitchen', 'ready', 'served'].includes(parent.status)) return res.status(400).json({ error: 'cannot split this order' });
@@ -1156,7 +1395,7 @@ export function createDevRouter(io) {
 
   // ---- Refund ----
   r.get('/refunds', (req, res) => res.json(store.refunds.map(toRefund)));
-  r.post('/orders/:id/refund', (req, res) => {
+  r.post('/orders/:id/refund', devRequirePerm('payment.refund'), (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!['paid', 'served'].includes(o.status)) return res.status(400).json({ error: 'only paid orders can be refunded' });
@@ -1204,22 +1443,22 @@ export function createDevRouter(io) {
 
   // ---- 门店设置 / GST ----
   r.get('/settings', (req, res) => res.json(getSettings()));
-  r.put('/settings', (req, res) => res.json(setSettings(req.body)));
+  r.put('/settings', devRequirePerm('settings.edit'), (req, res) => res.json(setSettings(req.body)));
 
   // ---- 促销 Promotion ----
   r.get('/promotions', (req, res) => res.json(store.promotions.map(toPromotion)));
-  r.post('/promotions', (req, res) => {
+  r.post('/promotions', devRequirePerm('order.discount'), (req, res) => {
     const b = req.body || {};
     const p = { id: nid(), orgId: '1', storeId: '1', code: b.code || `PROMO${store.promotions.length + 1}`, name: b.name || '', type: b.type || 'percent', value: Number(b.value || 0), minSpend: Number(b.minSpend || 0), validFrom: b.validFrom || null, validUntil: b.validUntil || null, isActive: b.isActive !== false, createdAt: now() };
     store.promotions.push(p); res.status(201).json(toPromotion(p));
   });
-  r.put('/promotions/:id', (req, res) => {
+  r.put('/promotions/:id', devRequirePerm('order.discount'), (req, res) => {
     const p = store.promotions.find((x) => x.id === req.params.id);
     if (!p) return res.status(404).json({ error: 'not found' });
     Object.assign(p, { code: req.body.code ?? p.code, name: req.body.name ?? p.name, type: req.body.type ?? p.type, value: req.body.value !== undefined ? Number(req.body.value) : p.value, minSpend: req.body.minSpend !== undefined ? Number(req.body.minSpend) : p.minSpend, validFrom: req.body.validFrom ?? p.validFrom, validUntil: req.body.validUntil ?? p.validUntil, isActive: req.body.isActive ?? p.isActive });
     res.json(toPromotion(p));
   });
-  r.delete('/promotions/:id', (req, res) => { store.promotions = store.promotions.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
+  r.delete('/promotions/:id', devRequirePerm('order.discount'), (req, res) => { store.promotions = store.promotions.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
   r.get('/promotions/apply', (req, res) => {
     const code = String(req.query.code || '').toUpperCase();
     const amount = Number(req.query.amount || 0);
@@ -1316,7 +1555,7 @@ export function createDevRouter(io) {
     res.json({ ...toVoucher(v), status: voucherStatus(v), txns: store.voucherTxns.filter((t) => t.voucherId === v.id).map(toVoucherTxn) });
   });
   r.get('/vouchers/:id/txns', (req, res) => res.json(store.voucherTxns.filter((t) => t.voucherId === req.params.id).map(toVoucherTxn)));
-  r.post('/vouchers', (req, res) => {
+  r.post('/vouchers', devRequirePerm('member.voucher_issue'), (req, res) => {
     const b = req.body || {};
     const face = round2(b.faceValue);
     if (!(face > 0)) return res.status(400).json({ error: 'faceValue must be positive' });
@@ -1349,7 +1588,7 @@ export function createDevRouter(io) {
     if (!r0.ok) return res.status(400).json({ error: r0.error });
     res.json({ voucher: toVoucher(r0.voucher), txn: toVoucherTxn(r0.txn) });
   });
-  r.post('/vouchers/:id/void', (req, res) => {
+  r.post('/vouchers/:id/void', devRequirePerm('member.voucher_void'), (req, res) => {
     const v = store.vouchers.find((x) => x.id === req.params.id);
     if (!v) return res.status(404).json({ error: 'not found' });
     if (v.status === 'void') return res.status(400).json({ error: 'already void' });
@@ -1394,7 +1633,7 @@ export function createDevRouter(io) {
       membersWithRebate: store.members.filter((m) => Number(m.rebateBalance || 0) > 0).length,
     });
   });
-  r.post('/rebates', (req, res) => {
+  r.post('/rebates', devRequirePerm('member.rebate'), (req, res) => {
     const b = req.body || {};
     const m = memberOf(b.memberId);
     if (!m) return res.status(404).json({ error: 'member not found' });
@@ -1405,7 +1644,7 @@ export function createDevRouter(io) {
     const row = pushRebate(m, type, amt, { reason: b.reason || 'manual adjustment', expiresAt: b.expiresAt || null }, req.user);
     res.status(201).json({ member: toMember(m), entry: toRebate(row) });
   });
-  r.post('/members/:id/rebate', (req, res) => {
+  r.post('/members/:id/rebate', devRequirePerm('member.rebate'), (req, res) => {
     const m = memberOf(req.params.id);
     if (!m) return res.status(404).json({ error: 'member not found' });
     const amt = round2(req.body.amount);
@@ -1438,12 +1677,12 @@ export function createDevRouter(io) {
 
   // ---- 定期盘点 Periodical Stock Take ----
   r.get('/stock-takes', (req, res) => res.json(store.stockTakes.map(toStockTake)));
-  r.post('/stock-takes', (req, res) => {
+  r.post('/stock-takes', devRequirePerm('stock.take'), (req, res) => {
     const lines = store.variants.map((v) => ({ itemId: v.id, code: v.code, name: v.name, systemQty: Number(v.stockQty || 0), countedQty: null, variance: 0 }));
     const st = { id: nid(), orgId: '1', storeId: '1', takeNo: `ST${Date.now()}`, status: 'draft', lines, createdBy: req.user.id, createdAt: now(), postedAt: null };
     store.stockTakes.unshift(st); res.status(201).json(toStockTake(st));
   });
-  r.put('/stock-takes/:id', (req, res) => {
+  r.put('/stock-takes/:id', devRequirePerm('stock.take'), (req, res) => {
     const st = store.stockTakes.find((x) => x.id === req.params.id);
     if (!st) return res.status(404).json({ error: 'not found' });
     if (st.status !== 'draft') return res.status(400).json({ error: 'already posted' });
@@ -1453,7 +1692,7 @@ export function createDevRouter(io) {
     }
     res.json(toStockTake(st));
   });
-  r.post('/stock-takes/:id/post', (req, res) => {
+  r.post('/stock-takes/:id/post', devRequirePerm('stock.take'), (req, res) => {
     const st = store.stockTakes.find((x) => x.id === req.params.id);
     if (!st) return res.status(404).json({ error: 'not found' });
     if (st.status !== 'draft') return res.status(400).json({ error: 'already posted' });
@@ -1467,8 +1706,8 @@ export function createDevRouter(io) {
   });
 
   // ---- 报表设计器 Report Templates ----
-  r.get('/report-templates', (req, res) => res.json(store.reportTemplates.map(toReportTemplate)));
-  r.post('/report-templates', (req, res) => {
+  r.get('/report-templates', devRequirePerm('report.view'), (req, res) => res.json(store.reportTemplates.map(toReportTemplate)));
+  r.post('/report-templates', devRequirePerm('report.design'), (req, res) => {
     const b = req.body || {};
     const t = {
       id: nid(), orgId: '1', storeId: '1',
@@ -1478,29 +1717,29 @@ export function createDevRouter(io) {
     };
     store.reportTemplates.push(t); res.status(201).json(toReportTemplate(t));
   });
-  r.put('/report-templates/:id', (req, res) => {
+  r.put('/report-templates/:id', devRequirePerm('report.design'), (req, res) => {
     const t = store.reportTemplates.find((x) => x.id === req.params.id);
     if (!t) return res.status(404).json({ error: 'not found' });
     const b = req.body || {};
     for (const k of ['type', 'name', 'columns', 'filters', 'sort', 'format']) if (b[k] !== undefined) t[k] = b[k];
     res.json(toReportTemplate(t));
   });
-  r.delete('/report-templates/:id', (req, res) => { store.reportTemplates = store.reportTemplates.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
+  r.delete('/report-templates/:id', devRequirePerm('report.design'), (req, res) => { store.reportTemplates = store.reportTemplates.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
 
   // ---- 硬件 Hardware ----
   r.get('/hardware/printers', (req, res) => res.json(store.printers.map(toPrinter)));
-  r.post('/hardware/printers', (req, res) => {
+  r.post('/hardware/printers', devRequirePerm('printer.manage'), (req, res) => {
     const b = req.body || {};
     const p = { id: nid(), orgId: '1', storeId: '1', name: b.name || 'Printer', target: b.target || 'receipt', connection: b.connection || 'usb', width: Number(b.width || 80), isDefault: !!b.isDefault, isActive: b.isActive !== false };
     store.printers.push(p); res.status(201).json(toPrinter(p));
   });
-  r.put('/hardware/printers/:id', (req, res) => {
+  r.put('/hardware/printers/:id', devRequirePerm('printer.manage'), (req, res) => {
     const p = store.printers.find((x) => x.id === req.params.id);
     if (!p) return res.status(404).json({ error: 'not found' });
     Object.assign(p, { name: req.body.name ?? p.name, target: req.body.target ?? p.target, connection: req.body.connection ?? p.connection, width: req.body.width !== undefined ? Number(req.body.width) : p.width, isDefault: req.body.isDefault ?? p.isDefault, isActive: req.body.isActive ?? p.isActive });
     res.json(toPrinter(p));
   });
-  r.post('/hardware/print', (req, res) => {
+  r.post('/hardware/print', devRequirePerm('reprint'), (req, res) => {
     const b = req.body || {};
     const target = b.target || 'receipt';
     const printer = store.printers.find((x) => x.target === target && x.isActive) || store.printers.find((x) => x.isActive);
@@ -1520,14 +1759,14 @@ export function createDevRouter(io) {
     store.printJobs.unshift(job);
     res.status(201).json({ job, printer: printer ? toPrinter(printer) : null, escpos: lines.join('\n') });
   });
-  r.post('/hardware/drawer', (req, res) => {
+  r.post('/hardware/drawer', devRequirePerm('payment.open_drawer'), (req, res) => {
     const job = { id: nid(), orgId: '1', storeId: '1', target: 'drawer', payload: 'ESC/POS: 1B 70 00 19 FA', status: 'sent', createdBy: req.user.id, createdAt: now() };
     store.printJobs.unshift(job);
     res.json({ ok: true, job });
   });
 
   // ---- GST 汇总报表(支持日期区间) ----
-  r.get('/reports/gst', (req, res) => {
+  r.get('/reports/gst', devRequirePerm('report.view'), (req, res) => {
     const from = req.query.from || null;
     const to = req.query.to || null;
     const inRange = makeFilter(from, to);
@@ -1541,7 +1780,7 @@ export function createDevRouter(io) {
   });
 
   // ---- 重打中心：按类型/日期/桌号/收银员检索历史单据 ----
-  r.get('/reports/reprint', (req, res) => {
+  r.get('/reports/reprint', devRequirePerm('report.view'), (req, res) => {
     const type = req.query.type || 'bill';
     const from = req.query.from ? new Date(`${req.query.from}T00:00:00`) : null;
     const to = req.query.to ? new Date(`${req.query.to}T23:59:59`) : null;
@@ -1584,12 +1823,12 @@ export function createDevRouter(io) {
 
   // ---- 库存（原料级） ----
   r.get('/inventory/items', (req, res) => res.json(store.inventory.map(toInventoryItem)));
-  r.post('/inventory/items', (req, res) => {
+  r.post('/inventory/items', devRequirePerm('stock.take'), (req, res) => {
     const b = req.body;
     const inv = { id: nid(), orgId: '1', storeId: '1', name: b.name, unit: b.unit, quantity: Number(b.quantity || 0), threshold: Number(b.threshold || 0), costPrice: b.costPrice == null ? null : Number(b.costPrice) };
     store.inventory.push(inv); res.status(201).json(toInventoryItem(inv));
   });
-  r.post('/inventory/adjust', (req, res) => {
+  r.post('/inventory/adjust', devRequirePerm('stock.take'), (req, res) => {
     const inv = store.inventory.find((x) => x.id === String(req.body.itemId));
     if (!inv) return res.status(404).json({ error: 'not found' });
     inv.quantity = Math.max(0, Number(inv.quantity) + Number(req.body.delta || 0));
@@ -1597,14 +1836,14 @@ export function createDevRouter(io) {
   });
 
   // ---- 报表 ----
-  r.get('/reports/sales', (req, res) => {
+  r.get('/reports/sales', devRequirePerm('report.view'), (req, res) => {
     const paid = store.orders.filter((o) => o.status === 'paid');
     const total = paid.reduce((s, o) => s + Number(o.total || 0), 0);
     const byMethod = {};
     for (const p of store.payments) byMethod[p.method] = (byMethod[p.method] || 0) + Number(p.amount || 0);
     res.json({ from: now(), to: now(), total, count: paid.length, byMethod });
   });
-  r.get('/reports/daily-close', (req, res) => {
+  r.get('/reports/daily-close', devRequirePerm('report.view'), (req, res) => {
     const paid = store.orders.filter((o) => o.status === 'paid');
     const total = paid.reduce((s, o) => s + Number(o.total || 0), 0);
     const byMethod = {};
@@ -1614,18 +1853,18 @@ export function createDevRouter(io) {
 
   // ---- 会员 / 会员充值 / 积分 / Knock Off ----
   r.get('/members', (req, res) => res.json(store.members.map(toMember)));
-  r.post('/members', (req, res) => {
+  r.post('/members', devRequirePerm('member.create'), (req, res) => {
     const b = req.body || {};
     const m = { id: nid(), orgId: '1', storeId: '1', memberNo: b.memberNo || `M${String(store.members.length + 1).padStart(4, '0')}`, name: b.name || '', phone: b.phone || '', creditBalance: Number(b.creditBalance || 0), points: Number(b.points || 0), status: 'active', createdAt: now() };
     store.members.push(m); res.status(201).json(toMember(m));
   });
-  r.put('/members/:id', (req, res) => {
+  r.put('/members/:id', devRequirePerm('member.create'), (req, res) => {
     const m = store.members.find((x) => x.id === req.params.id);
     if (!m) return res.status(404).json({ error: 'not found' });
     Object.assign(m, { memberNo: req.body.memberNo ?? m.memberNo, name: req.body.name ?? m.name, phone: req.body.phone ?? m.phone, status: req.body.status ?? m.status });
     res.json(toMember(m));
   });
-  r.post('/members/:id/top-up', (req, res) => {
+  r.post('/members/:id/top-up', devRequirePerm('member.topup'), (req, res) => {
     const m = store.members.find((x) => x.id === req.params.id);
     const amount = Number(req.body.amount || 0);
     if (!m || amount <= 0) return res.status(400).json({ error: 'invalid member or amount' });
@@ -1634,12 +1873,12 @@ export function createDevRouter(io) {
     store.memberTopups.push(topup); res.json({ member: toMember(m), topup });
   });
   r.get('/members/:id/ledger', (req, res) => res.json({ topups: store.memberTopups.filter((x) => x.memberId === req.params.id), points: store.pointsLedger.filter((x) => x.memberId === req.params.id) }));
-  r.post('/members/:id/points', (req, res) => {
+  r.post('/members/:id/points', devRequirePerm('member.points'), (req, res) => {
     const m = store.members.find((x) => x.id === req.params.id); const delta = Number(req.body.delta || 0);
     if (!m) return res.status(404).json({ error: 'not found' });
     m.points = Math.max(0, m.points + delta); const row = { id: nid(), memberId: m.id, delta, reason: req.body.reason || 'manual', createdAt: now() }; store.pointsLedger.push(row); res.json({ member: toMember(m), entry: row });
   });
-  r.post('/members/:id/knock-off', (req, res) => {
+  r.post('/members/:id/knock-off', devRequirePerm('payment.settle'), (req, res) => {
     const m = store.members.find((x) => x.id === req.params.id); const amount = Number(req.body.amount || 0);
     if (!m || amount <= 0 || amount > m.creditBalance) return res.status(400).json({ error: 'invalid amount' });
     m.creditBalance -= amount; res.json({ member: toMember(m), knockedOff: amount, receiptNo: `RV${Date.now()}` });
@@ -1647,7 +1886,7 @@ export function createDevRouter(io) {
 
   // ---- Cash In / Withdraw / Payment / Received / Credit Note ----
   r.get('/finance/movements', (req, res) => res.json(store.cashMovements.map(toMovement)));
-  r.post('/finance/movements', (req, res) => {
+  r.post('/finance/movements', devRequirePerm('payment.cash_move'), (req, res) => {
     const b = req.body || {}; const amount = Number(b.amount || 0);
     if (amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
     const row = { id: nid(), type: b.type || 'cash_in', voucherNo: b.voucherNo || `V${Date.now()}`, payTo: b.payTo || '', amount, reason: b.reason || b.for || '', method: b.method || 'cash', createdBy: req.user.id, createdAt: now() };
@@ -1660,7 +1899,7 @@ export function createDevRouter(io) {
     if (!c) return res.status(404).json({ error: 'not found' });
     res.json(toCreditNote(c));
   });
-  r.post('/finance/credit-notes', (req, res) => {
+  r.post('/finance/credit-notes', devRequirePerm('payment.credit_note'), (req, res) => {
     const b = req.body || {};
     const lines = (b.items || []).map((i) => {
       const qty = Number(i.qty || 0);
@@ -1681,7 +1920,7 @@ export function createDevRouter(io) {
     store.creditNotes.unshift(row);
     res.status(201).json(toCreditNote(row));
   });
-  r.post('/finance/credit-notes/:id/post', (req, res) => {
+  r.post('/finance/credit-notes/:id/post', devRequirePerm('payment.credit_note'), (req, res) => {
     const c = store.creditNotes.find((x) => x.id === req.params.id);
     if (!c) return res.status(404).json({ error: 'not found' });
     if (c.status !== 'open') return res.status(400).json({ error: 'already posted' });
@@ -1695,7 +1934,7 @@ export function createDevRouter(io) {
     c.status = 'posted'; c.postedAt = now();
     res.json(toCreditNote(c));
   });
-  r.delete('/finance/credit-notes/:id', (req, res) => {
+  r.delete('/finance/credit-notes/:id', devRequirePerm('payment.credit_note'), (req, res) => {
     const c = store.creditNotes.find((x) => x.id === req.params.id);
     if (c && c.status === 'posted') return res.status(400).json({ error: 'posted note cannot be deleted' });
     store.creditNotes = store.creditNotes.filter((x) => x.id !== req.params.id);
@@ -1703,14 +1942,14 @@ export function createDevRouter(io) {
   });
 
   // ---- 日结 Day End ----
-  r.get('/reports/day-end', (req, res) => res.json(dayEndSummary(req.query.date)));
-  r.get('/reports/day-end/history', (req, res) => res.json(store.dayEnds));
-  r.get('/reports/day-end/:id', (req, res) => {
+  r.get('/reports/day-end', devRequirePerm('report.view'), (req, res) => res.json(dayEndSummary(req.query.date)));
+  r.get('/reports/day-end/history', devRequirePerm('report.view'), (req, res) => res.json(store.dayEnds));
+  r.get('/reports/day-end/:id', devRequirePerm('report.view'), (req, res) => {
     const d = store.dayEnds.find((x) => x.id === req.params.id);
     if (!d) return res.status(404).json({ error: 'not found' });
     res.json(d);
   });
-  r.post('/reports/day-end/close', (req, res) => {
+  r.post('/reports/day-end/close', devRequirePerm('day_end'), (req, res) => {
     const date = req.body?.date || dayOf(new Date().toISOString());
     if (store.dayEnds.find((d) => d.date === date)) return res.status(400).json({ error: 'day already closed' });
     const summary = dayEndSummary(date);
@@ -1728,7 +1967,7 @@ export function createDevRouter(io) {
 
   // ---- Attendance ----
   r.get('/attendance', (req, res) => res.json(store.attendance.map(toAttendance)));
-  r.post('/attendance', (req, res) => {
+  r.post('/attendance', devRequirePerm('shift.manage'), (req, res) => {
     const action = req.body.action || 'sign_in';
     const row = { id: nid(), userId: req.user.id, userName: req.user.name, action, code: req.body.code || '', note: req.body.note || '', time: now() };
     store.attendance.unshift(row); res.status(201).json(toAttendance(row));
@@ -1742,30 +1981,30 @@ export function createDevRouter(io) {
     s.expectedAmount = s.openAmount + paid.reduce((sum, o) => sum + Number(o.total || 0), 0);
     res.json({ shift: toShift(s), paidOrders: paid.map(toOrder), byMethod: Object.fromEntries(Object.entries(store.payments.filter((p) => paid.some((o) => o.id === p.orderId)).reduce((a, p) => { a[p.method] = (a[p.method] || 0) + Number(p.amount); return a; }, {}))) });
   });
-  r.post('/shifts/open', (req, res) => { const s = { id: nid(), orgId: '1', storeId: '1', cashierId: req.user.id, openAmount: Number(req.body.openAmount || 0), expectedAmount: Number(req.body.openAmount || 0), closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null }; store.shifts.push(s); res.status(201).json(toShift(s)); });
-  r.post('/shifts/:id/close', (req, res) => {
+  r.post('/shifts/open', devRequirePerm('shift.manage'), (req, res) => { const s = { id: nid(), orgId: '1', storeId: '1', cashierId: req.user.id, openAmount: Number(req.body.openAmount || 0), expectedAmount: Number(req.body.openAmount || 0), closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null }; store.shifts.push(s); res.status(201).json(toShift(s)); });
+  r.post('/shifts/:id/close', devRequirePerm('shift.manage'), (req, res) => {
     const s = store.shifts.find((x) => x.id === req.params.id); if (!s || s.status !== 'open') return res.status(404).json({ error: 'open shift not found' });
     s.closeAmount = Number(req.body.closeAmount || 0); const paid = store.orders.filter((o) => o.status === 'paid' && o.shiftId === s.id); s.expectedAmount = s.openAmount + paid.reduce((sum, o) => sum + Number(o.total || 0), 0); s.difference = s.closeAmount - s.expectedAmount; s.status = 'closed'; s.closedAt = now(); res.json(toShift(s));
   });
 
   // ---- Suppliers / Purchase Order / GRN ----
   r.get('/suppliers', (req, res) => res.json(store.suppliers.map(toSupplier)));
-  r.post('/suppliers', (req, res) => { const b = req.body || {}; const s = { id: nid(), orgId: '1', storeId: '1', code: b.code || `SUP-${store.suppliers.length + 1}`, name: b.name || '', phone: b.phone || '', contact: b.contact || '', status: 'active', createdAt: now() }; store.suppliers.push(s); res.status(201).json(toSupplier(s)); });
+  r.post('/suppliers', devRequirePerm('stock.purchase'), (req, res) => { const b = req.body || {}; const s = { id: nid(), orgId: '1', storeId: '1', code: b.code || `SUP-${store.suppliers.length + 1}`, name: b.name || '', phone: b.phone || '', contact: b.contact || '', status: 'active', createdAt: now() }; store.suppliers.push(s); res.status(201).json(toSupplier(s)); });
   r.get('/purchases', (req, res) => res.json(store.purchaseOrders));
-  r.post('/purchases', (req, res) => { const b = req.body || {}; const p = { id: nid(), poNo: b.poNo || `PO${Date.now()}`, supplierId: b.supplierId || null, items: b.items || [], total: Number(b.total || 0), status: 'open', createdAt: now() }; store.purchaseOrders.unshift(p); res.status(201).json(p); });
-  r.post('/purchases/:id/receive', (req, res) => { const p = store.purchaseOrders.find((x) => x.id === req.params.id); if (!p) return res.status(404).json({ error: 'not found' }); p.status = 'received'; p.receivedAt = now(); for (const item of p.items || []) { const inv = store.inventory.find((x) => x.id === String(item.itemId)); if (inv) inv.quantity += Number(item.qty || 0); } res.json(p); });
+  r.post('/purchases', devRequirePerm('stock.purchase'), (req, res) => { const b = req.body || {}; const p = { id: nid(), poNo: b.poNo || `PO${Date.now()}`, supplierId: b.supplierId || null, items: b.items || [], total: Number(b.total || 0), status: 'open', createdAt: now() }; store.purchaseOrders.unshift(p); res.status(201).json(p); });
+  r.post('/purchases/:id/receive', devRequirePerm('stock.purchase'), (req, res) => { const p = store.purchaseOrders.find((x) => x.id === req.params.id); if (!p) return res.status(404).json({ error: 'not found' }); p.status = 'received'; p.receivedAt = now(); for (const item of p.items || []) { const inv = store.inventory.find((x) => x.id === String(item.itemId)); if (inv) inv.quantity += Number(item.qty || 0); } res.json(p); });
 
   // ---- 报表目录:前端据此渲染分组下拉与列定义 ----
-  r.get('/reports/catalog', (req, res) => res.json({ categories: REPORT_CATEGORIES, reports: REPORT_CATALOG }));
+  r.get('/reports/catalog', devRequirePerm('report.view'), (req, res) => res.json({ categories: REPORT_CATEGORIES, reports: REPORT_CATALOG }));
 
   // ---- 通用报表查询(统一走 reportEngine,开发预览与生产口径一致) ----
-  r.get('/reports/query', (req, res) => {
+  r.get('/reports/query', devRequirePerm('report.view'), (req, res) => {
     const type = req.query.type || 'sales_by_date';
     res.json(runReport(type, buildReportDataset(), { from: req.query.from, to: req.query.to }));
   });
 
   // ---- 报表导出:CSV / Excel(xlsx) / 打印页(浏览器另存为 PDF) ----
-  r.get('/reports/export', (req, res) => {
+  r.get('/reports/export', devRequirePerm('report.export'), (req, res) => {
     const type = req.query.type || 'sales_by_date';
     const format = String(req.query.format || 'csv').toLowerCase();
     const from = req.query.from || null;

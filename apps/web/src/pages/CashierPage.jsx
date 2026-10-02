@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import { io } from 'socket.io-client';
 import { api } from '../api/client.js';
+import { useAuth } from '../auth/AuthContext.jsx';
 
 const CATEGORY_COLORS = ['#d7e48e', '#f4bd63', '#f3e95d', '#ef9cca', '#9ed6e9', '#52d065', '#60a4eb', '#e79bd1', '#a99ece'];
 const PAGE_SIZE = 12;
 const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null, salesPersonId: '', memberId: '', memberLabel: '' });
 
 export default function CashierPage() {
+  // 按键权限:收银端的作废/折扣/退款/拆单/转台等按钮按权限显隐,服务端同样会拦。
+  const { can } = useAuth();
   const [tree, setTree] = useState({ categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [] });
   const [tables, setTables] = useState([]);
   const [active, setActive] = useState([]);
@@ -313,7 +316,7 @@ export default function CashierPage() {
           <button onClick={() => updateActiveCart(() => [])}>Del</button>
           <button onClick={() => setMultiplier(1)}>Pax</button>
           <button onClick={() => updateActiveCart((c) => c.slice(0, -1))}>X Dish</button>
-          <button onClick={applyDiscount}>Pre-Disc</button>
+          {can('order.discount') && <button onClick={applyDiscount}>Pre-Disc</button>}
           <button onClick={() => { updateActiveCart(() => []); setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, discount: 0 } : p)); }}>Void</button>
           <div className="cashier-multiplier">{[1, 2, 3, 4, 5, 6].map((n) => <button key={n} onClick={() => setMultiplier(n)} className={multiplier === n ? 'bg-yellow-200' : ''}>x{n}</button>)}</div>
           <div className="text-[10px] text-center text-indigo-900">下次点单 x{multiplier}</div>
@@ -356,20 +359,20 @@ export default function CashierPage() {
         <button onClick={() => { const n = prompt('选择桌号', tableId); if (n) setTableId(n); }}>Table</button>
         <button onClick={() => setMemberPicker('page')}>Member{activePage.memberLabel ? ` · ${activePage.memberLabel}` : ''}</button>
         <button onClick={() => printOrder(active[0] || { _id: '' }, 'receipt')}>Request</button>
-        <button onClick={openRefundPicker}>Refund</button>
+        {can('payment.refund') && <button onClick={openRefundPicker}>Refund</button>}
         <button onClick={sendCurrentPage}>Send</button>
-        <button onClick={holdCurrentPage}>Hold</button>
-        <button onClick={openRecall}>Recall</button>
+        {can('order.hold') && <button onClick={holdCurrentPage}>Hold</button>}
+        {can('order.hold') && <button onClick={openRecall}>Recall</button>}
         <button onClick={createPage}>Order</button>
         <button onClick={() => updateActiveCart(() => [])}>Delete All</button>
-        <button onClick={applyDiscount}>Discount</button>
-        <button onClick={() => { const n = prompt('Open item 名称'); const p = prompt('金额'); if (n && p) updateActiveCart((prev) => [...prev, { variantId: `open-${Date.now()}`, code: 'OPEN', name: n, unitPrice: Number(p), qty: 1 }]); }}>Open Item</button>
+        {can('order.discount') && <button onClick={applyDiscount}>Discount</button>}
+        {can('order.edit_price') && <button onClick={() => { const n = prompt('Open item 名称'); const p = prompt('金额'); if (n && p) updateActiveCart((prev) => [...prev, { variantId: `open-${Date.now()}`, code: 'OPEN', name: n, unitPrice: Number(p), qty: 1 }]); }}>Open Item</button>}
         <button onClick={() => active.length ? openPayment(active[0]) : alert('请先 Send 一个订单')}>Payment</button>
-        <button onClick={() => active.length ? setSplitOrder(active[0]) : alert('请先 Send 一个订单')}>Split</button>
-        <button onClick={() => active.length ? setTransferOrder(active[0]) : alert('请先 Send 一个订单')}>Transfer</button>
-        <button onClick={() => active.length ? setShowMerge(true) : alert('没有可合并的订单')}>Merge</button>
+        {can('order.split') && <button onClick={() => active.length ? setSplitOrder(active[0]) : alert('请先 Send 一个订单')}>Split</button>}
+        {can('order.transfer') && <button onClick={() => active.length ? setTransferOrder(active[0]) : alert('请先 Send 一个订单')}>Transfer</button>}
+        {can('order.merge') && <button onClick={() => active.length ? setShowMerge(true) : alert('没有可合并的订单')}>Merge</button>}
         <button onClick={() => active.length ? printOrder(active[0]) : alert('请先 Send 一个订单')}>PBill</button>
-        <button onClick={openDrawer}>Drawer</button>
+        {can('payment.open_drawer') && <button onClick={openDrawer}>Drawer</button>}
         <button onClick={() => history.back()}>Exit</button>
       </div>
 
@@ -380,10 +383,10 @@ export default function CashierPage() {
             <small className="cashier-open-meta">Table {tableLabel(o.tableId)}{o.salesPersonId ? ` · ${(salesPersons.find((u) => String(u.id) === String(o.salesPersonId)) || {}).name || ''}` : ''}{o.memberId ? ` · ${(members.find((m) => String(m.id) === String(o.memberId)) || {}).memberNo || 'Member'}` : ''}</small>
             <button onClick={() => openPayment(o)}>Payment</button>
             <button onClick={() => setMemberPicker(o)}>Member</button>
-            <button onClick={() => setSplitOrder(o)}>Split</button>
-            <button onClick={() => setTransferOrder(o)}>Transfer</button>
+            {can('order.split') && <button onClick={() => setSplitOrder(o)}>Split</button>}
+            {can('order.transfer') && <button onClick={() => setTransferOrder(o)}>Transfer</button>}
             <button onClick={() => printOrder(o)}>Print</button>
-            <button onClick={() => requestVoid(o)}>Void</button>
+            {can('order.void') && <button onClick={() => requestVoid(o)}>Void</button>}
           </div>)}
           {!active.length && <span className="text-slate-500 text-xs">Send 后订单会立即显示在这里</span>}
         </div>
@@ -411,8 +414,10 @@ export default function CashierPage() {
             {voidQueue.map((o) => <div key={o._id} className="cashier-open-card void">
               <b>{o.orderNo}</b> · ¥{o.total}<br />
               <small>原因: {o.voidReason || '-'}</small>
-              <button onClick={() => approveVoid(o)}>Approve</button>
-              <button onClick={() => rejectVoid(o)}>Reject</button>
+              {can('order.void_approve') ? <>
+                <button onClick={() => approveVoid(o)}>Approve</button>
+                <button onClick={() => rejectVoid(o)}>Reject</button>
+              </> : <small className="cashier-void-locked">需要主管权限审批</small>}
             </div>)}
           </div>
         </div>

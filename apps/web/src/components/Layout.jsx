@@ -2,22 +2,24 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { api } from '../api/client.js';
 
+// perm 有值时按「按键权限」显示(后台权限矩阵可授予/收回);
+// 没有对应按键的条目才回落到 roles 判断。
 const NAV = [
-  { feature: 'sales', label: 'Sales', icon: '⚑', roles: ['admin', 'manager', 'cashier', 'waiter'] },
-  { feature: 'cash-in', label: 'Cash In', icon: '▰', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'withdraw', label: 'Withdraw', icon: '♢', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'payment', label: 'Payment', icon: '▱', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'credit-note', label: 'Credit Note', icon: '▰', roles: ['admin', 'manager'] },
-  { feature: 'refund', label: 'Refund', icon: '↩', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'reprint', label: 'Reprint', icon: '⎙', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'void-approval', label: 'Void Approval', icon: '⊘', roles: ['admin', 'manager'] },
-  { feature: 'received', label: 'Received', icon: '♨', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'drawer', label: 'Open Drawer', icon: '▣', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'close-shift', label: 'Close shift', icon: '◉', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'daily-sales', label: 'Daily sales', icon: '▱', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'reports', label: 'Reports', icon: '◌', roles: ['admin', 'manager'] },
-  { feature: 'attendance', label: 'Attendance', icon: '◍', roles: ['admin', 'manager', 'cashier'] },
-  { feature: 'back-office', label: 'Back Office', icon: '⚙', roles: ['admin', 'manager'] },
+  { feature: 'sales', label: 'Sales', icon: '⚑', perm: 'order.create' },
+  { feature: 'cash-in', label: 'Cash In', icon: '▰', perm: 'payment.cash_move' },
+  { feature: 'withdraw', label: 'Withdraw', icon: '♢', perm: 'payment.cash_move' },
+  { feature: 'payment', label: 'Payment', icon: '▱', perm: 'payment.settle' },
+  { feature: 'credit-note', label: 'Credit Note', icon: '▰', perm: 'payment.credit_note' },
+  { feature: 'refund', label: 'Refund', icon: '↩', perm: 'payment.refund' },
+  { feature: 'reprint', label: 'Reprint', icon: '⎙', perm: 'reprint' },
+  { feature: 'void-approval', label: 'Void Approval', icon: '⊘', perm: 'order.void_approve' },
+  { feature: 'received', label: 'Received', icon: '♨', perm: 'payment.settle' },
+  { feature: 'drawer', label: 'Open Drawer', icon: '▣', perm: 'payment.open_drawer' },
+  { feature: 'close-shift', label: 'Close shift', icon: '◉', perm: 'shift.manage' },
+  { feature: 'daily-sales', label: 'Daily sales', icon: '▱', perm: 'report.view' },
+  { feature: 'reports', label: 'Reports', icon: '◌', perm: 'report.view' },
+  { feature: 'attendance', label: 'Attendance', icon: '◍', perm: 'shift.manage' },
+  { feature: 'back-office', label: 'Back Office', icon: '⚙', perm: 'settings.edit' },
   { feature: 'password', label: 'Password', icon: '▣', roles: ['admin', 'manager', 'cashier', 'waiter', 'kitchen'] },
 ];
 
@@ -27,9 +29,9 @@ const FEATURE_TABS = {
 };
 
 export default function Layout() {
-  const { user, logout } = useAuth();
+  const { user, logout, can } = useAuth();
   const navigate = useNavigate();
-  const nav = NAV.filter((n) => n.roles.includes(user.role));
+  const nav = NAV.filter((n) => (n.perm ? can(n.perm) : n.roles.includes(user.role)));
 
   const go = (item) => {
     if (item.to) navigate(item.to);

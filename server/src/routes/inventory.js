@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { query, getRow, insert, toInventoryItem, toStockMovement } from '../db.js';
-import { authenticate, rbac, tenant } from '../middleware/auth.js';
+import { authenticate, rbac, tenant, requirePermission } from '../middleware/auth.js';
 import { inventoryItemSchema, adjustSchema } from '../validators.js';
 import { emitToStore } from '../sockets.js';
 
@@ -13,7 +13,7 @@ router.get('/items', async (req, res) => {
   res.json(list.map(toInventoryItem));
 });
 
-router.post('/items', rbac('admin', 'manager'), async (req, res) => {
+router.post('/items', requirePermission('stock.take'), async (req, res) => {
   const p = inventoryItemSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const id = await insert(
@@ -24,7 +24,7 @@ router.post('/items', rbac('admin', 'manager'), async (req, res) => {
   res.status(201).json(toInventoryItem(await getRow('SELECT * FROM inventory_items WHERE id=?', [id])));
 });
 
-router.put('/items/:id', rbac('admin', 'manager'), async (req, res) => {
+router.put('/items/:id', requirePermission('stock.take'), async (req, res) => {
   const p = inventoryItemSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const sets = [], params = [];
@@ -38,7 +38,7 @@ router.put('/items/:id', rbac('admin', 'manager'), async (req, res) => {
   res.json(toInventoryItem(await getRow('SELECT * FROM inventory_items WHERE id=?', [req.params.id])));
 });
 
-router.post('/adjust', rbac('admin', 'manager'), async (req, res) => {
+router.post('/adjust', requirePermission('stock.take'), async (req, res) => {
   const p = adjustSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const item = await getRow('SELECT * FROM inventory_items WHERE id=? AND org_id=? AND store_id=?', [Number(req.body.itemId), orgId, storeId]);

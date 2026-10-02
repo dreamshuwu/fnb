@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { query, getRow, insert, toShift } from '../db.js';
-import { authenticate, rbac, tenant } from '../middleware/auth.js';
+import { authenticate, rbac, tenant, requirePermission } from '../middleware/auth.js';
 
 const router = Router();
 router.use(authenticate);
 
-router.post('/open', rbac('admin', 'manager', 'cashier'), async (req, res) => {
+router.post('/open', requirePermission('shift.manage'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const existing = await getRow(
     'SELECT * FROM shifts WHERE org_id=? AND store_id=? AND cashier_id=? AND status=?',
@@ -19,7 +19,7 @@ router.post('/open', rbac('admin', 'manager', 'cashier'), async (req, res) => {
   res.status(201).json(toShift(await getRow('SELECT * FROM shifts WHERE id=?', [id])));
 });
 
-router.post('/close', rbac('admin', 'manager', 'cashier'), async (req, res) => {
+router.post('/close', requirePermission('shift.manage'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const s = await getRow(
     'SELECT * FROM shifts WHERE org_id=? AND store_id=? AND cashier_id=? AND status=?',

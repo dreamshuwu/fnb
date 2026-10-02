@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { query, getRow, insert, toOrder, toStore, toPayment, stringifyJSON, parseJSON } from '../db.js';
-import { authenticate, rbac, tenant } from '../middleware/auth.js';
+import { authenticate, rbac, tenant, requirePermission } from '../middleware/auth.js';
 import { createOrderSchema, orderItemSchema, checkoutSchema, voidSchema } from '../validators.js';
 import { emitToStore } from '../sockets.js';
 
@@ -63,7 +63,7 @@ async function getOrder(id, orgId, storeId) {
   return r ? toOrder(r) : null;
 }
 
-router.post('/', async (req, res) => {
+router.post('/', requirePermission('order.create'), async (req, res) => {
   const p = createOrderSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const settings = await loadSettings(orgId, storeId);
@@ -143,7 +143,7 @@ router.get('/sales-persons', async (req, res) => {
 });
 
 // 并台：把多张进行中的单合并到主单，其余标记 merged 并释放桌位
-router.post('/merge', async (req, res) => {
+router.post('/merge', requirePermission('order.merge'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const ids = (req.body.orderIds || []).map(Number).filter((n) => Number.isFinite(n));
   if (ids.length < 2) return res.status(400).json({ error: 'need at least 2 orders' });
@@ -207,7 +207,7 @@ router.get('/:id', async (req, res) => {
   res.json(o);
 });
 
-router.post('/:id/items', async (req, res) => {
+router.post('/:id/items', requirePermission('order.create'), async (req, res) => {
   const p = orderItemSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
@@ -225,7 +225,7 @@ router.post('/:id/items', async (req, res) => {
 });
 
 // 整单替换明细（取单后编辑再送厨房用）
-router.put('/:id/items', async (req, res) => {
+router.put('/:id/items', requirePermission('order.create'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -277,7 +277,7 @@ async function deductInventory(order, user, io) {
   if (low.length) emitToStore(io, user.storeId, 'inventory:low', low);
 }
 
-router.post('/:id/checkout', async (req, res) => {
+router.post('/:id/checkout', requirePermission('payment.settle'), async (req, res) => {
   const p = checkoutSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
@@ -409,7 +409,7 @@ router.post('/:id/checkout', async (req, res) => {
   });
 });
 
-router.post('/:id/void', async (req, res) => {
+router.post('/:id/void', requirePermission('order.void'), async (req, res) => {
   const p = voidSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
@@ -422,7 +422,7 @@ router.post('/:id/void', async (req, res) => {
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
-router.post('/:id/void/approve', rbac('admin', 'manager'), async (req, res) => {
+router.post('/:id/void/approve', requirePermission('order.void_approve'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -438,7 +438,7 @@ router.post('/:id/void/approve', rbac('admin', 'manager'), async (req, res) => {
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
-router.post('/:id/void/reject', rbac('admin', 'manager'), async (req, res) => {
+router.post('/:id/void/reject', requirePermission('order.void_approve'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -450,7 +450,7 @@ router.post('/:id/void/reject', rbac('admin', 'manager'), async (req, res) => {
 });
 
 // ---- 挂单 / 取单 ----
-router.post('/:id/hold', async (req, res) => {
+router.post('/:id/hold', requirePermission('order.hold'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -462,7 +462,7 @@ router.post('/:id/hold', async (req, res) => {
   res.json(order);
 });
 
-router.post('/:id/recall', async (req, res) => {
+router.post('/:id/recall', requirePermission('order.hold'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -473,7 +473,7 @@ router.post('/:id/recall', async (req, res) => {
 });
 
 // ---- 转台 / 销售员指派 ----
-router.post('/:id/transfer', async (req, res) => {
+router.post('/:id/transfer', requirePermission('order.transfer'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const o = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!o) return res.status(404).json({ error: 'not found' });
@@ -506,7 +506,7 @@ router.post('/:id/transfer', async (req, res) => {
   res.json({ order: updated, transfer: transferRow(await getRow('SELECT * FROM order_transfers WHERE id=?', [id])) });
 });
 
-router.put('/:id/sales-person', async (req, res) => {
+router.put('/:id/sales-person', requirePermission('order.sales_person'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -516,7 +516,7 @@ router.put('/:id/sales-person', async (req, res) => {
 });
 
 // 结账前挂/换会员:返利抵扣必须基于订单上的会员,所以允许在 Payment 之前补挂。
-router.put('/:id/member', async (req, res) => {
+router.put('/:id/member', requirePermission('payment.settle'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -537,7 +537,7 @@ router.get('/unsettles/list', async (req, res) => {
   res.json(rows.map((r) => ({ _id: r.id, id: r.id, orderId: r.order_id, orderNo: r.order_no, invoiceNo: r.invoice_no, amount: Number(r.amount || 0), payments: parseJSON(r.payments), reason: r.reason, createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at })));
 });
 
-router.post('/:id/unsettle', async (req, res) => {
+router.post('/:id/unsettle', requirePermission('order.unsettle'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
@@ -586,7 +586,7 @@ router.get('/:id/document', async (req, res) => {
   res.json(buildDocument(order, settings, table?.number || null, cashier?.name || null, payments, req.query.kind || 'bill'));
 });
 
-router.post('/:id/reprint', async (req, res) => {
+router.post('/:id/reprint', requirePermission('reprint'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });

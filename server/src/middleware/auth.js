@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
-import { getUserById, normalizeUser } from '../db.js';
+import { getUserById, normalizeUser, getRolePermissionOverrides } from '../db.js';
+import { hasPermission, resolveRolePermissions } from '../permissions.js';
 
 export const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
@@ -54,5 +55,56 @@ export function publicUser(u) {
     orgId: String(u.orgId),
     storeId: String(u.storeId),
     phone: u.phone,
+    email: u.email || null,
+    employeeNo: u.employeeNo || null,
+    joinDate: u.joinDate || null,
+    lastLoginAt: u.lastLoginAt || null,
+    // 只回「有没有设 PIN」,绝不回 bcrypt 哈希
+    hasPin: !!u.hasPin,
+    isActive: u.isActive !== false,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 按键级权限(与 permissions.js 目录对应)
+// 权限矩阵存在 role_permissions 表里,每个请求都查库太贵,按门店缓存 15 秒。
+// 后台改完权限后调用 invalidatePermissionCache 立即失效。
+// ---------------------------------------------------------------------------
+const permCache = new Map(); // `${orgId}:${storeId}` -> { at, overrides }
+const PERM_TTL = 15_000;
+
+export function invalidatePermissionCache(orgId, storeId) {
+  permCache.delete(`${orgId}:${storeId}`);
+}
+
+async function loadOverrides(orgId, storeId) {
+  const key = `${orgId}:${storeId}`;
+  const hit = permCache.get(key);
+  if (hit && Date.now() - hit.at < PERM_TTL) return hit.overrides;
+  let overrides = {};
+  try {
+    overrides = await getRolePermissionOverrides(orgId, storeId);
+  } catch {
+    overrides = {}; // 表还没建好时回落到默认值,不阻断业务
+  }
+  permCache.set(key, { at: Date.now(), overrides });
+  return overrides;
+}
+
+/** 某用户当前生效的权限清单(角色默认值 + 本店覆盖值)。 */
+export async function effectivePermissions(user) {
+  if (!user) return [];
+  const overrides = await loadOverrides(user.orgId, user.storeId);
+  return resolveRolePermissions(user.role, overrides);
+}
+
+/** 路由守卫:要求当前用户具备全部指定按键权限。 */
+export function requirePermission(...keys) {
+  return async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+    const perms = await effectivePermissions(req.user);
+    const missing = keys.filter((k) => !hasPermission(perms, k));
+    if (missing.length) return res.status(403).json({ error: 'forbidden', missing });
+    next();
   };
 }

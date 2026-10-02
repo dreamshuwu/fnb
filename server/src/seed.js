@@ -1,12 +1,13 @@
 import bcrypt from 'bcryptjs';
 import { pool, query, insert, stringifyJSON } from './db.js';
+import { ROLES, defaultPermissions } from './permissions.js';
 
 const DEMO_USERS = [
-  { phone: '1000000000', name: 'Admin', role: 'admin', password: 'admin123' },
-  { phone: '1000000001', name: 'Manager', role: 'manager', password: 'manager123' },
-  { phone: '1000000002', name: 'Cashier', role: 'cashier', password: 'cashier123' },
-  { phone: '1000000003', name: 'Waiter', role: 'waiter', password: 'waiter123' },
-  { phone: '1000000004', name: 'Kitchen', role: 'kitchen', password: 'kitchen123' },
+  { phone: '1000000000', name: 'Admin', role: 'admin', password: 'admin123', employeeNo: 'EMP-0001', joinDate: '2023-01-01' },
+  { phone: '1000000001', name: 'Manager', role: 'manager', password: 'manager123', employeeNo: 'EMP-0002', joinDate: '2023-02-01' },
+  { phone: '1000000002', name: 'Cashier', role: 'cashier', password: 'cashier123', employeeNo: 'EMP-0003', joinDate: '2023-03-01' },
+  { phone: '1000000003', name: 'Waiter', role: 'waiter', password: 'waiter123', employeeNo: 'EMP-0004', joinDate: '2023-04-01' },
+  { phone: '1000000004', name: 'Kitchen', role: 'kitchen', password: 'kitchen123', employeeNo: 'EMP-0005', joinDate: '2023-05-01' },
 ];
 
 // ---- 菜单种子数据（kopitiam 风格，演示用；后台可改） ----
@@ -75,9 +76,18 @@ export async function seedIfEmpty() {
   for (const u of DEMO_USERS) {
     const passwordHash = await bcrypt.hash(u.password, 10);
     await insert(
-      `INSERT INTO users (org_id, store_id, name, phone, role, password_hash, is_active)
-       VALUES (?,?,?,?,?,?,1)`,
-      [orgId, storeId, u.name, u.phone, u.role, passwordHash]
+      `INSERT INTO users (org_id, store_id, name, phone, role, employee_no, join_date, password_hash, is_active)
+       VALUES (?,?,?,?,?,?,?,?,1)`,
+      [orgId, storeId, u.name, u.phone, u.role, u.employeeNo, u.joinDate, passwordHash]
+    );
+  }
+
+  // 角色权限矩阵:把默认值落库一份,后台改动就覆盖这些行。
+  for (const role of ROLES) {
+    await insert(
+      `INSERT INTO role_permissions (org_id, store_id, role, permissions)
+       VALUES (?,?,?,?)`,
+      [orgId, storeId, role, stringifyJSON(defaultPermissions(role))]
     );
   }
 

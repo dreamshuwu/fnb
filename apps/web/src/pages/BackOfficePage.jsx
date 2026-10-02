@@ -1,24 +1,38 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api/client.js';
+import { useAuth } from '../auth/AuthContext.jsx';
 
 const TABS = [
   ['promotions', 'Promotion'], ['vouchers', 'Gift Voucher'], ['rebates', 'Member Rebate'],
   ['customer-stock', 'Customer Stock'], ['stock-take', 'Periodical Stock'],
   ['barcode', 'Barcode'], ['gst', 'GST / Store Setup'], ['printers', 'Printers'], ['designer', 'Report Designer'],
+  ['staff', 'Staff'], ['permissions', 'Permissions'],
+];
+
+const ROLES = [
+  ['admin', 'Admin 管理员'], ['manager', 'Manager 店长'], ['cashier', 'Cashier 收银员'],
+  ['waiter', 'Waiter 服务员'], ['kitchen', 'Kitchen 厨房'],
 ];
 
 export default function BackOfficePage() {
   const [params, setParams] = useSearchParams();
+  const { can } = useAuth();
+  // Staff / Permissions 两个标签按按键权限显示:店长有 staff.manage 但没有 permission.manage
+  const tabs = TABS.filter(([key]) => {
+    if (key === 'staff') return can('staff.manage');
+    if (key === 'permissions') return can('permission.manage');
+    return true;
+  });
   const tab = params.get('tab') || 'promotions';
-  const active = TABS.some(([key]) => key === tab) ? tab : 'promotions';
+  const active = tabs.some(([key]) => key === tab) ? tab : tabs[0][0];
   return (
     <div className="operations-page">
       <div className="operations-heading">
-        <div><div className="modern-eyebrow">SMCIN / MASTER DATA</div><h1>Back Office</h1><p>促销、客户库存、定期盘点、条码、GST 设置、硬件与报表设计</p></div>
+        <div><div className="modern-eyebrow">SMCIN / MASTER DATA</div><h1>Back Office</h1><p>促销、礼券返利、客户库存、盘点、条码、GST、硬件、报表设计与员工权限</p></div>
         <div className="operations-date">{new Date().toLocaleDateString('en-GB')}</div>
       </div>
-      <div className="operations-tabs">{TABS.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div>
+      <div className="operations-tabs">{tabs.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div>
       <div className="operations-content">
         {active === 'promotions' && <PromotionPanel />}
         {active === 'vouchers' && <VoucherPanel />}
@@ -29,6 +43,8 @@ export default function BackOfficePage() {
         {active === 'gst' && <GstPanel />}
         {active === 'printers' && <PrinterPanel />}
         {active === 'designer' && <DesignerPanel />}
+        {active === 'staff' && <StaffPanel />}
+        {active === 'permissions' && <PermissionMatrixPanel />}
       </div>
     </div>
   );
@@ -227,6 +243,247 @@ function RebatePanel() {
       </div>
     </Panel>}
   </>;
+}
+
+function StaffPanel() {
+  const { user: me } = useAuth();
+  const [rows, setRows] = useState([]);
+  const [q, setQ] = useState(''); const [roleFilter, setRoleFilter] = useState(''); const [statusFilter, setStatusFilter] = useState('');
+  const [msg, setMsg] = useState('');
+  const [form, setForm] = useState({ name: '', phone: '', email: '', employeeNo: '', joinDate: '', role: 'cashier', password: '' });
+  const [editing, setEditing] = useState(null);   // 正在编辑的员工副本
+
+  const flash = (t) => { setMsg(t); setTimeout(() => setMsg(''), 2000); };
+  const load = async () => {
+    const qs = new URLSearchParams();
+    if (q) qs.set('q', q);
+    if (roleFilter) qs.set('role', roleFilter);
+    if (statusFilter) qs.set('status', statusFilter);
+    setRows((await api.get('/users', { params: Object.fromEntries(qs) })).data);
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [roleFilter, statusFilter]);
+
+  const add = async () => {
+    if (!form.name.trim()) { alert('请填写姓名'); return; }
+    if (!form.phone.trim()) { alert('请填写登录手机号'); return; }
+    if (form.password.length < 6) { alert('密码至少 6 位'); return; }
+    try {
+      await api.post('/users', { ...form, password: form.password });
+      setForm({ name: '', phone: '', email: '', employeeNo: '', joinDate: '', role: 'cashier', password: '' });
+      flash('员工已创建'); load();
+    } catch (e) { alert(e.response?.data?.error || '创建失败'); }
+  };
+  const saveEdit = async () => {
+    try {
+      await api.put(`/users/${editing.id}`, {
+        name: editing.name, phone: editing.phone, email: editing.email,
+        employeeNo: editing.employeeNo, joinDate: editing.joinDate || null, role: editing.role,
+      });
+      setEditing(null); flash('已保存'); load();
+    } catch (e) { alert(e.response?.data?.error || '保存失败'); }
+  };
+  const toggleStatus = async (u) => {
+    if (u.id === me.id) { alert('不能停用自己'); return; }
+    if (u.isActive && !window.confirm(`停用 ${u.name}? 该员工将无法登录。`)) return;
+    try { await api.put(`/users/${u.id}/status`, { isActive: !u.isActive }); load(); }
+    catch (e) { alert(e.response?.data?.error || '操作失败'); }
+  };
+  const resetPassword = async (u) => {
+    const np = prompt(`为 ${u.name} 设置新密码(至少 6 位):`, '');
+    if (!np) return;
+    try { await api.put(`/users/${u.id}/password`, { newPassword: np }); flash('密码已重置'); }
+    catch (e) { alert(e.response?.data?.error || '重置失败'); }
+  };
+  const setPin = async (u) => {
+    const pin = prompt(`为 ${u.name} 设置 4-6 位 PIN(留空 = 清除):`, '');
+    if (pin === null) return;
+    try {
+      const r = await api.put(`/users/${u.id}/pin`, { pin });
+      flash(r.data.hasPin ? 'PIN 已设置' : 'PIN 已清除'); load();
+    } catch (e) { alert(e.response?.data?.error || 'PIN 设置失败'); }
+  };
+  const remove = async (u) => {
+    if (!window.confirm(`删除 ${u.name}? 将停用账号并保留历史单据引用。`)) return;
+    try { await api.delete(`/users/${u.id}`); flash('账号已停用'); load(); }
+    catch (e) { alert(e.response?.data?.error || '删除失败'); }
+  };
+
+  const roleLabel = (r) => (ROLES.find(([k]) => k === r) || [r, r])[1];
+  const activeCount = rows.filter((u) => u.isActive).length;
+  const byRole = ROLES.map(([k, label]) => [label, rows.filter((u) => u.role === k).length]);
+
+  return <>
+    <Panel title="Staff & Access" subtitle="员工主档 · 登录密码 · PIN 快捷登录 · 启用停用">
+      <div className="report-kpis voucher-kpis">
+        <span>Total <b>{rows.length}</b></span>
+        <span>Active <b>{activeCount}</b></span>
+        <span>Disabled <b>{rows.length - activeCount}</b></span>
+        <span>With PIN <b>{rows.filter((u) => u.hasPin).length}</b></span>
+        {byRole.map(([label, n]) => <span key={label}>{label.split(' ')[0]} <b>{n}</b></span>)}
+      </div>
+
+      <div className="ops-form inline">
+        <Input label="Name" value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="Ali bin Abu" />
+        <Input label="Login Phone" value={form.phone} onChange={(v) => setForm({ ...form, phone: v })} placeholder="1000000010" />
+        <Input label="Email" value={form.email} onChange={(v) => setForm({ ...form, email: v })} />
+        <Input label="Employee No." value={form.employeeNo} onChange={(v) => setForm({ ...form, employeeNo: v })} placeholder="EMP-0010" />
+        <Input label="Join Date" type="date" value={form.joinDate} onChange={(v) => setForm({ ...form, joinDate: v })} />
+        <label className="ops-field"><span>Role</span>
+          <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+            {ROLES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+        </label>
+        <Input label="Initial Password" type="password" value={form.password} onChange={(v) => setForm({ ...form, password: v })} />
+        <Action onClick={add}>Add Staff</Action>{msg && <span className="ops-saved">{msg}</span>}
+      </div>
+
+      <div className="ops-form inline">
+        <Input label="Search" value={q} onChange={setQ} placeholder="name / phone / employee no." />
+        <label className="ops-field"><span>Role</span>
+          <select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+            <option value="">All roles</option>
+            {ROLES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+        </label>
+        <label className="ops-field"><span>Status</span>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="">All</option><option value="active">Active</option><option value="inactive">Disabled</option>
+          </select>
+        </label>
+        <Action tone="secondary" onClick={load}>Search</Action>
+      </div>
+
+      <div className="ops-table staff-table tall"><div className="ops-row ops-head"><span>Emp No.</span><span>Name</span><span>Login Phone</span><span>Role</span><span>Joined</span><span>Last Login</span><span>PIN</span><span>Status</span><span>Action</span></div>
+        {rows.map((u) => <div className="ops-row" key={u.id}>
+          <span>{u.employeeNo || '-'}</span>
+          <span><b>{u.name}</b>{String(u.id) === String(me.id) && <small className="staff-self"> (me)</small>}</span>
+          <span>{u.phone}</span>
+          <span className={`staff-role ${u.role}`}>{roleLabel(u.role)}</span>
+          <span>{u.joinDate ? new Date(u.joinDate).toLocaleDateString('en-GB') : '-'}</span>
+          <span>{u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString('en-GB') : '—'}</span>
+          <span>{u.hasPin ? '●' : '—'}</span>
+          <span className={u.isActive ? 'staff-on' : 'staff-off'}>{u.isActive ? 'Active' : 'Disabled'}</span>
+          <span className="ops-inline-actions">
+            <button className="mini-action" onClick={() => setEditing({ ...u })}>Edit</button>
+            <button className="mini-action" onClick={() => resetPassword(u)}>Password</button>
+            <button className="mini-action" onClick={() => setPin(u)}>PIN</button>
+            <button className="mini-action" onClick={() => toggleStatus(u)}>{u.isActive ? 'Disable' : 'Enable'}</button>
+            <button className="mini-action danger" onClick={() => remove(u)}>Delete</button>
+          </span>
+        </div>)}
+        {!rows.length && <Empty text="No staff found" />}
+      </div>
+    </Panel>
+
+    {editing && <Panel title={`Edit Staff · ${editing.name}`} subtitle="角色变更需谨慎:店长不能修改管理员,也不能把最后一个管理员降级">
+      <div className="ops-form inline">
+        <Input label="Name" value={editing.name} onChange={(v) => setEditing({ ...editing, name: v })} />
+        <Input label="Login Phone" value={editing.phone} onChange={(v) => setEditing({ ...editing, phone: v })} />
+        <Input label="Email" value={editing.email || ''} onChange={(v) => setEditing({ ...editing, email: v })} />
+        <Input label="Employee No." value={editing.employeeNo || ''} onChange={(v) => setEditing({ ...editing, employeeNo: v })} />
+        <Input label="Join Date" type="date" value={(editing.joinDate || '').slice(0, 10)} onChange={(v) => setEditing({ ...editing, joinDate: v })} />
+        <label className="ops-field"><span>Role</span>
+          <select value={editing.role} onChange={(e) => setEditing({ ...editing, role: e.target.value })}>
+            {ROLES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+        </label>
+        <Action onClick={saveEdit}>Save Changes</Action>
+        <Action tone="secondary" onClick={() => setEditing(null)}>Cancel</Action>
+      </div>
+    </Panel>}
+  </>;
+}
+
+function PermissionMatrixPanel() {
+  const [data, setData] = useState(null);           // { catalog, all, roles, defaults }
+  const [draft, setDraft] = useState(null);         // { role: [keys] }
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    const r = await api.get('/roles/permissions');
+    setData(r.data);
+    setDraft(JSON.parse(JSON.stringify(r.data.roles)));
+  };
+  useEffect(() => { load(); }, []);
+
+  const flash = (t) => { setMsg(t); setTimeout(() => setMsg(''), 2000); };
+  const toggle = (role, key) => {
+    if (role === 'admin') return;
+    setDraft((d) => {
+      const list = d[role] || [];
+      return { ...d, [role]: list.includes(key) ? list.filter((k) => k !== key) : [...list, key] };
+    });
+  };
+  const dirty = (role) => {
+    const a = [...(draft?.[role] || [])].sort();
+    const b = [...(data?.roles?.[role] || [])].sort();
+    return a.length !== b.length || a.some((k, i) => k !== b[i]);
+  };
+  const saveRole = async (role) => {
+    setBusy(true);
+    try {
+      await api.put(`/roles/${role}/permissions`, { permissions: draft[role] || [] });
+      flash(`${ROLES.find(([k]) => k === role)?.[1] || role} 已保存`);
+      await load();
+    } catch (e) { alert(e.response?.data?.error || '保存失败'); }
+    finally { setBusy(false); }
+  };
+  const resetRole = (role) => {
+    if (role === 'admin') return;
+    setDraft((d) => ({ ...d, [role]: [...(data.defaults?.[role] || [])] }));
+  };
+  const checkAll = (role, on) => {
+    if (role === 'admin') return;
+    setDraft((d) => ({ ...d, [role]: on ? [...(data.all || [])] : [] }));
+  };
+
+  if (!data || !draft) return <Panel title="Permission Matrix" subtitle="Loading…"><Empty text="Loading permissions" /></Panel>;
+  const dirtyRoles = ROLES.map(([k]) => k).filter(dirty);
+
+  return <Panel title="Permission Matrix" subtitle="按键级权限:勾选 = 该角色可用。admin 恒为全权,不可限制。改动即时生效于服务端校验与前端按钮。">
+    <div className="ops-actions">
+      <Action tone="secondary" onClick={load}>Reload</Action>
+      {dirtyRoles.length > 0 && <Action onClick={async () => { for (const r of dirtyRoles) await saveRole(r); }}>{busy ? 'Saving…' : `Save All (${dirtyRoles.length})`}</Action>}
+      {msg && <span className="ops-saved">{msg}</span>}
+      <span className="perm-hint">共 {data.all.length} 个按键 · {ROLES.length} 个角色</span>
+    </div>
+    <div className="ops-table perm-table tall">
+      <div className="ops-row ops-head perm-row"><span>Permission</span>
+        {ROLES.map(([k, l]) => <span key={k} className="perm-col-head">
+          <b>{l.split(' ')[0]}</b>
+          {k !== 'admin' && <>
+            <button className="mini-action" onClick={() => checkAll(k, true)}>All</button>
+            <button className="mini-action" onClick={() => checkAll(k, false)}>None</button>
+            {dirty(k) && <button className="mini-action" onClick={() => saveRole(k)}>Save</button>}
+            <button className="mini-action" onClick={() => resetRole(k)}>Reset</button>
+          </>}
+          {k === 'admin' && <small className="perm-locked">全权</small>}
+        </span>)}
+      </div>
+      {data.catalog.map((g) => (
+        <div key={g.group} className="perm-group">
+          <div className="ops-row perm-row perm-group-row"><span>{g.label}</span>{ROLES.map(([k]) => <span key={k} />)}</div>
+          {g.actions.map((a) => (
+            <div className="ops-row perm-row" key={a.key}>
+              <span className="perm-name"><b>{a.label}</b><small>{a.desc} · {a.key}</small></span>
+              {ROLES.map(([role]) => (
+                <span key={role} className="perm-cell">
+                  <input
+                    type="checkbox"
+                    disabled={role === 'admin'}
+                    checked={role === 'admin' ? true : (draft[role] || []).includes(a.key)}
+                    onChange={() => toggle(role, a.key)}
+                  />
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+    <div className="perm-legend">提示:收回 <b>report.view</b> 会同时隐藏侧边栏的 Reports / Daily sales;收回 <b>payment.settle</b> 会让该角色无法结账。</div>
+  </Panel>;
 }
 
 function CustomerStockPanel() {

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import { initSchema } from './db.js';
 import { seedIfEmpty } from './seed.js';
 import authRoutes from './routes/auth.js';
+import userRoutes from './routes/users.js';
 import menuRoutes from './routes/menu.js';
 import tableRoutes from './routes/tables.js';
 import orderRoutes from './routes/orders.js';
@@ -56,6 +57,7 @@ if (process.env.DEV_NO_DB === '1') {
   server.listen(PORT, () => console.log(`[dev-mode] listening on :${PORT} (no MySQL)`));
 } else {
   app.use('/api/auth', authRoutes);
+  app.use('/api/users', userRoutes);
   app.use('/api/menu', menuRoutes);
   app.use('/api/tables', tableRoutes);
   app.use('/api/orders', orderRoutes);

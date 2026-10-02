@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { query } from '../db.js';
-import { authenticate, tenant } from '../middleware/auth.js';
+import { authenticate, tenant, requirePermission } from '../middleware/auth.js';
 
 const router = Router();
 router.use(authenticate);
@@ -11,7 +11,7 @@ function startOfDay(d = new Date()) {
   return x;
 }
 
-router.get('/sales', async (req, res) => {
+router.get('/sales', requirePermission('report.view'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const from = req.query.from ? new Date(req.query.from) : startOfDay();
   const to = req.query.to ? new Date(req.query.to) : new Date();
@@ -29,7 +29,7 @@ router.get('/sales', async (req, res) => {
   res.json({ from, to, total, count: orders.length, byMethod });
 });
 
-router.get('/daily-close', async (req, res) => {
+router.get('/daily-close', requirePermission('report.view'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const day = startOfDay();
   const orders = await query(
