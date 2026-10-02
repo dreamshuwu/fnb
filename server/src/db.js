@@ -280,6 +280,9 @@ export async function initSchema() {
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
       credit_no VARCHAR(64), customer_name VARCHAR(255), order_no VARCHAR(64),
       reason TEXT, gst TINYINT(1) DEFAULT 0, items TEXT, status VARCHAR(32) DEFAULT 'open',
+      include_gst TINYINT(1) DEFAULT 0, subtotal DECIMAL(12,2) DEFAULT 0, gst_amount DECIMAL(12,2) DEFAULT 0,
+      total DECIMAL(12,2) DEFAULT 0, tax_rate DECIMAL(6,2) DEFAULT 0, restock TINYINT(1) DEFAULT 1,
+      posted_at TIMESTAMP NULL,
       created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS attendance_records (
@@ -365,6 +368,13 @@ export async function initSchema() {
       order_id INT, order_no VARCHAR(64), kind VARCHAR(32) DEFAULT 'bill', created_by INT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id), INDEX (order_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS day_ends (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      end_date DATE NOT NULL, snapshot TEXT, counted_cash DECIMAL(12,2) DEFAULT 0,
+      expected_cash DECIMAL(12,2) DEFAULT 0, difference DECIMAL(12,2) DEFAULT 0,
+      note TEXT, closed_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), UNIQUE KEY uniq_day (org_id, store_id, end_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
   for (const s of stmts) await query(s);
 
@@ -379,6 +389,13 @@ export async function initSchema() {
     "ALTER TABLE orders ADD COLUMN held_at TIMESTAMP NULL",
     "ALTER TABLE orders ADD COLUMN reprint_count INT DEFAULT 0",
     "ALTER TABLE orders ADD COLUMN unsettled_at TIMESTAMP NULL",
+    "ALTER TABLE credit_notes ADD COLUMN include_gst TINYINT(1) DEFAULT 0",
+    "ALTER TABLE credit_notes ADD COLUMN subtotal DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE credit_notes ADD COLUMN gst_amount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE credit_notes ADD COLUMN total DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE credit_notes ADD COLUMN tax_rate DECIMAL(6,2) DEFAULT 0",
+    "ALTER TABLE credit_notes ADD COLUMN restock TINYINT(1) DEFAULT 1",
+    "ALTER TABLE credit_notes ADD COLUMN posted_at TIMESTAMP NULL",
     "ALTER TABLE orders MODIFY COLUMN status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open'",
   ];
   for (const a of alters) {

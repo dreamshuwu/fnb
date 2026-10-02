@@ -20,8 +20,124 @@ router.post('/members/:id/knock-off', async (req, res) => { const { orgId, store
 
 router.get('/finance/movements', async (req, res) => { const { orgId, storeId } = tenant(req); res.json((await query('SELECT * FROM cash_movements WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map(movement)); });
 router.post('/finance/movements', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO cash_movements (org_id,store_id,type,voucher_no,pay_to,amount,reason,method,created_by) VALUES (?,?,?,?,?,?,?,?,?)', [orgId, storeId, b.type || 'cash_in', b.voucherNo || `V${Date.now()}`, b.payTo || '', Number(b.amount || 0), b.reason || '', b.method || 'cash', req.user.id]); res.status(201).json(movement(await getRow('SELECT * FROM cash_movements WHERE id=?', [id]))); });
-router.get('/finance/credit-notes', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT * FROM credit_notes WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId]); res.json(rows.map((r) => ({ _id: r.id, id: r.id, creditNo: r.credit_no, customerName: r.customer_name, orderNo: r.order_no, reason: r.reason, gst: !!r.gst, items: parseJSON(r.items), status: r.status, createdAt: dt(r.created_at) }))); });
-router.post('/finance/credit-notes', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO credit_notes (org_id,store_id,credit_no,customer_name,order_no,reason,gst,items,created_by) VALUES (?,?,?,?,?,?,?,?,?)', [orgId, storeId, b.creditNo || `CN${Date.now()}`, b.customerName || '', b.orderNo || '', b.reason || '', b.gst ? 1 : 0, stringifyJSON(b.items || []), req.user.id]); res.status(201).json(await getRow('SELECT * FROM credit_notes WHERE id=?', [id])); });
+// ---- 门店设置读取 ----
+async function loadSettings(orgId, storeId) {
+  const rows = await query('SELECT setting_key,setting_value FROM app_settings WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const s = {};
+  for (const r of rows) { try { s[r.setting_key] = JSON.parse(r.setting_value); } catch { s[r.setting_key] = r.setting_value; } }
+  return s;
+}
+const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+const toCreditNote = (r) => ({
+  _id: r.id, id: r.id, creditNo: r.credit_no, customerName: r.customer_name, orderNo: r.order_no,
+  date: dt(r.created_at), reason: r.reason, includeGst: !!r.include_gst, gst: !!r.include_gst,
+  items: parseJSON(r.items), subtotal: Number(r.subtotal || 0), gstAmount: Number(r.gst_amount || 0),
+  total: Number(r.total || 0), taxRate: Number(r.tax_rate || 0), status: r.status, restock: !!r.restock,
+  postedAt: dt(r.posted_at), createdAt: dt(r.created_at),
+});
+
+// ---- Credit Note（含行项目 / GST / 过账回库） ----
+router.get('/finance/credit-notes', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  res.json((await query('SELECT * FROM credit_notes WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map(toCreditNote));
+});
+router.get('/finance/credit-notes/:id', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM credit_notes WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not found' });
+  res.json(toCreditNote(r));
+});
+router.post('/finance/credit-notes', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const b = req.body || {};
+  const s = await loadSettings(orgId, storeId);
+  const rate = Number(s.taxRate || 0) / 100;
+  const lines = (b.items || []).map((i) => {
+    const qty = Number(i.qty || 0);
+    const retail = Number(i.retail ?? i.unitPrice ?? 0);
+    return { code: i.code || '', barcode: i.barcode || '', description: i.description || i.name || '', location: i.location || '', qty, uom: i.uom || 'pcs', retail, cost: Number(i.cost || 0), subtotal: round2(qty * retail) };
+  });
+  const subtotal = round2(lines.reduce((x, l) => x + l.subtotal, 0));
+  const includeGst = !!b.includeGst;
+  const gstAmount = includeGst ? (s.taxInclusive ? round2(subtotal - subtotal / (1 + rate)) : round2(subtotal * rate)) : 0;
+  const total = includeGst && !s.taxInclusive ? round2(subtotal + gstAmount) : subtotal;
+  const id = await insert(
+    'INSERT INTO credit_notes (org_id,store_id,credit_no,customer_name,order_no,reason,gst,include_gst,items,subtotal,gst_amount,total,tax_rate,restock,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, b.creditNo || `CN${Date.now()}`, b.customerName || '', b.orderNo || '', b.reason || '', includeGst ? 1 : 0, includeGst ? 1 : 0, stringifyJSON(lines), subtotal, gstAmount, total, Number(s.taxRate || 0), b.restock === false ? 0 : 1, req.user.id]
+  );
+  res.status(201).json(toCreditNote(await getRow('SELECT * FROM credit_notes WHERE id=?', [id])));
+});
+router.post('/finance/credit-notes/:id/post', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM credit_notes WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not found' });
+  if (r.status !== 'open') return res.status(400).json({ error: 'already posted' });
+  if (r.restock) {
+    for (const l of parseJSON(r.items)) {
+      await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE org_id=? AND store_id=? AND (code=? OR (barcode IS NOT NULL AND barcode=?))', [Number(l.qty || 0), orgId, storeId, l.code || '', l.barcode || '']);
+    }
+  }
+  await query('UPDATE credit_notes SET status="posted",posted_at=NOW() WHERE id=?', [r.id]);
+  res.json(toCreditNote(await getRow('SELECT * FROM credit_notes WHERE id=?', [r.id])));
+});
+router.delete('/finance/credit-notes/:id', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM credit_notes WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (r && r.status === 'posted') return res.status(400).json({ error: 'posted note cannot be deleted' });
+  await query('DELETE FROM credit_notes WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  res.json({ ok: true });
+});
+
+// ---- 日结 Day End ----
+async function dayEndSummary(orgId, storeId, dateStr) {
+  const s = await loadSettings(orgId, storeId);
+  const day = dateStr || new Date().toISOString().slice(0, 10);
+  const paid = await query('SELECT subtotal,discount,service_charge,tax,total FROM orders WHERE org_id=? AND store_id=? AND status IN ("paid","refunded") AND DATE(created_at)=?', [orgId, storeId, day]);
+  const voids = await query('SELECT total FROM orders WHERE org_id=? AND store_id=? AND status="void" AND DATE(created_at)=?', [orgId, storeId, day]);
+  const byMethodRows = await query('SELECT p.method,SUM(p.amount) AS amount FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.org_id=? AND p.store_id=? AND DATE(o.created_at)=? GROUP BY p.method', [orgId, storeId, day]);
+  const byMethod = {}; for (const r of byMethodRows) byMethod[r.method] = round2(r.amount);
+  const movRows = await query('SELECT type,SUM(amount) AS amount FROM cash_movements WHERE org_id=? AND store_id=? AND DATE(created_at)=? GROUP BY type', [orgId, storeId, day]);
+  const mov = {}; for (const r of movRows) mov[r.type] = round2(r.amount);
+  const shiftRow = await getRow('SELECT COALESCE(SUM(open_amount),0) AS opening FROM shifts WHERE org_id=? AND store_id=? AND DATE(created_at)=?', [orgId, storeId, day]);
+  const refundRow = await getRow('SELECT COALESCE(SUM(amount),0) AS refunded FROM refunds WHERE org_id=? AND store_id=? AND DATE(created_at)=?', [orgId, storeId, day]);
+  const unsettleRow = await getRow('SELECT COALESCE(SUM(amount),0) AS unsettled FROM unsettles WHERE org_id=? AND store_id=? AND DATE(created_at)=?', [orgId, storeId, day]);
+  const cnRow = await getRow('SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS amount FROM credit_notes WHERE org_id=? AND store_id=? AND DATE(created_at)=?', [orgId, storeId, day]);
+  const closed = await getRow('SELECT id FROM day_ends WHERE org_id=? AND store_id=? AND end_date=?', [orgId, storeId, day]);
+  const sum = (f) => round2(paid.reduce((x, o) => x + Number(o[f] || 0), 0));
+  const opening = round2(shiftRow?.opening);
+  const salesCash = byMethod.cash || 0;
+  const tax = sum('tax');
+  const net = sum('total');
+  const refunded = round2(refundRow?.refunded);
+  const rate = Number(s.taxRate || 0);
+  const refundTax = rate ? round2(refunded * (rate / (100 + rate))) : 0;
+  return {
+    date: day, status: closed ? 'closed' : 'open',
+    sales: { orders: paid.length, gross: sum('subtotal'), discount: sum('discount'), serviceCharge: sum('service_charge'), tax, net, refunded, unsettled: round2(unsettleRow?.unsettled), voids: voids.length, voidAmount: round2(voids.reduce((x, o) => x + Number(o.total || 0), 0)) },
+    byMethod,
+    cash: { opening, cashIn: mov.cash_in || 0, withdraw: mov.withdraw || 0, payout: mov.payout || 0, received: mov.received || 0, salesCash, expected: round2(opening + (mov.cash_in || 0) + salesCash + (mov.received || 0) - (mov.withdraw || 0) - (mov.payout || 0)), counted: null, difference: null },
+    gst: { taxRate: rate, taxInclusive: !!s.taxInclusive, taxableSales: net, outputTax: tax, refundTax, netTax: round2(tax - refundTax) },
+    creditNotes: { count: Number(cnRow?.c || 0), amount: round2(cnRow?.amount) },
+    closedAt: null, closedBy: null, note: '',
+  };
+}
+router.get('/reports/day-end', async (req, res) => { const { orgId, storeId } = tenant(req); res.json(await dayEndSummary(orgId, storeId, req.query.date)); });
+router.get('/reports/day-end/history', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT id,end_date,snapshot,counted_cash,expected_cash,difference,note,created_at FROM day_ends WHERE org_id=? AND store_id=? ORDER BY end_date DESC', [orgId, storeId]); res.json(rows.map((r) => ({ _id: r.id, id: r.id, date: dt(r.end_date), snapshot: parseJSON(r.snapshot), countedCash: Number(r.counted_cash || 0), expectedCash: Number(r.expected_cash || 0), difference: Number(r.difference || 0), note: r.note, closedAt: dt(r.created_at) }))); });
+router.get('/reports/day-end/:id', async (req, res) => { const { orgId, storeId } = tenant(req); const r = await getRow('SELECT * FROM day_ends WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!r) return res.status(404).json({ error: 'not found' }); res.json({ _id: r.id, id: r.id, date: dt(r.end_date), snapshot: parseJSON(r.snapshot), countedCash: Number(r.counted_cash || 0), expectedCash: Number(r.expected_cash || 0), difference: Number(r.difference || 0), note: r.note, closedAt: dt(r.created_at) }); });
+router.post('/reports/day-end/close', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const date = req.body?.date || new Date().toISOString().slice(0, 10);
+  const existing = await getRow('SELECT id FROM day_ends WHERE org_id=? AND store_id=? AND end_date=?', [orgId, storeId, date]);
+  if (existing) return res.status(400).json({ error: 'day already closed' });
+  const summary = await dayEndSummary(orgId, storeId, date);
+  const counted = round2(req.body?.countedCash || 0);
+  summary.cash.counted = counted;
+  summary.cash.difference = round2(counted - summary.cash.expected);
+  summary.status = 'closed'; summary.closedAt = new Date().toISOString(); summary.closedBy = req.user.name;
+  summary.note = req.body?.note || '';
+  const id = await insert('INSERT INTO day_ends (org_id,store_id,end_date,snapshot,counted_cash,expected_cash,difference,note,closed_by) VALUES (?,?,?,?,?,?,?,?,?)', [orgId, storeId, date, stringifyJSON(summary), counted, summary.cash.expected, summary.cash.difference, summary.note, req.user.id]);
+  res.status(201).json({ id, ...summary });
+});
 
 router.get('/attendance', async (req, res) => { const { orgId, storeId } = tenant(req); res.json((await query('SELECT * FROM attendance_records WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map(attendance)); });
 router.post('/attendance', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO attendance_records (org_id,store_id,user_id,user_name,action,code,note) VALUES (?,?,?,?,?,?,?)', [orgId, storeId, req.user.id, req.user.name, b.action || 'sign_in', b.code || '', b.note || '']); res.status(201).json(attendance(await getRow('SELECT * FROM attendance_records WHERE id=?', [id]))); });

@@ -23,7 +23,7 @@ const NAV = [
 
 const FEATURE_TABS = {
   'cash-in': 'finance', withdraw: 'finance', payment: 'finance', 'credit-note': 'finance', received: 'finance',
-  refund: 'refunds', reprint: 'reprint', 'void-approval': 'voids', 'close-shift': 'shifts', attendance: 'attendance', reports: 'reports',
+  refund: 'refunds', reprint: 'reprint', 'void-approval': 'voids', 'close-shift': 'shifts', 'daily-sales': 'day-end', attendance: 'attendance', reports: 'reports',
 };
 
 export default function Layout() {

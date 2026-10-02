@@ -15,6 +15,8 @@ const store = {
   reportTemplates: [], printJobs: [], printers: [], invoices: [],
   // 新增：挂单 / 反结算 / 重打
   unsettles: [], reprintLogs: [],
+  // 新增：日结
+  dayEnds: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -197,6 +199,13 @@ const toCustomerStock = (c) => ({ _id: c.id, id: c.id, memberId: String(c.member
 const toStockTake = (s) => ({ _id: s.id, id: s.id, takeNo: s.takeNo, status: s.status, lines: s.lines || [], createdBy: s.createdBy, createdAt: s.createdAt, postedAt: s.postedAt || null });
 const toReportTemplate = (t) => ({ _id: t.id, id: t.id, type: t.type, name: t.name, columns: t.columns || [], isSystem: !!t.isSystem, createdAt: t.createdAt });
 const toPrinter = (p) => ({ _id: p.id, id: p.id, name: p.name, target: p.target, connection: p.connection, width: Number(p.width || 80), isDefault: !!p.isDefault, isActive: !!p.isActive });
+const toCreditNote = (c) => ({
+  _id: c.id, id: c.id, creditNo: c.creditNo, customerName: c.customerName, orderNo: c.orderNo,
+  date: c.date || c.createdAt, reason: c.reason, includeGst: !!c.includeGst, gst: !!c.includeGst,
+  items: c.items || [], subtotal: Number(c.subtotal || 0), gstAmount: Number(c.gstAmount || 0),
+  total: Number(c.total || 0), taxRate: Number(c.taxRate || 0), status: c.status,
+  restock: !!c.restock, postedAt: c.postedAt || null, createdBy: c.createdBy, createdAt: c.createdAt,
+});
 
 // ---- 门店设置 ----
 function getSettings() {
@@ -255,6 +264,68 @@ function computeOrderTotals(items, discount = 0) {
   }
   if (s.roundTo5cent) total = Math.round(total * 20) / 20;
   return { subtotal: gross, discount: disc, serviceCharge, tax, total: Math.round(total * 100) / 100 };
+}
+
+const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+const dayOf = (d) => String(d || '').slice(0, 10);
+
+// 贷项凭单：按行项目计算小计 / GST / 合计
+function computeCreditNote(lines, includeGst) {
+  const s = getSettings();
+  const rate = Number(s.taxRate || 0) / 100;
+  const subtotal = round2(lines.reduce((x, l) => x + Number(l.subtotal || 0), 0));
+  const gstAmount = includeGst ? (s.taxInclusive ? round2(subtotal - subtotal / (1 + rate)) : round2(subtotal * rate)) : 0;
+  const total = includeGst && !s.taxInclusive ? round2(subtotal + gstAmount) : subtotal;
+  return { subtotal, gstAmount, total, taxRate: Number(s.taxRate || 0), taxInclusive: !!s.taxInclusive };
+}
+
+// 日结汇总：当天销售 / 付款方式 / 现金流水 / GST / 差异
+function dayEndSummary(dateStr) {
+  const s = getSettings();
+  const day = dateStr || dayOf(new Date().toISOString());
+  const onDay = (d) => dayOf(d) === day;
+  const today = store.orders.filter((o) => onDay(o.createdAt));
+  const paid = today.filter((o) => o.status === 'paid' || o.status === 'refunded');
+  const voids = today.filter((o) => o.status === 'void');
+  const byMethod = {};
+  for (const p of store.payments) {
+    const o = store.orders.find((x) => x.id === String(p.orderId));
+    if (o && onDay(o.createdAt)) byMethod[p.method] = round2((byMethod[p.method] || 0) + Number(p.amount || 0));
+  }
+  const movements = store.cashMovements.filter((m) => onDay(m.createdAt));
+  const sumType = (t) => round2(movements.filter((m) => m.type === t).reduce((x, m) => x + Number(m.amount || 0), 0));
+  const shiftsToday = store.shifts.filter((sh) => onDay(sh.openedAt));
+  const opening = round2(shiftsToday.reduce((x, sh) => x + Number(sh.openAmount || 0), 0));
+  const salesCash = byMethod.cash || 0;
+  const refunded = round2(store.refunds.filter((r) => onDay(r.createdAt)).reduce((x, r) => x + Number(r.amount || 0), 0));
+  const unsettled = round2(store.unsettles.filter((u) => onDay(u.createdAt)).reduce((x, u) => x + Number(u.amount || 0), 0));
+  const creditNotes = store.creditNotes.filter((c) => onDay(c.createdAt));
+  const tax = round2(paid.reduce((x, o) => x + Number(o.tax || 0), 0));
+  const net = round2(paid.reduce((x, o) => x + Number(o.total || 0), 0));
+  const rate = Number(s.taxRate || 0);
+  const refundTax = rate ? round2(refunded * (rate / (100 + rate))) : 0;
+  return {
+    date: day,
+    status: store.dayEnds.find((d) => d.date === day) ? 'closed' : 'open',
+    sales: {
+      orders: paid.length,
+      gross: round2(paid.reduce((x, o) => x + Number(o.subtotal || 0), 0)),
+      discount: round2(paid.reduce((x, o) => x + Number(o.discount || 0), 0)),
+      serviceCharge: round2(paid.reduce((x, o) => x + Number(o.serviceCharge || 0), 0)),
+      tax, net, refunded, unsettled,
+      voids: voids.length,
+      voidAmount: round2(voids.reduce((x, o) => x + Number(o.total || 0), 0)),
+    },
+    byMethod,
+    cash: {
+      opening, cashIn: sumType('cash_in'), withdraw: sumType('withdraw'), payout: sumType('payout'), received: sumType('received'),
+      salesCash, expected: round2(opening + sumType('cash_in') + salesCash + sumType('received') - sumType('withdraw') - sumType('payout')),
+      counted: null, difference: null,
+    },
+    gst: { taxRate: rate, taxInclusive: !!s.taxInclusive, taxableSales: net, outputTax: tax, refundTax, netTax: round2(tax - refundTax) },
+    creditNotes: { count: creditNotes.length, amount: round2(creditNotes.reduce((x, c) => x + Number(c.total || 0), 0)) },
+    closedAt: null, closedBy: null, note: '',
+  };
 }
 function orderNo() {
   const d = new Date();
@@ -1021,10 +1092,77 @@ export function createDevRouter(io) {
     const row = { id: nid(), type: b.type || 'cash_in', voucherNo: b.voucherNo || `V${Date.now()}`, payTo: b.payTo || '', amount, reason: b.reason || b.for || '', method: b.method || 'cash', createdBy: req.user.id, createdAt: now() };
     store.cashMovements.unshift(row); res.status(201).json(toMovement(row));
   });
-  r.get('/finance/credit-notes', (req, res) => res.json(store.creditNotes));
+  // ---- Credit Note（含行项目 / GST / 过账回库） ----
+  r.get('/finance/credit-notes', (req, res) => res.json(store.creditNotes.map(toCreditNote)));
+  r.get('/finance/credit-notes/:id', (req, res) => {
+    const c = store.creditNotes.find((x) => x.id === req.params.id);
+    if (!c) return res.status(404).json({ error: 'not found' });
+    res.json(toCreditNote(c));
+  });
   r.post('/finance/credit-notes', (req, res) => {
-    const b = req.body || {}; const row = { id: nid(), creditNo: b.creditNo || `CN${Date.now()}`, customerName: b.customerName || '', orderNo: b.orderNo || '', reason: b.reason || '', gst: !!b.gst, items: b.items || [], status: 'open', createdBy: req.user.id, createdAt: now() };
-    store.creditNotes.unshift(row); res.status(201).json(row);
+    const b = req.body || {};
+    const lines = (b.items || []).map((i) => {
+      const qty = Number(i.qty || 0);
+      const retail = Number(i.retail ?? i.unitPrice ?? 0);
+      return {
+        code: i.code || '', barcode: i.barcode || '', description: i.description || i.name || '',
+        location: i.location || '', qty, uom: i.uom || 'pcs', retail, cost: Number(i.cost || 0),
+        subtotal: round2(qty * retail),
+      };
+    });
+    const totals = computeCreditNote(lines, !!b.includeGst);
+    const row = {
+      id: nid(), orgId: '1', storeId: '1', creditNo: b.creditNo || `CN${Date.now()}`,
+      customerName: b.customerName || '', orderNo: b.orderNo || '', date: b.date || now(),
+      reason: b.reason || '', includeGst: !!b.includeGst, items: lines, status: 'open',
+      restock: b.restock !== false, ...totals, createdBy: req.user.id, createdAt: now(),
+    };
+    store.creditNotes.unshift(row);
+    res.status(201).json(toCreditNote(row));
+  });
+  r.post('/finance/credit-notes/:id/post', (req, res) => {
+    const c = store.creditNotes.find((x) => x.id === req.params.id);
+    if (!c) return res.status(404).json({ error: 'not found' });
+    if (c.status !== 'open') return res.status(400).json({ error: 'already posted' });
+    // 过账：可选回补库存
+    if (c.restock !== false) {
+      for (const l of c.items || []) {
+        const v = store.variants.find((x) => x.code === l.code || (l.barcode && x.barcode === l.barcode));
+        if (v) v.stockQty = Number(v.stockQty) + Number(l.qty || 0);
+      }
+    }
+    c.status = 'posted'; c.postedAt = now();
+    res.json(toCreditNote(c));
+  });
+  r.delete('/finance/credit-notes/:id', (req, res) => {
+    const c = store.creditNotes.find((x) => x.id === req.params.id);
+    if (c && c.status === 'posted') return res.status(400).json({ error: 'posted note cannot be deleted' });
+    store.creditNotes = store.creditNotes.filter((x) => x.id !== req.params.id);
+    res.json({ ok: true });
+  });
+
+  // ---- 日结 Day End ----
+  r.get('/reports/day-end', (req, res) => res.json(dayEndSummary(req.query.date)));
+  r.get('/reports/day-end/history', (req, res) => res.json(store.dayEnds));
+  r.get('/reports/day-end/:id', (req, res) => {
+    const d = store.dayEnds.find((x) => x.id === req.params.id);
+    if (!d) return res.status(404).json({ error: 'not found' });
+    res.json(d);
+  });
+  r.post('/reports/day-end/close', (req, res) => {
+    const date = req.body?.date || dayOf(new Date().toISOString());
+    if (store.dayEnds.find((d) => d.date === date)) return res.status(400).json({ error: 'day already closed' });
+    const summary = dayEndSummary(date);
+    const counted = Number(req.body?.countedCash || 0);
+    summary.cash.counted = round2(counted);
+    summary.cash.difference = round2(counted - summary.cash.expected);
+    summary.status = 'closed';
+    summary.closedAt = now();
+    summary.closedBy = req.user.name;
+    summary.note = req.body?.note || '';
+    const rec = { id: nid(), ...summary };
+    store.dayEnds.unshift(rec);
+    res.status(201).json(rec);
   });
 
   // ---- Attendance ----
