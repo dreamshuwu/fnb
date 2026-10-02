@@ -206,6 +206,17 @@ function computeRows(type, ds, inRange, range) {
     case 'reprint_log':
       return (ds.reprintLogs || []).filter((l) => inRange(l.createdAt || l.at))
         .map((l) => ({ orderNo: l.orderNo, kind: l.kind, date: l.createdAt || l.at }));
+    case 'transfer_log':
+      return (ds.orderTransfers || []).filter((t) => inRange(t.createdAt)).map((t) => ({
+        date: t.createdAt,
+        type: t.type,
+        orderNo: t.orderNo,
+        fromTableNo: t.fromTableNo || '-',
+        toTableNo: t.toTableNo || '-',
+        mergedOrderNos: (t.mergedOrderNos || []).join(', ') || '-',
+        amount: round2(t.amount),
+        user: t.createdByName || '-',
+      }));
     case 'credit_note':
       return (ds.creditNotes || []).filter((c) => inRange(c.createdAt))
         .map((c) => ({ creditNo: c.creditNo, customerName: c.customerName || '-', orderNo: c.orderNo || '-', reason: c.reason || '', total: round2(c.total), status: c.status }));

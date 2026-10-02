@@ -41,8 +41,16 @@ router.put('/:id', rbac('admin', 'manager'), async (req, res) => {
 router.post('/:id/status', async (req, res) => {
   const { status } = req.body || {};
   const { orgId, storeId } = tenant(req);
-  await query('UPDATE tables SET status=? WHERE id=? AND org_id=? AND store_id=?', [status, req.params.id, orgId, storeId]);
-  res.json(toTable(await getRow('SELECT * FROM tables WHERE id=?', [req.params.id])));
+  // 手动改状态时同步清掉占用关系，避免遗留 current_order_id 指向已结单的订单
+  if (status && status !== 'occupied') {
+    await query('UPDATE tables SET status=?, current_order_id=NULL WHERE id=? AND org_id=? AND store_id=?', [status, req.params.id, orgId, storeId]);
+  } else {
+    await query('UPDATE tables SET status=? WHERE id=? AND org_id=? AND store_id=?', [status, req.params.id, orgId, storeId]);
+  }
+  const row = await getRow('SELECT * FROM tables WHERE id=?', [req.params.id]);
+  const io = req.app.get('io');
+  if (io) io.to(`store:${storeId}`).emit('tables:changed', toTable(row));
+  res.json(toTable(row));
 });
 
 export default router;

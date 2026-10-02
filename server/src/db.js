@@ -173,7 +173,7 @@ export async function initSchema() {
       table_id INT,
       customer_name VARCHAR(255),
       phone VARCHAR(64),
-      status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open',
+      status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split','merged') DEFAULT 'open',
       items TEXT,
       subtotal DECIMAL(12,2) DEFAULT 0,
       discount DECIMAL(12,2) DEFAULT 0,
@@ -380,6 +380,15 @@ export async function initSchema() {
       note TEXT, closed_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), UNIQUE KEY uniq_day (org_id, store_id, end_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS order_transfers (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      type VARCHAR(32) NOT NULL, order_id INT, order_no VARCHAR(64),
+      from_table_id INT, from_table_no VARCHAR(64), to_table_id INT, to_table_no VARCHAR(64),
+      merged_order_ids TEXT, merged_order_nos TEXT,
+      amount DECIMAL(12,2) DEFAULT 0, reason VARCHAR(255),
+      created_by INT, created_by_name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (order_id), INDEX (type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
   for (const s of stmts) await query(s);
 
@@ -401,7 +410,7 @@ export async function initSchema() {
     "ALTER TABLE credit_notes ADD COLUMN tax_rate DECIMAL(6,2) DEFAULT 0",
     "ALTER TABLE credit_notes ADD COLUMN restock TINYINT(1) DEFAULT 1",
     "ALTER TABLE credit_notes ADD COLUMN posted_at TIMESTAMP NULL",
-    "ALTER TABLE orders MODIFY COLUMN status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open'",
+    "ALTER TABLE orders MODIFY COLUMN status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split','merged') DEFAULT 'open'",
     // 报表增强:会员/销售员/折扣类型 + 出品部门 + 报表模板筛选条件
     "ALTER TABLE orders ADD COLUMN member_id INT",
     "ALTER TABLE orders ADD COLUMN sales_person_id INT",
@@ -410,6 +419,11 @@ export async function initSchema() {
     "ALTER TABLE report_templates ADD COLUMN filters TEXT",
     "ALTER TABLE report_templates ADD COLUMN sort TEXT",
     "ALTER TABLE report_templates ADD COLUMN format VARCHAR(16) DEFAULT 'csv'",
+    // 转台 / 并台审计
+    "ALTER TABLE order_transfers ADD COLUMN from_table_no VARCHAR(64)",
+    "ALTER TABLE order_transfers ADD COLUMN to_table_no VARCHAR(64)",
+    "ALTER TABLE order_transfers ADD COLUMN created_by_name VARCHAR(255)",
+    "ALTER TABLE orders ADD COLUMN merged_into_order_id INT",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }

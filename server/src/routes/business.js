@@ -165,7 +165,7 @@ async function buildReportDataset(orgId, storeId) {
   const safe = async (sql, params) => { try { return await query(sql, params); } catch { return []; } };
   const [orders, payments, refunds, unsettles, cashMovements, shifts, members, memberTopups, pointsLedger,
     invoices, creditNotes, variants, categories, customerStock, stockTakes, suppliers, purchaseOrders,
-    attendanceRows, reprintLogs, dayEnds, settings] = await Promise.all([
+    attendanceRows, reprintLogs, dayEnds, orderTransfers, settings] = await Promise.all([
     query('SELECT o.*, t.number AS table_no, u.name AS cashier_name, sp.name AS sales_person_name, m.member_no, m.name AS member_name FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by LEFT JOIN users sp ON sp.id=o.sales_person_id LEFT JOIN members m ON m.id=o.member_id WHERE o.org_id=? AND o.store_id=?', [orgId, storeId]),
     query('SELECT * FROM payments WHERE org_id=? AND store_id=?', [orgId, storeId]),
     query('SELECT * FROM refunds WHERE org_id=? AND store_id=?', [orgId, storeId]),
@@ -186,6 +186,7 @@ async function buildReportDataset(orgId, storeId) {
     safe('SELECT * FROM attendance WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM reprint_logs WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM day_ends WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM order_transfers WHERE org_id=? AND store_id=?', [orgId, storeId]),
     loadSettings(orgId, storeId),
   ]);
 
@@ -232,6 +233,7 @@ async function buildReportDataset(orgId, storeId) {
     attendance: attendanceRows.map((a) => ({ ...a, userName: a.user_name, time: dt(a.event_time || a.created_at) })),
     reprintLogs: reprintLogs.map((l) => ({ ...l, orderNo: l.order_no, kind: l.kind, createdAt: dt(l.created_at) })),
     dayEnds: dayEnds.map((d) => ({ date: d.end_date instanceof Date ? d.end_date.toISOString().slice(0, 10) : String(d.end_date).slice(0, 10), expectedCash: Number(d.expected_cash || 0), countedCash: Number(d.counted_cash || 0), difference: Number(d.difference || 0), closedAt: dt(d.created_at) })),
+    orderTransfers: orderTransfers.map((t) => ({ ...t, orderNo: t.order_no, fromTableNo: t.from_table_no, toTableNo: t.to_table_no, mergedOrderNos: parseJSON(t.merged_order_nos) || [], amount: Number(t.amount || 0), createdByName: t.created_by_name, createdAt: dt(t.created_at) })),
     settings,
   };
 }

@@ -73,14 +73,17 @@ router.post('/', async (req, res) => {
   const held = !!p.hold;
   const id = await insert(
     `INSERT INTO orders
-      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, status, hold_label, held_at, created_by, shift_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, status, hold_label, held_at, created_by, shift_id, member_id, sales_person_id, discount_type)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       orgId, storeId, orderNo(), p.type, p.tableId ? Number(p.tableId) : null,
       p.customerName ?? null, p.phone ?? null, stringifyJSON(items),
       subtotal, discount, serviceCharge, tax, total, held ? 'hold' : 'open',
       held ? (p.holdLabel || `Hold ${Date.now()}`) : null, held ? new Date() : null,
       req.user.id, openShift?.id ?? null,
+      p.memberId ? Number(p.memberId) : null,
+      p.salesPersonId ? Number(p.salesPersonId) : (held ? null : req.user.id),
+      p.discountType ?? null,
     ]
   );
   if (!held && p.type === 'dine_in' && p.tableId) {
@@ -96,7 +99,9 @@ router.get('/', async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const params = [orgId, storeId];
   let sql = 'SELECT * FROM orders WHERE org_id=? AND store_id=?';
-  if (req.query.status) { sql += ' AND status=?'; params.push(req.query.status); }
+  if (req.query.status === 'running') {
+    sql += " AND status IN ('open','hold','kitchen','preparing','ready','served')";
+  } else if (req.query.status) { sql += ' AND status=?'; params.push(req.query.status); }
   if (req.query.type) { sql += ' AND type=?'; params.push(req.query.type); }
   sql += ' ORDER BY created_at DESC';
   const list = await query(sql, params);
@@ -108,6 +113,91 @@ router.get('/holds', async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const list = await query('SELECT * FROM orders WHERE org_id=? AND store_id=? AND status=? ORDER BY created_at DESC', [orgId, storeId, 'hold']);
   res.json(list.map(toOrder));
+});
+
+// 转台 / 并台 / 销售员 —— 字面量路由必须定义在 /:id 之前，否则会被 /:id 吃掉
+const RUNNING_STATUS = ['open', 'hold', 'kitchen', 'preparing', 'ready', 'served'];
+
+const transferRow = (r) => ({
+  _id: r.id, id: r.id, type: r.type, orderId: r.order_id, orderNo: r.order_no,
+  fromTableId: r.from_table_id, fromTableNo: r.from_table_no,
+  toTableId: r.to_table_id, toTableNo: r.to_table_no,
+  mergedOrderIds: parseJSON(r.merged_order_ids) || [], mergedOrderNos: parseJSON(r.merged_order_nos) || [],
+  amount: Number(r.amount || 0), reason: r.reason,
+  createdBy: r.created_by, createdByName: r.created_by_name, createdAt: dt(r.created_at),
+});
+
+router.get('/transfers', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const params = [orgId, storeId];
+  let sql = 'SELECT * FROM order_transfers WHERE org_id=? AND store_id=?';
+  if (req.query.type) { sql += ' AND type=?'; params.push(req.query.type); }
+  sql += ' ORDER BY id DESC LIMIT 300';
+  res.json((await query(sql, params)).map(transferRow));
+});
+
+router.get('/sales-persons', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT id,name,role,phone FROM users WHERE org_id=? AND store_id=? AND is_active=1 ORDER BY id', [orgId, storeId]);
+  res.json(rows.map((u) => ({ id: u.id, name: u.name, role: u.role, code: u.phone })));
+});
+
+// 并台：把多张进行中的单合并到主单，其余标记 merged 并释放桌位
+router.post('/merge', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const ids = (req.body.orderIds || []).map(Number).filter((n) => Number.isFinite(n));
+  if (ids.length < 2) return res.status(400).json({ error: 'need at least 2 orders' });
+  const list = await query(`SELECT * FROM orders WHERE org_id=? AND store_id=? AND id IN (${ids.map(() => '?').join(',')})`, [orgId, storeId, ...ids]);
+  if (list.length !== ids.length) return res.status(404).json({ error: 'some orders not found' });
+  for (const o of list) if (!RUNNING_STATUS.includes(o.status)) return res.status(400).json({ error: `order ${o.order_no} is not mergeable` });
+
+  const primary = (req.body.targetOrderId && list.find((o) => String(o.id) === String(req.body.targetOrderId))) || list[0];
+  const others = list.filter((o) => o.id !== primary.id);
+  if (!others.length) return res.status(400).json({ error: 'nothing to merge' });
+
+  const settings = await loadSettings(orgId, storeId);
+  const items = [...parseJSON(primary.items), ...others.flatMap((o) => parseJSON(o.items))];
+  const discount = round2(Number(primary.discount || 0) + others.reduce((s, o) => s + Number(o.discount || 0), 0));
+  const totals = computeGst(items, discount, settings);
+
+  const targetId = req.body.tableId != null ? Number(req.body.tableId) : (primary.table_id ? Number(primary.table_id) : null);
+  const targetTable = targetId ? await getRow('SELECT * FROM tables WHERE id=? AND org_id=? AND store_id=?', [targetId, orgId, storeId]) : null;
+
+  await query(
+    'UPDATE orders SET items=?, discount=?, subtotal=?, service_charge=?, tax=?, total=?, table_id=?, type=?, updated_at=NOW() WHERE id=?',
+    [stringifyJSON(items), discount, totals.subtotal, totals.serviceCharge, totals.tax, totals.total, targetTable ? targetTable.id : primary.table_id, targetTable ? 'dine_in' : primary.type, primary.id]
+  );
+  if (targetTable) await query('UPDATE tables SET status=?, current_order_id=? WHERE id=?', ['occupied', primary.id, targetTable.id]);
+
+  for (const o of others) {
+    if (o.table_id && (!targetTable || Number(o.table_id) !== Number(targetTable.id))) {
+      await query('UPDATE tables SET status=?, current_order_id=NULL WHERE id=? AND org_id=? AND store_id=?', ['free', o.table_id, orgId, storeId]);
+    }
+    await query('UPDATE orders SET status=?, merged_into_order_id=?, updated_at=NOW() WHERE id=?', ['merged', primary.id, o.id]);
+    emitToStore(orgId, storeId, 'order:closed', String(o.id));
+  }
+
+  const firstFrom = others[0].table_id ? await getRow('SELECT * FROM tables WHERE id=?', [others[0].table_id]) : null;
+  const id = await insert(
+    `INSERT INTO order_transfers
+      (org_id, store_id, type, order_id, order_no, from_table_id, from_table_no, to_table_id, to_table_no, merged_order_ids, merged_order_nos, amount, reason, created_by, created_by_name)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      orgId, storeId, 'merge', primary.id, primary.order_no,
+      firstFrom ? firstFrom.id : null, firstFrom ? firstFrom.number : null,
+      targetTable ? targetTable.id : null, targetTable ? targetTable.number : null,
+      stringifyJSON(others.map((o) => o.id)), stringifyJSON(others.map((o) => o.order_no)),
+      round2(others.reduce((s, o) => s + Number(o.total || 0), 0)), req.body.reason || '',
+      req.user.id, req.user.name || null,
+    ]
+  );
+  emitToStore(orgId, storeId, 'order:created', toOrder(await getRow('SELECT * FROM orders WHERE id=?', [primary.id])));
+  const mergedRows = await query(`SELECT * FROM orders WHERE id IN (${others.map(() => '?').join(',')})`, others.map((o) => o.id));
+  res.json({
+    order: toOrder(await getRow('SELECT * FROM orders WHERE id=?', [primary.id])),
+    merged: mergedRows.map(toOrder),
+    merge: transferRow(await getRow('SELECT * FROM order_transfers WHERE id=?', [id])),
+  });
 });
 
 router.get('/:id', async (req, res) => {
@@ -291,6 +381,49 @@ router.post('/:id/recall', async (req, res) => {
   if (row.status !== 'hold') return res.status(400).json({ error: 'order is not on hold' });
   await query('UPDATE orders SET status=?, held_at=NULL WHERE id=?', ['open', row.id]);
   if (row.type === 'dine_in' && row.table_id) await query('UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?', ['occupied', row.id, row.table_id, orgId, storeId]);
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
+});
+
+// ---- 转台 / 销售员指派 ----
+router.post('/:id/transfer', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const o = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!o) return res.status(404).json({ error: 'not found' });
+  if (!RUNNING_STATUS.includes(o.status)) return res.status(400).json({ error: 'only running orders can be transferred' });
+  const targetId = Number(req.body.tableId);
+  if (!Number.isFinite(targetId)) return res.status(400).json({ error: 'tableId required' });
+  const target = await getRow('SELECT * FROM tables WHERE id=? AND org_id=? AND store_id=?', [targetId, orgId, storeId]);
+  if (!target) return res.status(404).json({ error: 'target table not found' });
+  if (Number(o.table_id) === targetId) return res.status(400).json({ error: 'already on this table' });
+  if (target.status === 'occupied' && String(target.current_order_id) !== String(o.id)) return res.status(400).json({ error: 'target table is occupied' });
+
+  const from = o.table_id ? await getRow('SELECT * FROM tables WHERE id=?', [o.table_id]) : null;
+  if (from) await query('UPDATE tables SET status=?, current_order_id=NULL WHERE id=?', ['free', from.id]);
+  await query('UPDATE tables SET status=?, current_order_id=? WHERE id=?', ['occupied', o.id, target.id]);
+  await query('UPDATE orders SET table_id=?, type=?, updated_at=NOW() WHERE id=?', [target.id, 'dine_in', o.id]);
+
+  const id = await insert(
+    `INSERT INTO order_transfers
+      (org_id, store_id, type, order_id, order_no, from_table_id, from_table_no, to_table_id, to_table_no, merged_order_ids, merged_order_nos, amount, reason, created_by, created_by_name)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      orgId, storeId, 'transfer', o.id, o.order_no,
+      from ? from.id : null, from ? from.number : null, target.id, target.number,
+      stringifyJSON([]), stringifyJSON([]), Number(o.total || 0), req.body.reason || '',
+      req.user.id, req.user.name || null,
+    ]
+  );
+  const updated = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [o.id]));
+  emitToStore(orgId, storeId, 'order:created', updated);
+  res.json({ order: updated, transfer: transferRow(await getRow('SELECT * FROM order_transfers WHERE id=?', [id])) });
+});
+
+router.put('/:id/sales-person', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  const sp = req.body.salesPersonId ? Number(req.body.salesPersonId) : null;
+  await query('UPDATE orders SET sales_person_id=?, updated_at=NOW() WHERE id=?', [sp, row.id]);
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 

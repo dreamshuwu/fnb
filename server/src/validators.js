@@ -78,8 +78,11 @@ export const createOrderSchema = z.object({
   customerName: z.string().optional(),
   phone: z.string().optional(),
   discount: z.number().min(0).optional(),
+  discountType: z.string().optional(),
   hold: z.boolean().optional(),
   holdLabel: z.string().optional(),
+  memberId: z.string().optional(),
+  salesPersonId: z.string().optional(),
   items: z.array(orderItemSchema).min(1),
 });
 

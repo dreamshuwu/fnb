@@ -4,7 +4,7 @@ import { api } from '../api/client.js';
 
 const CATEGORY_COLORS = ['#d7e48e', '#f4bd63', '#f3e95d', '#ef9cca', '#9ed6e9', '#52d065', '#60a4eb', '#e79bd1', '#a99ece'];
 const PAGE_SIZE = 12;
-const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null });
+const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null, salesPersonId: '' });
 
 export default function CashierPage() {
   const [tree, setTree] = useState({ categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [] });
@@ -29,6 +29,10 @@ export default function CashierPage() {
   const [promoCode, setPromoCode] = useState('');
   const [holdList, setHoldList] = useState([]);
   const [showRecall, setShowRecall] = useState(false);
+  const [transferOrder, setTransferOrder] = useState(null);
+  const [showMerge, setShowMerge] = useState(false);
+  const [salesPersons, setSalesPersons] = useState([]);
+  const [transferLog, setTransferLog] = useState([]);
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
@@ -44,18 +48,23 @@ export default function CashierPage() {
   const loadTables = async () => { const r = await api.get('/tables'); setTables(r.data); };
   const loadActive = async () => { const r = await api.get('/orders?status=kitchen'); setActive(r.data); };
   const loadVoids = async () => { const r = await api.get('/orders?status=void_pending'); setVoidQueue(r.data); };
+  const loadSalesPersons = async () => { const r = await api.get('/sales-persons'); setSalesPersons(r.data); };
+  const loadTransfers = async () => { const r = await api.get('/transfers'); setTransferLog(r.data.slice(0, 8)); };
 
   useEffect(() => {
     loadTree();
     loadTables();
     loadActive();
     loadVoids();
+    loadSalesPersons();
+    loadTransfers();
     const socketUrl = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || undefined;
     const socket = io(socketUrl, { auth: { token: localStorage.getItem('token') } });
     const receiveOrder = (order) => setActive((prev) => [order, ...prev.filter((o) => o._id !== order._id)]);
     socket.on('order:created', receiveOrder);
     socket.on('kds:ticket', receiveOrder);
     socket.on('order:closed', (id) => setActive((prev) => prev.filter((o) => o._id !== id)));
+    socket.on('tables:changed', () => { loadTables(); loadTransfers(); });
     return () => socket.disconnect();
   }, []);
 
@@ -114,9 +123,10 @@ export default function CashierPage() {
     let orderId = activePage.orderId;
     if (orderId) {
       await api.put(`/orders/${orderId}/items`, { items: cart, discount });
+      if (activePage.salesPersonId) await api.put(`/orders/${orderId}/sales-person`, { salesPersonId: activePage.salesPersonId });
       await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
     } else {
-      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount });
+      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, salesPersonId: activePage.salesPersonId || undefined });
       orderId = r.data._id;
       await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
     }
@@ -207,6 +217,34 @@ export default function CashierPage() {
     setRefundOrder(r.data[0] || null);
   };
 
+  // ---- 转台 / 并台 / 销售员 ----
+  const doTransfer = async (tableId) => {
+    if (!transferOrder) return;
+    try {
+      const r = await api.post(`/orders/${transferOrder._id}/transfer`, { tableId, reason: 'cashier transfer' });
+      setTransferOrder(null);
+      const t = tables.find((x) => String(x.id) === String(tableId));
+      alert(`已转到桌位 ${t ? t.number : tableId}`);
+      loadActive(); loadTables(); loadTransfers();
+      return r.data;
+    } catch (e) { alert(e.response?.data?.error || '转台失败'); }
+  };
+  const doMerge = async (orderIds) => {
+    try {
+      const r = await api.post('/orders/merge', { orderIds, targetOrderId: orderIds[0], reason: 'cashier merge' });
+      setShowMerge(false);
+      alert(`已合并 ${orderIds.length} 张单 → ${r.data.order.orderNo}\n合计 ¥${Number(r.data.order.total).toFixed(2)}`);
+      loadActive(); loadTables(); loadTransfers();
+    } catch (e) { alert(e.response?.data?.error || '并台失败'); }
+  };
+  const setSalesPerson = async (id) => {
+    setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, salesPersonId: id } : p));
+    if (activePage.orderId) {
+      try { await api.put(`/orders/${activePage.orderId}/sales-person`, { salesPersonId: id || null }); } catch { /* 静默失败,下次 Send 会带上 */ }
+    }
+  };
+  const tableLabel = (id) => { const t = tables.find((x) => String(x.id) === String(id)); return t ? t.number : (id ? `#${id}` : '—'); };
+
   return (
     <div className="cashier-screen">
       <div className="cashier-top">
@@ -255,7 +293,14 @@ export default function CashierPage() {
             {!cart.length && <div className="text-center text-indigo-800 p-5 text-xs">{activePage.status === 'sent' ? '已发送到厨房' : '请选择菜单项目'}</div>}
           </div>
           <div className="cashier-promo"><input placeholder="Promo code" value={promoCode} onChange={(e) => setPromoCode(e.target.value)} /><button onClick={applyPromo}>Apply</button></div>
-          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
+          <div className="cashier-salesperson">
+            <span>Sales Person</span>
+            <select value={activePage.salesPersonId || ''} onChange={(e) => setSalesPerson(e.target.value)}>
+              <option value="">—</option>
+              {salesPersons.map((u) => <option key={u.id} value={u.id}>{u.name} ({u.role})</option>)}
+            </select>
+          </div>
+          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}{tableId && <span> · Table {tableLabel(tableId)}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
           <div className="cashier-keypad">{['Enter', '7', '8', '9', 'Back', '4', '5', '6', 'Up', '1', '2', '3', 'Down', '0', '.', 'Clear'].map((n) => <button key={n}>{n}</button>)}</div>
         </div>
       </div>
@@ -274,6 +319,8 @@ export default function CashierPage() {
         <button onClick={() => { const n = prompt('Open item 名称'); const p = prompt('金额'); if (n && p) updateActiveCart((prev) => [...prev, { variantId: `open-${Date.now()}`, code: 'OPEN', name: n, unitPrice: Number(p), qty: 1 }]); }}>Open Item</button>
         <button onClick={() => active.length ? openPayment(active[0]) : alert('请先 Send 一个订单')}>Payment</button>
         <button onClick={() => active.length ? setSplitOrder(active[0]) : alert('请先 Send 一个订单')}>Split</button>
+        <button onClick={() => active.length ? setTransferOrder(active[0]) : alert('请先 Send 一个订单')}>Transfer</button>
+        <button onClick={() => active.length ? setShowMerge(true) : alert('没有可合并的订单')}>Merge</button>
         <button onClick={() => active.length ? printOrder(active[0]) : alert('请先 Send 一个订单')}>PBill</button>
         <button onClick={openDrawer}>Drawer</button>
         <button onClick={() => history.back()}>Exit</button>
@@ -283,14 +330,31 @@ export default function CashierPage() {
         <h3>收银端待处理订单 / Kitchen 已收到</h3>
         <div className="cashier-open-orders">
           {active.map((o) => <div key={o._id} className="cashier-open-card"><b>{o.orderNo}</b> · ¥{o.total}<br />{o.items.reduce((s, i) => s + i.qty, 0)} items
+            <small className="cashier-open-meta">Table {tableLabel(o.tableId)}{o.salesPersonId ? ` · ${(salesPersons.find((u) => String(u.id) === String(o.salesPersonId)) || {}).name || ''}` : ''}</small>
             <button onClick={() => openPayment(o)}>Payment</button>
             <button onClick={() => setSplitOrder(o)}>Split</button>
+            <button onClick={() => setTransferOrder(o)}>Transfer</button>
             <button onClick={() => printOrder(o)}>Print</button>
             <button onClick={() => requestVoid(o)}>Void</button>
           </div>)}
           {!active.length && <span className="text-slate-500 text-xs">Send 后订单会立即显示在这里</span>}
         </div>
       </div>
+
+      {transferLog.length > 0 && (
+        <div className="cashier-transfer-log">
+          <h3>转台 / 并台记录 Table Transfer &amp; Merge</h3>
+          <div className="transfer-log-list">
+            {transferLog.map((t) => <div key={t.id} className={`transfer-log-row ${t.type}`}>
+              <b>{t.type === 'merge' ? '并台' : '转台'}</b>
+              <span>{t.orderNo}</span>
+              <span>{t.type === 'merge' ? `${(t.mergedOrderNos || []).length} 张并入` : `${t.fromTableNo || '—'} → ${t.toTableNo || '—'}`}</span>
+              <span>¥{Number(t.amount || 0).toFixed(2)}</span>
+              <small>{t.createdByName || ''} · {new Date(t.createdAt).toLocaleTimeString('en-GB')}</small>
+            </div>)}
+          </div>
+        </div>
+      )}
 
       {voidQueue.length > 0 && (
         <div className="cashier-void-queue">
@@ -312,8 +376,59 @@ export default function CashierPage() {
       {splitOrder && <SplitBillModal order={splitOrder} onConfirm={doSplit} onClose={() => setSplitOrder(null)} />}
       {refundOrder && <RefundModal order={refundOrder} orders={refundList} onPick={setRefundOrder} onConfirm={doRefund} onClose={() => setRefundOrder(null)} />}
       {showRecall && <RecallModal holds={holdList} onPick={recallOrder} onClose={() => setShowRecall(false)} />}
+      {transferOrder && <TransferModal order={transferOrder} tables={tables} onConfirm={doTransfer} onClose={() => setTransferOrder(null)} />}
+      {showMerge && <MergeModal orders={active} tables={tables} onConfirm={doMerge} onClose={() => setShowMerge(false)} />}
     </div>
   );
+}
+
+function TransferModal({ order, tables, onConfirm, onClose }) {
+  const [pick, setPick] = useState('');
+  const free = tables.filter((t) => t.status === 'free');
+  const current = tables.find((t) => String(t.id) === String(order.tableId));
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 480 }}>
+    <header><span>Transfer Table · {order.orderNo}</span><button onClick={onClose}>×</button></header>
+    <div className="legacy-window-body">
+      <div className="payment-amount-box"><small>CURRENT TABLE</small><strong>{current ? current.number : '—'}</strong></div>
+      <p className="settlement-note">选择要转去的空闲桌位，原桌位会自动释放。</p>
+      <div className="transfer-grid">
+        {free.map((t) => <button key={t.id} className={pick === t.id ? 'active' : ''} onClick={() => setPick(t.id)}><b>{t.number}</b><small>{t.seats || 4} seats</small></button>)}
+      </div>
+      {!free.length && <div className="ops-empty">没有空闲桌位可转</div>}
+      <div className="legacy-window-actions">
+        <button className="legacy-btn green" disabled={!pick} onClick={() => onConfirm(pick)}>Move to Table</button>
+        <button className="legacy-btn pink" onClick={onClose}>Cancel</button>
+      </div>
+    </div>
+  </section></div>;
+}
+
+function MergeModal({ orders, tables, onConfirm, onClose }) {
+  const [picks, setPicks] = useState([]);
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const tableNo = (id) => (tables.find((t) => String(t.id) === String(id)) || {}).number || '—';
+  const toggle = (id) => setPicks((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
+  const sum = orders.filter((o) => picks.includes(o._id)).reduce((s, o) => s + Number(o.total), 0);
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 540 }}>
+    <header><span>Merge Tables / 并台</span><button onClick={onClose}>×</button></header>
+    <div className="legacy-window-body">
+      <p className="settlement-note">勾选要合并的订单。列表第一张作为主单，其余订单的菜品并入主单并释放其桌位。</p>
+      <div className="split-items">
+        {orders.map((o) => <label key={o._id} className={`merge-row ${picks.includes(o._id) ? 'active' : ''}`}>
+          <input type="checkbox" checked={picks.includes(o._id)} onChange={() => toggle(o._id)} />
+          <span><b>{o.orderNo}</b> · {o.items.reduce((s, i) => s + Number(i.qty), 0)} items · {money(o.total)}</span>
+          <small>Table {tableNo(o.tableId)}</small>
+        </label>)}
+        {!orders.length && <div className="ops-empty">没有可合并的进行中订单</div>}
+      </div>
+      <div className="payment-change">Selected <strong>{picks.length}</strong></div>
+      <div className="payment-change">Combined Total <strong>{money(sum)}</strong></div>
+      <div className="legacy-window-actions">
+        <button className="legacy-btn green" disabled={picks.length < 2} onClick={() => onConfirm(picks)}>Merge {picks.length} Orders</button>
+        <button className="legacy-btn pink" onClick={onClose}>Cancel</button>
+      </div>
+    </div>
+  </section></div>;
 }
 
 function RecallModal({ holds, onPick, onClose }) {

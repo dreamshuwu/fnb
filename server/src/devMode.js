@@ -18,6 +18,8 @@ const store = {
   reportTemplates: [], printJobs: [], printers: [], invoices: [],
   // 新增：挂单 / 反结算 / 重打
   unsettles: [], reprintLogs: [],
+  // 新增：转台 / 并台审计
+  orderTransfers: [],
   // 新增：日结
   dayEnds: [],
 };
@@ -194,6 +196,8 @@ const toOrder = (o) => ({
   holdLabel: o.holdLabel || null, heldAt: o.heldAt || null, reprintCount: Number(o.reprintCount || 0),
   unsettledAt: o.unsettledAt || null,
   createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: o.shiftId == null ? null : String(o.shiftId),
+  salesPersonId: o.salesPersonId == null ? null : String(o.salesPersonId),
+  mergedIntoOrderId: o.mergedIntoOrderId == null ? null : String(o.mergedIntoOrderId),
   voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: o.voidApprovedBy == null ? null : String(o.voidApprovedBy), voidReason: o.voidReason || null,
   createdAt: o.createdAt, updatedAt: o.updatedAt || o.createdAt,
 });
@@ -277,6 +281,9 @@ function computeOrderTotals(items, discount = 0) {
 
 const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
 const dayOf = (d) => String(d || '').slice(0, 10);
+
+// 进行中(可转台 / 可并台 / 可加菜)的订单状态
+const RUNNING_STATUS = ['open', 'hold', 'kitchen', 'preparing', 'ready', 'served'];
 
 // 贷项凭单：按行项目计算小计 / GST / 合计
 function computeCreditNote(lines, includeGst) {
@@ -457,6 +464,7 @@ function buildReportDataset() {
     purchaseOrders: store.purchaseOrders.map((p) => ({ ...p, total: Number(p.total || 0) })),
     attendance: store.attendance,
     reprintLogs: store.reprintLogs,
+    orderTransfers: store.orderTransfers,
     dayEnds: store.dayEnds.map((d) => ({ ...d, expectedCash: Number(d.expectedCash || 0), countedCash: Number(d.countedCash || 0), difference: Number(d.difference || 0) })),
     settings: getSettings(),
   };
@@ -624,13 +632,17 @@ export function createDevRouter(io) {
     const t = store.tables.find((x) => x.id === req.params.id);
     if (!t) return res.status(404).json({ error: 'not found' });
     t.status = req.body.status || t.status;
+    // 手动改状态时同步清掉占用关系，避免遗留 currentOrderId 指向已结单的订单
+    if (t.status !== 'occupied') t.currentOrderId = null;
+    io.to(`store:${t.storeId}`).emit('tables:changed', toTable(t));
     res.json(toTable(t));
   });
 
   // ---- 订单（item 引用 variantId） ----
   r.get('/orders', (req, res) => {
     let list = store.orders;
-    if (req.query.status) list = list.filter((o) => o.status === req.query.status);
+    if (req.query.status === 'running') list = list.filter((o) => RUNNING_STATUS.includes(o.status));
+    else if (req.query.status) list = list.filter((o) => o.status === req.query.status);
     res.json(list.map(toOrder));
   });
   r.get('/orders/:id', (req, res) => {
@@ -650,7 +662,8 @@ export function createDevRouter(io) {
       tax: totals.tax, total: totals.total, refundedAmount: 0, invoiceNo: null,
       holdLabel: held ? (b.holdLabel || `Hold ${store.orders.filter((x) => x.status === 'hold').length + 1}`) : null,
       heldAt: held ? now() : null, reprintCount: 0,
-      createdBy: req.user.id, shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
+      createdBy: req.user.id, salesPersonId: b.salesPersonId ? String(b.salesPersonId) : null,
+      shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
       createdAt: now(), updatedAt: now(),
     };
     store.orders.push(o);
@@ -695,6 +708,94 @@ export function createDevRouter(io) {
     else io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
     res.json(toOrder(o));
   });
+  // ---- 转台:把进行中的订单移到另一张桌 ----
+  r.post('/orders/:id/transfer', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (!RUNNING_STATUS.includes(o.status)) return res.status(400).json({ error: 'only running orders can be transferred' });
+    const targetId = req.body.tableId == null ? null : String(req.body.tableId);
+    const target = store.tables.find((t) => t.id === targetId);
+    if (!target) return res.status(404).json({ error: 'target table not found' });
+    if (String(o.tableId) === targetId) return res.status(400).json({ error: 'already on this table' });
+    if (target.status === 'occupied' && String(target.currentOrderId) !== String(o.id)) return res.status(400).json({ error: 'target table is occupied' });
+
+    const from = store.tables.find((t) => t.id === String(o.tableId)) || null;
+    if (from) { from.status = 'free'; from.currentOrderId = null; }
+    target.status = 'occupied'; target.currentOrderId = o.id;
+    o.tableId = target.id; o.type = 'dine_in'; o.updatedAt = now();
+
+    const record = {
+      id: nid(), orgId: '1', storeId: '1', type: 'transfer', orderId: o.id, orderNo: o.orderNo,
+      fromTableId: from ? from.id : null, fromTableNo: from ? from.number : null,
+      toTableId: target.id, toTableNo: target.number,
+      mergedOrderIds: [], mergedOrderNos: [],
+      amount: Number(o.total || 0), reason: req.body.reason || '', createdBy: req.user.id, createdByName: req.user.name, createdAt: now(),
+    };
+    store.orderTransfers.unshift(record);
+    io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
+    io.to(`store:${o.storeId}`).emit('tables:changed');
+    res.json({ order: toOrder(o), transfer: record });
+  });
+
+  // ---- 并台:把多张进行中的单合并到第一张(或指定的主单) ----
+  r.post('/orders/merge', (req, res) => {
+    const ids = (req.body.orderIds || []).map(String);
+    if (ids.length < 2) return res.status(400).json({ error: 'need at least 2 orders' });
+    const list = ids.map((id) => store.orders.find((x) => x.id === id)).filter(Boolean);
+    if (list.length !== ids.length) return res.status(404).json({ error: 'some orders not found' });
+    for (const o of list) {
+      if (!RUNNING_STATUS.includes(o.status)) return res.status(400).json({ error: `order ${o.orderNo} is not mergeable` });
+    }
+    const primary = (req.body.targetOrderId && list.find((x) => x.id === String(req.body.targetOrderId))) || list[0];
+    const others = list.filter((o) => o.id !== primary.id);
+    if (!others.length) return res.status(400).json({ error: 'nothing to merge' });
+
+    primary.items = [...primary.items, ...others.flatMap((o) => o.items)];
+    primary.discount = round2(Number(primary.discount || 0) + others.reduce((s, o) => s + Number(o.discount || 0), 0));
+    Object.assign(primary, computeOrderTotals(primary.items, primary.discount));
+    primary.updatedAt = now();
+
+    const targetId = req.body.tableId != null ? String(req.body.tableId) : (primary.tableId ? String(primary.tableId) : null);
+    const targetTable = targetId ? store.tables.find((t) => t.id === targetId) : null;
+    if (targetTable) { targetTable.status = 'occupied'; targetTable.currentOrderId = primary.id; primary.tableId = targetTable.id; }
+
+    for (const o of others) {
+      const t = o.tableId ? store.tables.find((x) => x.id === String(o.tableId)) : null;
+      if (t && (!targetTable || t.id !== targetTable.id)) { t.status = 'free'; t.currentOrderId = null; }
+      o.status = 'merged'; o.mergedIntoOrderId = primary.id; o.updatedAt = now();
+      io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
+    }
+
+    const firstFrom = store.tables.find((t) => t.id === String(others[0].tableId)) || null;
+    const record = {
+      id: nid(), orgId: '1', storeId: '1', type: 'merge', orderId: primary.id, orderNo: primary.orderNo,
+      fromTableId: firstFrom ? firstFrom.id : null, fromTableNo: firstFrom ? firstFrom.number : null,
+      toTableId: targetTable ? targetTable.id : null, toTableNo: targetTable ? targetTable.number : null,
+      mergedOrderIds: others.map((o) => o.id), mergedOrderNos: others.map((o) => o.orderNo),
+      amount: round2(others.reduce((s, o) => s + Number(o.total || 0), 0)),
+      reason: req.body.reason || '', createdBy: req.user.id, createdByName: req.user.name, createdAt: now(),
+    };
+    store.orderTransfers.unshift(record);
+    io.to(`store:${primary.storeId}`).emit('order:created', toOrder(primary));
+    io.to(`store:${primary.storeId}`).emit('tables:changed');
+    res.json({ order: toOrder(primary), merged: others.map(toOrder), merge: record });
+  });
+
+  r.get('/transfers', (req, res) => {
+    const type = req.query.type;
+    res.json(type ? store.orderTransfers.filter((t) => t.type === type) : store.orderTransfers);
+  });
+
+  // ---- 销售员 ----
+  r.get('/sales-persons', (req, res) => res.json(store.users.filter((u) => u.isActive).map((u) => ({ id: u.id, name: u.name, role: u.role, code: u.phone }))));
+  r.put('/orders/:id/sales-person', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    o.salesPersonId = req.body.salesPersonId ? String(req.body.salesPersonId) : null;
+    o.updatedAt = now();
+    res.json(toOrder(o));
+  });
+
   r.post('/orders/:id/checkout', (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
