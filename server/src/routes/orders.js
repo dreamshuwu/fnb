@@ -13,6 +13,20 @@ function computeTotals(items, taxRate = 0) {
   return { subtotal, tax, total: subtotal + tax };
 }
 
+// 付款行归集：多收的部分视为找零，只记录实际入账金额，避免日报表虚高
+function normalizePayments(rows, total) {
+  const list = (rows || []).map((r) => ({ ...r, amount: Number(r.amount || 0) }));
+  const sum = list.reduce((s, r) => s + r.amount, 0);
+  if (sum <= total + 0.001) return list;
+  let excess = Math.round((sum - total) * 100) / 100;
+  for (let i = list.length - 1; i >= 0 && excess > 0.001; i--) {
+    const cut = Math.min(list[i].amount, excess);
+    list[i].amount = Math.round((list[i].amount - cut) * 100) / 100;
+    excess = Math.round((excess - cut) * 100) / 100;
+  }
+  return list.filter((r) => r.amount > 0);
+}
+
 async function loadSettings(orgId, storeId) {
   const rows = await query('SELECT setting_key,setting_value FROM app_settings WHERE org_id=? AND store_id=?', [orgId, storeId]);
   const s = {};
@@ -56,17 +70,20 @@ router.post('/', async (req, res) => {
   const items = p.items.map((i) => ({ ...i, status: 'pending' }));
   const { subtotal, discount, serviceCharge, tax, total } = computeGst(items, p.discount, settings);
   const openShift = await getRow('SELECT id FROM shifts WHERE org_id=? AND store_id=? AND cashier_id=? AND status=? ORDER BY id DESC LIMIT 1', [orgId, storeId, req.user.id, 'open']);
+  const held = !!p.hold;
   const id = await insert(
     `INSERT INTO orders
-      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, created_by, shift_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, status, hold_label, held_at, created_by, shift_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       orgId, storeId, orderNo(), p.type, p.tableId ? Number(p.tableId) : null,
       p.customerName ?? null, p.phone ?? null, stringifyJSON(items),
-      subtotal, discount, serviceCharge, tax, total, req.user.id, openShift?.id ?? null,
+      subtotal, discount, serviceCharge, tax, total, held ? 'hold' : 'open',
+      held ? (p.holdLabel || `Hold ${Date.now()}`) : null, held ? new Date() : null,
+      req.user.id, openShift?.id ?? null,
     ]
   );
-  if (p.type === 'dine_in' && p.tableId) {
+  if (!held && p.type === 'dine_in' && p.tableId) {
     await query(
       'UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?',
       ['occupied', id, Number(p.tableId), orgId, storeId]
@@ -83,6 +100,13 @@ router.get('/', async (req, res) => {
   if (req.query.type) { sql += ' AND type=?'; params.push(req.query.type); }
   sql += ' ORDER BY created_at DESC';
   const list = await query(sql, params);
+  res.json(list.map(toOrder));
+});
+
+// 挂单列表必须定义在 /:id 之前，否则会被 /:id 吃掉
+router.get('/holds', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const list = await query('SELECT * FROM orders WHERE org_id=? AND store_id=? AND status=? ORDER BY created_at DESC', [orgId, storeId, 'hold']);
   res.json(list.map(toOrder));
 });
 
@@ -107,6 +131,20 @@ router.post('/:id/items', async (req, res) => {
     'UPDATE orders SET items=?, subtotal=?, discount=?, service_charge=?, tax=?, total=? WHERE id=?',
     [stringifyJSON(items), totals.subtotal, totals.discount, totals.serviceCharge, totals.tax, totals.total, row.id]
   );
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
+});
+
+// 整单替换明细（取单后编辑再送厨房用）
+router.put('/:id/items', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (!['open', 'hold'].includes(row.status)) return res.status(400).json({ error: 'order not editable' });
+  const items = (req.body.items || []).map((i) => ({ ...i, status: 'pending' }));
+  if (!items.length) return res.status(400).json({ error: 'items required' });
+  const settings = await loadSettings(orgId, storeId);
+  const totals = computeGst(items, req.body.discount ?? row.discount, settings);
+  await query('UPDATE orders SET items=?, subtotal=?, discount=?, service_charge=?, tax=?, total=? WHERE id=?', [stringifyJSON(items), totals.subtotal, totals.discount, totals.serviceCharge, totals.tax, totals.total, row.id]);
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
@@ -157,7 +195,7 @@ router.post('/:id/checkout', async (req, res) => {
   if (['paid', 'void', 'refunded', 'split'].includes(row.status)) return res.status(400).json({ error: 'already closed' });
   const paidSum = p.payments.reduce((s, x) => s + x.amount, 0);
   if (paidSum + (p.tip || 0) < Number(row.total || 0)) return res.status(400).json({ error: 'amount not covered' });
-  for (const pm of p.payments) {
+  for (const pm of normalizePayments(p.payments, Number(row.total || 0))) {
     await insert(
       `INSERT INTO payments (org_id, store_id, order_id, method, amount, tip, created_by)
        VALUES (?,?,?,?,?,?,?)`,
@@ -231,6 +269,100 @@ router.post('/:id/void/reject', rbac('admin', 'manager'), async (req, res) => {
   const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
   emitToStore(req.app.get('io'), storeId, 'order:created', order);
   res.json(order);
+});
+
+// ---- 挂单 / 取单 ----
+router.post('/:id/hold', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (!['open', 'hold'].includes(row.status)) return res.status(400).json({ error: 'only open orders can be held' });
+  await query('UPDATE orders SET status=?, hold_label=COALESCE(?,hold_label), held_at=NOW() WHERE id=?', ['hold', req.body?.label || null, row.id]);
+  if (row.table_id) await query('UPDATE tables SET status=?, current_order_id=NULL WHERE id=? AND org_id=? AND store_id=?', ['free', row.table_id, orgId, storeId]);
+  const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  emitToStore(req.app.get('io'), storeId, 'order:closed', String(row.id));
+  res.json(order);
+});
+
+router.post('/:id/recall', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.status !== 'hold') return res.status(400).json({ error: 'order is not on hold' });
+  await query('UPDATE orders SET status=?, held_at=NULL WHERE id=?', ['open', row.id]);
+  if (row.type === 'dine_in' && row.table_id) await query('UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?', ['occupied', row.id, row.table_id, orgId, storeId]);
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
+});
+
+// ---- 反结算 ----
+router.get('/unsettles/list', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT * FROM unsettles WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId]);
+  res.json(rows.map((r) => ({ _id: r.id, id: r.id, orderId: r.order_id, orderNo: r.order_no, invoiceNo: r.invoice_no, amount: Number(r.amount || 0), payments: parseJSON(r.payments), reason: r.reason, createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at })));
+});
+
+router.post('/:id/unsettle', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (!['paid', 'refunded'].includes(row.status)) return res.status(400).json({ error: 'only settled orders can be unsettled' });
+  for (const it of parseJSON(row.items)) {
+    await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=? AND org_id=? AND store_id=?', [Number(it.qty), Number(it.variantId || it.itemId), orgId, storeId]);
+  }
+  const payments = await query('SELECT method,amount FROM payments WHERE order_id=?', [row.id]);
+  await query('DELETE FROM payments WHERE order_id=?', [row.id]);
+  await query('DELETE FROM invoices WHERE order_id=?', [row.id]);
+  await insert('INSERT INTO unsettles (org_id,store_id,order_id,order_no,invoice_no,amount,payments,reason,created_by) VALUES (?,?,?,?,?,?,?,?,?)', [orgId, storeId, row.id, row.order_no, row.invoice_no, Number(row.total || 0), stringifyJSON(payments), req.body?.reason || 'unsettle', req.user.id]);
+  await query('UPDATE orders SET status=?, invoice_no=NULL, refunded_amount=0, unsettled_at=NOW() WHERE id=?', ['open', row.id]);
+  if (row.table_id) await query('UPDATE tables SET status=?, current_order_id=? WHERE id=? AND org_id=? AND store_id=?', ['occupied', row.id, row.table_id, orgId, storeId]);
+  const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  emitToStore(req.app.get('io'), storeId, 'order:created', order);
+  res.json({ order });
+});
+
+// ---- 单据内容（重打用） ----
+function buildDocument(order, settings, tableNo, cashierName, payments, kind) {
+  const isKitchen = kind === 'kitchen' || kind === 'bar';
+  const titles = { bill: 'Bill / Tax Invoice', receipt: 'Receipt', order: 'Order Slip', kitchen: 'Kitchen Order', bar: 'Bar Order' };
+  return {
+    kind, title: titles[kind] || 'Bill',
+    header: isKitchen ? { name: settings.companyName || 'Store' } : { name: settings.companyName || 'Store', address: settings.address || '', phone: settings.phone || '', gstNo: settings.gstNo || '' },
+    orderNo: order.orderNo, invoiceNo: order.invoiceNo || null, date: order.createdAt, status: order.status,
+    table: tableNo, cashier: cashierName, customerName: order.customerName || null,
+    items: isKitchen ? order.items.map((i) => ({ qty: i.qty, code: i.code, name: i.name })) : order.items,
+    subtotal: order.subtotal, discount: order.discount, serviceCharge: order.serviceCharge, tax: order.tax,
+    taxRate: settings.taxRate || 0, taxInclusive: !!settings.taxInclusive, total: order.total,
+    refundedAmount: order.refundedAmount || 0,
+    payments: isKitchen ? [] : payments.map((p) => ({ method: p.method, amount: Number(p.amount) })),
+    footer: isKitchen ? '' : (settings.receiptFooter || ''), reprintCount: order.reprintCount || 0,
+  };
+}
+
+router.get('/:id/document', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  const settings = await loadSettings(orgId, storeId);
+  const order = toOrder(row);
+  const table = row.table_id ? await getRow('SELECT number FROM tables WHERE id=?', [row.table_id]) : null;
+  const cashier = row.created_by ? await getRow('SELECT name FROM users WHERE id=?', [row.created_by]) : null;
+  const payments = await query('SELECT method,amount FROM payments WHERE order_id=?', [row.id]);
+  res.json(buildDocument(order, settings, table?.number || null, cashier?.name || null, payments, req.query.kind || 'bill'));
+});
+
+router.post('/:id/reprint', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  const kind = req.body?.kind || 'bill';
+  await query('UPDATE orders SET reprint_count=reprint_count+1 WHERE id=?', [row.id]);
+  await insert('INSERT INTO reprint_logs (org_id,store_id,order_id,order_no,kind,created_by) VALUES (?,?,?,?,?,?)', [orgId, storeId, row.id, row.order_no, kind, req.user.id]);
+  const settings = await loadSettings(orgId, storeId);
+  const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  const table = row.table_id ? await getRow('SELECT number FROM tables WHERE id=?', [row.table_id]) : null;
+  const cashier = row.created_by ? await getRow('SELECT name FROM users WHERE id=?', [row.created_by]) : null;
+  const payments = await query('SELECT method,amount FROM payments WHERE order_id=?', [row.id]);
+  res.json({ document: buildDocument(order, settings, table?.number || null, cashier?.name || null, payments, kind) });
 });
 
 export default router;

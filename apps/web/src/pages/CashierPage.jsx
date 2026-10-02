@@ -27,6 +27,8 @@ export default function CashierPage() {
   const [refundList, setRefundList] = useState([]);
   const [voidQueue, setVoidQueue] = useState([]);
   const [promoCode, setPromoCode] = useState('');
+  const [holdList, setHoldList] = useState([]);
+  const [showRecall, setShowRecall] = useState(false);
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
@@ -105,17 +107,49 @@ export default function CashierPage() {
     if (id === activePageId) setActivePageId(rest[rest.length - 1].id);
   };
 
-  // Send 只发送当前页面；发送后保留已发送页面，并自动开一个新的空白点单页。
+  // Send 只发送当前页面；若该页来自取单(已有 orderId)，先同步明细再送厨房，避免重复开单。
   const sendCurrentPage = async () => {
     if (!cart.length) return;
-    if (mode === 'dine_in' && !tableId) { alert('请选择桌台'); return; }
-    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount });
-    await api.put(`/orders/${r.data._id}/status`, { status: 'kitchen' });
+    if (mode === 'dine_in' && !tableId && !activePage.orderId) { alert('请选择桌台'); return; }
+    let orderId = activePage.orderId;
+    if (orderId) {
+      await api.put(`/orders/${orderId}/items`, { items: cart, discount });
+      await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
+    } else {
+      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount });
+      orderId = r.data._id;
+      await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
+    }
     const nextId = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
-    setPages((prev) => [...prev.map((p) => p.id === activePageId ? { ...p, status: 'sent', orderId: r.data._id, label: `${p.label} · Sent` } : p), newPage(nextId)]);
+    setPages((prev) => [...prev.map((p) => p.id === activePageId ? { ...p, status: 'sent', orderId, label: `${p.label.replace(/ · (Held|Recall.*)$/, '')} · Sent` } : p), newPage(nextId)]);
     setActivePageId(nextId);
     setTableId('');
     loadActive();
+    loadTables();
+  };
+
+  // 挂单：把当前页存为 hold，不送厨房
+  const holdCurrentPage = async () => {
+    if (!cart.length) { alert('当前页面没有点单'); return; }
+    const label = `${tableId ? `T${tableId} ` : ''}${cart.reduce((s, c) => s + c.qty, 0)} items`;
+    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, hold: true, holdLabel: label });
+    const nextId = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
+    setPages((prev) => [...prev.map((p) => p.id === activePageId ? { ...p, status: 'held', orderId: r.data._id, label: `${p.label} · Held` } : p), newPage(nextId)]);
+    setActivePageId(nextId);
+    setTableId('');
+    loadTables();
+  };
+  const openRecall = async () => { const r = await api.get('/holds'); setHoldList(r.data); setShowRecall(true); };
+  const recallOrder = async (o) => {
+    await api.post(`/orders/${o._id}/recall`, {});
+    const id = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
+    setPages((prev) => [...prev, {
+      ...newPage(id), label: `Recall ${o.orderNo}`, orderId: o._id, discount: Number(o.discount || 0),
+      cart: o.items.map((i) => ({ variantId: i.variantId || i.itemId, code: i.code, name: i.name, unitPrice: Number(i.unitPrice), qty: Number(i.qty) })),
+    }]);
+    setActivePageId(id);
+    setShowRecall(false);
+    if (o.tableId) setTableId(String(o.tableId));
     loadTables();
   };
 
@@ -135,7 +169,7 @@ export default function CashierPage() {
   const completeSettlement = async () => {
     if (!settlement) return;
     const result = await api.post(`/orders/${settlement.order._id}/checkout`, { payments: settlement.rows, tip: 0 });
-    setReceipt({ ...result.data.receipt, payments: settlement.rows });
+    setReceipt(result.data.receipt);
     setSettlement(null);
     loadActive();
     loadTables();
@@ -232,6 +266,8 @@ export default function CashierPage() {
         <button onClick={() => printOrder(active[0] || { _id: '' }, 'receipt')}>Request</button>
         <button onClick={openRefundPicker}>Refund</button>
         <button onClick={sendCurrentPage}>Send</button>
+        <button onClick={holdCurrentPage}>Hold</button>
+        <button onClick={openRecall}>Recall</button>
         <button onClick={createPage}>Order</button>
         <button onClick={() => updateActiveCart(() => [])}>Delete All</button>
         <button onClick={applyDiscount}>Discount</button>
@@ -275,8 +311,25 @@ export default function CashierPage() {
       {receipt && <ReceiptModal receipt={receipt} onClose={() => setReceipt(null)} />}
       {splitOrder && <SplitBillModal order={splitOrder} onConfirm={doSplit} onClose={() => setSplitOrder(null)} />}
       {refundOrder && <RefundModal order={refundOrder} orders={refundList} onPick={setRefundOrder} onConfirm={doRefund} onClose={() => setRefundOrder(null)} />}
+      {showRecall && <RecallModal holds={holdList} onPick={recallOrder} onClose={() => setShowRecall(false)} />}
     </div>
   );
+}
+
+function RecallModal({ holds, onPick, onClose }) {
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 520 }}>
+    <header><span>Recall · 挂单取单 ({holds.length})</span><button onClick={onClose}>×</button></header>
+    <div className="legacy-window-body">
+      {!holds.length && <div className="ops-empty">没有挂单记录</div>}
+      <div className="recall-list">
+        {holds.map((o) => <div key={o._id} className="recall-row">
+          <div><b>{o.holdLabel || o.orderNo}</b><small>{o.orderNo} · {o.items.reduce((s, i) => s + Number(i.qty), 0)} items · ¥{Number(o.total).toFixed(2)}</small></div>
+          <button className="legacy-btn green" onClick={() => onPick(o)}>Recall</button>
+        </div>)}
+      </div>
+      <div className="legacy-window-actions"><button className="legacy-btn pink" onClick={onClose}>Close</button></div>
+    </div>
+  </section></div>;
 }
 
 function PaymentModal({ order, rows, setRows, onConfirm, onClose }) {

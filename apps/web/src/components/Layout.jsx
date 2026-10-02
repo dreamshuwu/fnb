@@ -9,6 +9,7 @@ const NAV = [
   { feature: 'payment', label: 'Payment', icon: '▱', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'credit-note', label: 'Credit Note', icon: '▰', roles: ['admin', 'manager'] },
   { feature: 'refund', label: 'Refund', icon: '↩', roles: ['admin', 'manager', 'cashier'] },
+  { feature: 'reprint', label: 'Reprint', icon: '⎙', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'void-approval', label: 'Void Approval', icon: '⊘', roles: ['admin', 'manager'] },
   { feature: 'received', label: 'Received', icon: '♨', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'drawer', label: 'Open Drawer', icon: '▣', roles: ['admin', 'manager', 'cashier'] },
@@ -22,7 +23,7 @@ const NAV = [
 
 const FEATURE_TABS = {
   'cash-in': 'finance', withdraw: 'finance', payment: 'finance', 'credit-note': 'finance', received: 'finance',
-  refund: 'refunds', 'void-approval': 'voids', 'close-shift': 'shifts', attendance: 'attendance', reports: 'reports',
+  refund: 'refunds', reprint: 'reprint', 'void-approval': 'voids', 'close-shift': 'shifts', attendance: 'attendance', reports: 'reports',
 };
 
 export default function Layout() {

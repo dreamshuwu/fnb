@@ -172,7 +172,7 @@ export async function initSchema() {
       table_id INT,
       customer_name VARCHAR(255),
       phone VARCHAR(64),
-      status ENUM('open','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open',
+      status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open',
       items TEXT,
       subtotal DECIMAL(12,2) DEFAULT 0,
       discount DECIMAL(12,2) DEFAULT 0,
@@ -183,6 +183,10 @@ export async function initSchema() {
       invoice_no VARCHAR(64),
       split_from_order_id INT,
       split_group_no INT,
+      hold_label VARCHAR(64),
+      held_at TIMESTAMP NULL,
+      reprint_count INT DEFAULT 0,
+      unsettled_at TIMESTAMP NULL,
       created_by INT,
       shift_id INT,
       void_requested_by INT,
@@ -350,6 +354,17 @@ export async function initSchema() {
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
       setting_key VARCHAR(64), setting_value TEXT, UNIQUE KEY uniq_setting (org_id, store_id, setting_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS unsettles (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      order_id INT, order_no VARCHAR(64), invoice_no VARCHAR(64), amount DECIMAL(12,2) DEFAULT 0,
+      payments TEXT, reason TEXT, created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (order_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS reprint_logs (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      order_id INT, order_no VARCHAR(64), kind VARCHAR(32) DEFAULT 'bill', created_by INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id), INDEX (order_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
   for (const s of stmts) await query(s);
 
@@ -360,7 +375,11 @@ export async function initSchema() {
     "ALTER TABLE orders ADD COLUMN invoice_no VARCHAR(64)",
     "ALTER TABLE orders ADD COLUMN split_from_order_id INT",
     "ALTER TABLE orders ADD COLUMN split_group_no INT",
-    "ALTER TABLE orders MODIFY COLUMN status ENUM('open','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open'",
+    "ALTER TABLE orders ADD COLUMN hold_label VARCHAR(64)",
+    "ALTER TABLE orders ADD COLUMN held_at TIMESTAMP NULL",
+    "ALTER TABLE orders ADD COLUMN reprint_count INT DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN unsettled_at TIMESTAMP NULL",
+    "ALTER TABLE orders MODIFY COLUMN status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open'",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -440,6 +459,8 @@ export const toOrder = (r) => ({
   refundedAmount: Number(r.refunded_amount || 0), invoiceNo: r.invoice_no || null,
   splitFromOrderId: r.split_from_order_id == null ? null : String(r.split_from_order_id),
   splitGroupNo: r.split_group_no == null ? null : r.split_group_no,
+  holdLabel: r.hold_label || null, heldAt: dt(r.held_at), reprintCount: Number(r.reprint_count || 0),
+  unsettledAt: dt(r.unsettled_at),
   createdBy: r.created_by == null ? null : String(r.created_by),
   shiftId: r.shift_id == null ? null : String(r.shift_id),
   voidRequestedBy: r.void_requested_by == null ? null : String(r.void_requested_by),

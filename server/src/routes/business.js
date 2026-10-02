@@ -86,4 +86,36 @@ router.post('/hardware/drawer', async (req, res) => { const { orgId, storeId } =
 // ---- GST 汇总 ----
 router.get('/reports/gst', async (req, res) => { const { orgId, storeId } = tenant(req); const paid = await query('SELECT total,tax FROM orders WHERE org_id=? AND store_id=? AND status IN ("paid","refunded")', [orgId, storeId]); const setRows = await query('SELECT setting_key,setting_value FROM app_settings WHERE org_id=? AND store_id=?', [orgId, storeId]); const s = {}; for (const r of setRows) { try { s[r.setting_key] = JSON.parse(r.setting_value); } catch { s[r.setting_key] = r.setting_value; } } const outputTax = paid.reduce((x, o) => x + Number(o.tax || 0), 0); res.json({ from: req.query.from || null, to: req.query.to || null, taxRate: s.taxRate, taxInclusive: s.taxInclusive, taxableSales: paid.reduce((x, o) => x + Number(o.total || 0), 0), outputTax: Math.round(outputTax * 100) / 100, netTax: Math.round(outputTax * 100) / 100 }); });
 
+// ---- 重打中心 ----
+router.get('/reports/reprint', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const type = req.query.type || 'bill';
+  const from = req.query.from ? `${req.query.from} 00:00:00` : null;
+  const to = req.query.to ? `${req.query.to} 23:59:59` : null;
+  let rows = [];
+  if (type === 'payout') {
+    rows = await query('SELECT id,voucher_no AS voucherNo,created_at AS date,pay_to AS payTo,amount,reason,method FROM cash_movements WHERE org_id=? AND store_id=? AND type IN ("payout","withdraw") AND (? IS NULL OR created_at>=?) AND (? IS NULL OR created_at<=?) ORDER BY id DESC', [orgId, storeId, from, from, to, to]);
+  } else if (type === 'closeshift') {
+    rows = await query('SELECT s.id,s.created_at AS date,u.name AS cashier,s.open_amount AS openAmount,s.expected_amount AS expectedAmount,s.close_amount AS closeAmount,s.difference_amount AS difference,s.status FROM shifts s LEFT JOIN users u ON u.id=s.cashier_id WHERE s.org_id=? AND s.store_id=? AND (? IS NULL OR s.created_at>=?) AND (? IS NULL OR s.created_at<=?) ORDER BY s.id DESC', [orgId, storeId, from, from, to, to]);
+  } else if (type === 'dayend') {
+    rows = await query('SELECT DATE(o.created_at) AS date, COUNT(*) AS orders, SUM(o.total) AS total FROM orders o WHERE o.org_id=? AND o.store_id=? AND o.status IN ("paid","refunded") AND (? IS NULL OR o.created_at>=?) AND (? IS NULL OR o.created_at<=?) GROUP BY DATE(o.created_at) ORDER BY date DESC', [orgId, storeId, from, from, to, to]);
+  } else {
+    const params = [orgId, storeId];
+    let sql = 'SELECT o.id,o.order_no AS orderNo,o.invoice_no AS invoiceNo,o.created_at AS date,o.status,t.number AS tableNo,u.name AS cashier,o.total,o.reprint_count AS reprintCount,o.items FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by WHERE o.org_id=? AND o.store_id=?';
+    if (type === 'bill' || type === 'receipt') sql += ' AND o.status IN ("paid","refunded")';
+    else if (type === 'order') sql += ' AND o.status NOT IN ("void","hold")';
+    if (from) { sql += ' AND o.created_at>=?'; params.push(from); }
+    if (to) { sql += ' AND o.created_at<=?'; params.push(to); }
+    if (req.query.table) { sql += ' AND o.table_id=?'; params.push(Number(req.query.table)); }
+    if (req.query.cashier) { sql += ' AND o.created_by=?'; params.push(Number(req.query.cashier)); }
+    if (req.query.orderNo) { sql += ' AND o.order_no LIKE ?'; params.push(`%${req.query.orderNo}%`); }
+    sql += ' ORDER BY o.created_at DESC LIMIT 300';
+    const list = await query(sql, params);
+    rows = list.map((r) => ({ id: r.id, orderNo: r.orderNo, invoiceNo: r.invoiceNo, date: r.date instanceof Date ? r.date.toISOString() : r.date, status: r.status, table: r.tableNo, cashier: r.cashier, itemCount: parseJSON(r.items).length, total: Number(r.total || 0), reprintCount: Number(r.reprintCount || 0), kind: type }));
+  }
+  res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, count: rows.length });
+});
+
+router.get('/reprints', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT * FROM reprint_logs WHERE org_id=? AND store_id=? ORDER BY id DESC LIMIT 200', [orgId, storeId]); res.json(rows.map((r) => ({ _id: r.id, id: r.id, orderId: r.order_id, orderNo: r.order_no, kind: r.kind, createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at }))); });
+
 export default router;

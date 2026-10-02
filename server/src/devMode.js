@@ -13,6 +13,8 @@ const store = {
   // 新增：Split Bill / Refund / Void / 促销 / 客户库存 / 盘点 / 报表设计器 / 硬件
   orderSplits: [], refunds: [], promotions: [], customerStock: [], stockTakes: [],
   reportTemplates: [], printJobs: [], printers: [], invoices: [],
+  // 新增：挂单 / 反结算 / 重打
+  unsettles: [], reprintLogs: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -178,6 +180,8 @@ const toOrder = (o) => ({
   items: o.items || [], subtotal: Number(o.subtotal || 0), discount: Number(o.discount || 0), tax: Number(o.tax || 0), total: Number(o.total || 0),
   serviceCharge: Number(o.serviceCharge || 0), refundedAmount: Number(o.refundedAmount || 0), invoiceNo: o.invoiceNo || null,
   splitFromOrderId: o.splitFromOrderId == null ? null : String(o.splitFromOrderId), splitGroupNo: o.splitGroupNo ?? null,
+  holdLabel: o.holdLabel || null, heldAt: o.heldAt || null, reprintCount: Number(o.reprintCount || 0),
+  unsettledAt: o.unsettledAt || null,
   createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: o.shiftId == null ? null : String(o.shiftId),
   voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: o.voidApprovedBy == null ? null : String(o.voidApprovedBy), voidReason: o.voidReason || null,
   createdAt: o.createdAt, updatedAt: o.updatedAt || o.createdAt,
@@ -216,6 +220,20 @@ function computeTotals(items, taxRate = 0) {
   return { subtotal, tax, total: subtotal + tax };
 }
 
+// 付款行归集：多收的部分视为找零，只记录实际入账金额，避免日报表虚高
+function normalizePayments(rows, total) {
+  const list = (rows || []).map((r) => ({ ...r, amount: Number(r.amount || 0) }));
+  const sum = list.reduce((s, r) => s + r.amount, 0);
+  if (sum <= total + 0.001) return list;
+  let excess = Math.round((sum - total) * 100) / 100;
+  for (let i = list.length - 1; i >= 0 && excess > 0.001; i--) {
+    const cut = Math.min(list[i].amount, excess);
+    list[i].amount = Math.round((list[i].amount - cut) * 100) / 100;
+    excess = Math.round((excess - cut) * 100) / 100;
+  }
+  return list.filter((r) => r.amount > 0);
+}
+
 // GST 感知的总额计算：支持含税/未税价、服务费、5 分钱取整
 function computeOrderTotals(items, discount = 0) {
   const s = getSettings();
@@ -242,6 +260,32 @@ function orderNo() {
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
   return `T${ymd}-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+// 生成可重打的单据内容（Bill / Receipt / Order slip / Kitchen / Bar）。
+// 只产出结构化内容供界面显示与浏览器打印；不涉及 ESC/POS 硬件。
+const DOC_TITLES = { bill: 'Bill / Tax Invoice', receipt: 'Receipt', order: 'Order Slip', kitchen: 'Kitchen Order', bar: 'Bar Order' };
+function buildDocument(o, kind = 'bill') {
+  const s = getSettings();
+  const isKitchen = kind === 'kitchen' || kind === 'bar';
+  const table = o.tableId ? (store.tables.find((t) => t.id === String(o.tableId)) || {}).number || null : null;
+  const cashier = (store.users.find((u) => u.id === String(o.createdBy)) || {}).name || null;
+  const payments = store.payments.filter((p) => p.orderId === o.id);
+  return {
+    kind, title: DOC_TITLES[kind] || 'Bill',
+    header: isKitchen
+      ? { name: s.companyName || 'Store' }
+      : { name: s.companyName || 'Store', address: s.address || '', phone: s.phone || '', gstNo: s.gstNo || '' },
+    orderNo: o.orderNo, invoiceNo: o.invoiceNo || null, date: o.createdAt, status: o.status,
+    table, cashier, customerName: o.customerName || null,
+    items: isKitchen ? o.items.map((i) => ({ qty: i.qty, code: i.code, name: i.name })) : o.items,
+    subtotal: Number(o.subtotal || 0), discount: Number(o.discount || 0), serviceCharge: Number(o.serviceCharge || 0),
+    tax: Number(o.tax || 0), taxRate: s.taxRate || 0, taxInclusive: !!s.taxInclusive,
+    total: Number(o.total || 0), refundedAmount: Number(o.refundedAmount || 0),
+    payments: isKitchen ? [] : payments.map((p) => ({ method: p.method, amount: Number(p.amount) })),
+    footer: isKitchen ? '' : (s.receiptFooter || ''),
+    reprintCount: Number(o.reprintCount || 0),
+  };
 }
 
 function devAuthenticate(req, res, next) {
@@ -438,16 +482,19 @@ export function createDevRouter(io) {
     const b = req.body;
     const items = (b.items || []).map((i) => ({ ...i, status: 'pending' }));
     const totals = computeOrderTotals(items, b.discount || 0);
+    const held = !!b.hold;
     const o = {
       id: nid(), orgId: '1', storeId: '1', orderNo: orderNo(), type: b.type || 'dine_in',
       tableId: b.tableId ? String(b.tableId) : null, customerName: b.customerName || null, phone: b.phone || null,
-      status: 'open', items, subtotal: totals.subtotal, discount: totals.discount, serviceCharge: totals.serviceCharge,
+      status: held ? 'hold' : 'open', items, subtotal: totals.subtotal, discount: totals.discount, serviceCharge: totals.serviceCharge,
       tax: totals.tax, total: totals.total, refundedAmount: 0, invoiceNo: null,
+      holdLabel: held ? (b.holdLabel || `Hold ${store.orders.filter((x) => x.status === 'hold').length + 1}`) : null,
+      heldAt: held ? now() : null, reprintCount: 0,
       createdBy: req.user.id, shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
       createdAt: now(), updatedAt: now(),
     };
     store.orders.push(o);
-    if (o.type === 'dine_in' && o.tableId) {
+    if (!held && o.type === 'dine_in' && o.tableId) {
       const t = store.tables.find((x) => x.id === o.tableId);
       if (t) { t.status = 'occupied'; t.currentOrderId = o.id; }
     }
@@ -459,6 +506,18 @@ export function createDevRouter(io) {
     if (o.status !== 'open') return res.status(400).json({ error: 'order not open' });
     o.items.push({ ...req.body, status: 'pending' });
     const totals = computeOrderTotals(o.items, o.discount);
+    Object.assign(o, totals); o.updatedAt = now();
+    res.json(toOrder(o));
+  });
+  // 整单替换明细（取单后编辑再送厨房用）
+  r.put('/orders/:id/items', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (!['open', 'hold'].includes(o.status)) return res.status(400).json({ error: 'order not editable' });
+    const items = (req.body.items || []).map((i) => ({ ...i, status: 'pending' }));
+    if (!items.length) return res.status(400).json({ error: 'items required' });
+    o.items = items;
+    const totals = computeOrderTotals(items, req.body.discount ?? o.discount);
     Object.assign(o, totals); o.updatedAt = now();
     res.json(toOrder(o));
   });
@@ -482,7 +541,7 @@ export function createDevRouter(io) {
     if (o.status === 'paid' || o.status === 'void') return res.status(400).json({ error: 'already closed' });
     const paidSum = (req.body.payments || []).reduce((s, x) => s + Number(x.amount), 0);
     if (paidSum + Number(req.body.tip || 0) < Number(o.total || 0)) return res.status(400).json({ error: 'amount not covered' });
-    for (const pm of req.body.payments || []) {
+    for (const pm of normalizePayments(req.body.payments, Number(o.total || 0))) {
       store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: pm.method, amount: pm.amount, tip: 0, createdAt: now() });
     }
     o.status = 'paid'; o.updatedAt = now();
@@ -539,6 +598,68 @@ export function createDevRouter(io) {
     o.status = 'open'; o.voidRequestedBy = null; o.voidReason = null; o.voidRejectReason = req.body?.reason || null; o.updatedAt = now();
     io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
     res.json(toOrder(o));
+  });
+
+  // ---- 挂单 Hold / 取单 Recall ----
+  r.get('/holds', (req, res) => res.json(store.orders.filter((o) => o.status === 'hold').map(toOrder)));
+  r.post('/orders/:id/hold', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (!['open', 'hold'].includes(o.status)) return res.status(400).json({ error: 'only open orders can be held' });
+    o.status = 'hold';
+    o.holdLabel = req.body?.label || o.holdLabel || `Hold ${store.orders.filter((x) => x.status === 'hold').length + 1}`;
+    o.heldAt = now(); o.updatedAt = now();
+    if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'free'; t.currentOrderId = null; } }
+    io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
+    res.json(toOrder(o));
+  });
+  r.post('/orders/:id/recall', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (o.status !== 'hold') return res.status(400).json({ error: 'order is not on hold' });
+    o.status = 'open'; o.heldAt = null; o.updatedAt = now();
+    if (o.type === 'dine_in' && o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'occupied'; t.currentOrderId = o.id; } }
+    res.json(toOrder(o));
+  });
+
+  // ---- 反结算 Unsettle：把已结算单退回未结算 ----
+  r.get('/unsettles', (req, res) => res.json(store.unsettles));
+  r.post('/orders/:id/unsettle', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (!['paid', 'refunded'].includes(o.status)) return res.status(400).json({ error: 'only settled orders can be unsettled' });
+    // 回补库存
+    for (const it of o.items) {
+      const v = store.variants.find((x) => x.id === String(it.variantId || it.itemId));
+      if (v) v.stockQty = Number(v.stockQty) + Number(it.qty);
+    }
+    // 作废付款记录
+    const voided = store.payments.filter((p) => p.orderId === o.id);
+    store.payments = store.payments.filter((p) => p.orderId !== o.id);
+    // 发票作废
+    store.invoices = store.invoices.filter((i) => i.orderId !== o.id);
+    const record = { id: nid(), orderId: o.id, orderNo: o.orderNo, invoiceNo: o.invoiceNo || null, amount: o.total, payments: voided.map((p) => ({ method: p.method, amount: Number(p.amount) })), reason: req.body?.reason || 'unsettle', createdBy: req.user.id, createdAt: now() };
+    store.unsettles.unshift(record);
+    o.status = 'open'; o.invoiceNo = null; o.refundedAmount = 0; o.unsettledAt = now(); o.updatedAt = now();
+    if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'occupied'; t.currentOrderId = o.id; } }
+    io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
+    res.json({ order: toOrder(o), unsettle: record });
+  });
+
+  // ---- 单据内容（重打用）：Bill / Receipt / Order / Kitchen / Bar ----
+  r.get('/orders/:id/document', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    res.json(buildDocument(o, req.query.kind || 'bill'));
+  });
+  r.post('/orders/:id/reprint', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    const kind = req.body?.kind || 'bill';
+    o.reprintCount = Number(o.reprintCount || 0) + 1;
+    const row = { id: nid(), orderId: o.id, orderNo: o.orderNo, kind, createdBy: req.user.id, createdAt: now() };
+    store.reprintLogs.unshift(row);
+    res.json({ document: buildDocument(o, kind), reprint: row });
   });
 
   // ---- 发票 / Tax Invoice ----
@@ -786,6 +907,48 @@ export function createDevRouter(io) {
     const refundTax = store.refunds.reduce((sum, r) => sum + Number(r.amount || 0) * (Number(s.taxRate || 0) / (100 + Number(s.taxRate || 0))), 0);
     res.json({ from: req.query.from || null, to: req.query.to || null, taxRate: s.taxRate, taxInclusive: s.taxInclusive, taxableSales: paid.reduce((sum, o) => sum + Number(o.total || 0), 0), outputTax: Math.round(outputTax * 100) / 100, refundTax: Math.round(refundTax * 100) / 100, netTax: Math.round((outputTax - refundTax) * 100) / 100, invoiceCount: store.invoices.length });
   });
+
+  // ---- 重打中心：按类型/日期/桌号/收银员检索历史单据 ----
+  r.get('/reports/reprint', (req, res) => {
+    const type = req.query.type || 'bill';
+    const from = req.query.from ? new Date(`${req.query.from}T00:00:00`) : null;
+    const to = req.query.to ? new Date(`${req.query.to}T23:59:59`) : null;
+    const inRange = (d) => { const t = new Date(d); if (from && t < from) return false; if (to && t > to) return false; return true; };
+    const tableOf = (id) => (store.tables.find((t) => t.id === String(id)) || {}).number || null;
+    const cashierOf = (id) => (store.users.find((u) => u.id === String(id)) || {}).name || null;
+    let rows = [];
+    if (type === 'payout') {
+      rows = store.cashMovements.filter((m) => ['payout', 'withdraw'].includes(m.type) && inRange(m.createdAt))
+        .map((m) => ({ id: m.id, voucherNo: m.voucherNo, date: m.createdAt, payTo: m.payTo, amount: Number(m.amount), reason: m.reason, method: m.method, kind: 'payout' }));
+    } else if (type === 'closeshift') {
+      rows = store.shifts.filter((s) => inRange(s.openedAt)).map((s) => ({ id: s.id, date: s.openedAt, cashier: cashierOf(s.cashierId), openAmount: Number(s.openAmount), expectedAmount: Number(s.expectedAmount), closeAmount: Number(s.closeAmount), difference: Number(s.difference), status: s.status, kind: 'closeshift' }));
+    } else if (type === 'dayend') {
+      const byDay = {};
+      for (const o of store.orders.filter((x) => x.status === 'paid' || x.status === 'refunded')) {
+        if (!inRange(o.createdAt)) continue;
+        const d = String(o.createdAt).slice(0, 10);
+        byDay[d] = byDay[d] || { date: d, orders: 0, cash: 0, card: 0, other: 0, total: 0, kind: 'dayend' };
+        byDay[d].orders++; byDay[d].total += Number(o.total || 0);
+        for (const p of store.payments.filter((x) => x.orderId === o.id)) {
+          if (p.method === 'cash') byDay[d].cash += Number(p.amount);
+          else if (p.method === 'card') byDay[d].card += Number(p.amount);
+          else byDay[d].other += Number(p.amount);
+        }
+      }
+      rows = Object.values(byDay).sort((a, b) => b.date.localeCompare(a.date));
+    } else {
+      let list = store.orders.filter((o) => inRange(o.createdAt));
+      if (type === 'bill' || type === 'receipt') list = list.filter((o) => ['paid', 'refunded'].includes(o.status));
+      if (type === 'order') list = list.filter((o) => !['void', 'hold'].includes(o.status));
+      if (req.query.table) list = list.filter((o) => String(o.tableId) === String(req.query.table));
+      if (req.query.cashier) list = list.filter((o) => String(o.createdBy) === String(req.query.cashier));
+      if (req.query.orderNo) list = list.filter((o) => o.orderNo.toLowerCase().includes(String(req.query.orderNo).toLowerCase()));
+      rows = list.map((o) => ({ id: o.id, orderNo: o.orderNo, invoiceNo: o.invoiceNo || null, date: o.createdAt, status: o.status, table: tableOf(o.tableId), cashier: cashierOf(o.createdBy), itemCount: o.items.length, total: Number(o.total || 0), reprintCount: Number(o.reprintCount || 0), kind: type }));
+    }
+    res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, count: rows.length });
+  });
+
+  r.get('/reprints', (req, res) => res.json(store.reprintLogs));
 
   // ---- 库存（原料级） ----
   r.get('/inventory/items', (req, res) => res.json(store.inventory.map(toInventoryItem)));
