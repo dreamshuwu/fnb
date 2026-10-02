@@ -4,7 +4,7 @@ import { api } from '../api/client.js';
 
 const CATEGORY_COLORS = ['#d7e48e', '#f4bd63', '#f3e95d', '#ef9cca', '#9ed6e9', '#52d065', '#60a4eb', '#e79bd1', '#a99ece'];
 const PAGE_SIZE = 12;
-const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null, salesPersonId: '' });
+const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null, salesPersonId: '', memberId: '', memberLabel: '' });
 
 export default function CashierPage() {
   const [tree, setTree] = useState({ categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [] });
@@ -33,6 +33,11 @@ export default function CashierPage() {
   const [showMerge, setShowMerge] = useState(false);
   const [salesPersons, setSalesPersons] = useState([]);
   const [transferLog, setTransferLog] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [memberPicker, setMemberPicker] = useState(null);   // null | 'page' | 订单对象
+  const [payVouchers, setPayVouchers] = useState([]);   // [{ code, amount, voucherNo, maxRedeemable }]
+  const [payRebate, setPayRebate] = useState('');       // 结账时抵扣的返利金额
+  const [payMember, setPayMember] = useState(null);     // 正在结账的订单所属会员
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
@@ -49,6 +54,7 @@ export default function CashierPage() {
   const loadActive = async () => { const r = await api.get('/orders?status=kitchen'); setActive(r.data); };
   const loadVoids = async () => { const r = await api.get('/orders?status=void_pending'); setVoidQueue(r.data); };
   const loadSalesPersons = async () => { const r = await api.get('/sales-persons'); setSalesPersons(r.data); };
+  const loadMembers = async () => { try { const r = await api.get('/members'); setMembers(r.data); } catch { setMembers([]); } };
   const loadTransfers = async () => { const r = await api.get('/transfers'); setTransferLog(r.data.slice(0, 8)); };
 
   useEffect(() => {
@@ -57,6 +63,7 @@ export default function CashierPage() {
     loadActive();
     loadVoids();
     loadSalesPersons();
+    loadMembers();
     loadTransfers();
     const socketUrl = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || undefined;
     const socket = io(socketUrl, { auth: { token: localStorage.getItem('token') } });
@@ -124,9 +131,10 @@ export default function CashierPage() {
     if (orderId) {
       await api.put(`/orders/${orderId}/items`, { items: cart, discount });
       if (activePage.salesPersonId) await api.put(`/orders/${orderId}/sales-person`, { salesPersonId: activePage.salesPersonId });
+      if (activePage.memberId) await api.put(`/orders/${orderId}/member`, { memberId: activePage.memberId });
       await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
     } else {
-      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, salesPersonId: activePage.salesPersonId || undefined });
+      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, salesPersonId: activePage.salesPersonId || undefined, memberId: activePage.memberId || undefined });
       orderId = r.data._id;
       await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
     }
@@ -142,7 +150,7 @@ export default function CashierPage() {
   const holdCurrentPage = async () => {
     if (!cart.length) { alert('当前页面没有点单'); return; }
     const label = `${tableId ? `T${tableId} ` : ''}${cart.reduce((s, c) => s + c.qty, 0)} items`;
-    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, hold: true, holdLabel: label });
+    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, hold: true, holdLabel: label, memberId: activePage.memberId || undefined });
     const nextId = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
     setPages((prev) => [...prev.map((p) => p.id === activePageId ? { ...p, status: 'held', orderId: r.data._id, label: `${p.label} · Held` } : p), newPage(nextId)]);
     setActivePageId(nextId);
@@ -166,23 +174,42 @@ export default function CashierPage() {
   const openPayment = (order) => {
     setPaymentOrder(order);
     setPaymentRows([{ method: 'cash', amount: String(Number(order.total).toFixed(2)) }]);
+    setPayVouchers([]);
+    setPayRebate('');
+    // 返利只能用于会员单:结账时把订单所属会员查出来,顺便刷新返利余额。
+    const m = order.memberId ? members.find((x) => String(x.id) === String(order.memberId)) : null;
+    setPayMember(m || null);
   };
   const confirmPayment = (rows) => {
     if (!paymentOrder) return;
     const cleanRows = rows.filter((row) => Number(row.amount) > 0).map((row) => ({ ...row, amount: Number(row.amount) }));
     const tendered = cleanRows.reduce((sum, row) => sum + row.amount, 0);
-    if (!Number.isFinite(tendered) || tendered < Number(paymentOrder.total)) { alert('付款总额不足'); return; }
+    const deduction = payVouchers.reduce((s, v) => s + Number(v.amount || 0), 0) + Number(payRebate || 0);
+    const due = Math.max(0, Number((Number(paymentOrder.total) - deduction).toFixed(2)));
+    if (!Number.isFinite(tendered) || tendered < due) { alert(`付款总额不足，抵扣后应付 ¥${due.toFixed(2)}`); return; }
     // Payment 这里只确认金额；真正 checkout/扣库存/释放桌位在 Settlement 完成时执行。
     setPaymentOrder(null);
-    setSettlement({ order: paymentOrder, rows: cleanRows, tendered, change: tendered - Number(paymentOrder.total) });
+    setSettlement({
+      order: paymentOrder, rows: cleanRows, tendered, due,
+      vouchers: payVouchers, rebateAmount: Number(payRebate || 0),
+      deduction, change: Number((tendered - due).toFixed(2)),
+    });
   };
   const completeSettlement = async () => {
     if (!settlement) return;
-    const result = await api.post(`/orders/${settlement.order._id}/checkout`, { payments: settlement.rows, tip: 0 });
+    const result = await api.post(`/orders/${settlement.order._id}/checkout`, {
+      payments: settlement.rows, tip: 0,
+      vouchers: settlement.vouchers.map((v) => ({ code: v.code, amount: Number(v.amount) })),
+      rebateAmount: settlement.rebateAmount || 0,
+    });
     setReceipt(result.data.receipt);
     setSettlement(null);
+    setPayVouchers([]);
+    setPayRebate('');
+    setPayMember(null);
     loadActive();
     loadTables();
+    loadMembers();
   };
   const requestVoid = async (o) => { const reason = prompt('取消原因(需主管审批):'); if (!reason) return; await api.post(`/orders/${o._id}/void`, { reason }); loadActive(); loadVoids(); };
   const approveVoid = async (o) => { if (!window.confirm(`批准取消 ${o.orderNo}?`)) return; await api.post(`/orders/${o._id}/void/approve`, {}); loadVoids(); loadActive(); loadTables(); };
@@ -243,6 +270,26 @@ export default function CashierPage() {
       try { await api.put(`/orders/${activePage.orderId}/sales-person`, { salesPersonId: id || null }); } catch { /* 静默失败,下次 Send 会带上 */ }
     }
   };
+  const setMember = async (m) => {
+    const id = m ? String(m.id) : '';
+    const label = m ? `${m.memberNo} · ${m.name}` : '';
+    setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, memberId: id, memberLabel: label } : p));
+    setMemberPicker(null);
+    if (activePage.orderId) {
+      try { await api.put(`/orders/${activePage.orderId}/member`, { memberId: id || null }); await loadActive(); } catch (e) { alert(e.response?.data?.error || '会员绑定失败'); }
+    }
+  };
+  // 已送厨房的订单:Send 之后当前编辑页会切到新页,所以会员要直接挂到那一张单上,
+  // 否则 Payment 读到的订单 memberId 还是空的,返利抵扣就用不了。
+  const bindMemberToOrder = async (m) => {
+    const target = memberPicker;
+    if (!target || target === 'page') return;
+    try {
+      await api.put(`/orders/${target._id}/member`, { memberId: m ? String(m.id) : null });
+      setMemberPicker(null);
+      await loadActive();
+    } catch (e) { alert(e.response?.data?.error || '会员绑定失败'); }
+  };
   const tableLabel = (id) => { const t = tables.find((x) => String(x.id) === String(id)); return t ? t.number : (id ? `#${id}` : '—'); };
 
   return (
@@ -300,14 +347,14 @@ export default function CashierPage() {
               {salesPersons.map((u) => <option key={u.id} value={u.id}>{u.name} ({u.role})</option>)}
             </select>
           </div>
-          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}{tableId && <span> · Table {tableLabel(tableId)}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
+          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}{tableId && <span> · Table {tableLabel(tableId)}</span>}{activePage.memberLabel && <span> · Member {activePage.memberLabel}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
           <div className="cashier-keypad">{['Enter', '7', '8', '9', 'Back', '4', '5', '6', 'Up', '1', '2', '3', 'Down', '0', '.', 'Clear'].map((n) => <button key={n}>{n}</button>)}</div>
         </div>
       </div>
 
       <div className="cashier-footer">
         <button onClick={() => { const n = prompt('选择桌号', tableId); if (n) setTableId(n); }}>Table</button>
-        <button onClick={() => { const code = prompt('Member / A/C No.', ''); if (code) alert(`会员 ${code} 已关联`); }}>Member</button>
+        <button onClick={() => setMemberPicker('page')}>Member{activePage.memberLabel ? ` · ${activePage.memberLabel}` : ''}</button>
         <button onClick={() => printOrder(active[0] || { _id: '' }, 'receipt')}>Request</button>
         <button onClick={openRefundPicker}>Refund</button>
         <button onClick={sendCurrentPage}>Send</button>
@@ -330,8 +377,9 @@ export default function CashierPage() {
         <h3>收银端待处理订单 / Kitchen 已收到</h3>
         <div className="cashier-open-orders">
           {active.map((o) => <div key={o._id} className="cashier-open-card"><b>{o.orderNo}</b> · ¥{o.total}<br />{o.items.reduce((s, i) => s + i.qty, 0)} items
-            <small className="cashier-open-meta">Table {tableLabel(o.tableId)}{o.salesPersonId ? ` · ${(salesPersons.find((u) => String(u.id) === String(o.salesPersonId)) || {}).name || ''}` : ''}</small>
+            <small className="cashier-open-meta">Table {tableLabel(o.tableId)}{o.salesPersonId ? ` · ${(salesPersons.find((u) => String(u.id) === String(o.salesPersonId)) || {}).name || ''}` : ''}{o.memberId ? ` · ${(members.find((m) => String(m.id) === String(o.memberId)) || {}).memberNo || 'Member'}` : ''}</small>
             <button onClick={() => openPayment(o)}>Payment</button>
+            <button onClick={() => setMemberPicker(o)}>Member</button>
             <button onClick={() => setSplitOrder(o)}>Split</button>
             <button onClick={() => setTransferOrder(o)}>Transfer</button>
             <button onClick={() => printOrder(o)}>Print</button>
@@ -370,8 +418,9 @@ export default function CashierPage() {
         </div>
       )}
 
-      {paymentOrder && <PaymentModal order={paymentOrder} rows={paymentRows} setRows={setPaymentRows} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} />}
+      {paymentOrder && <PaymentModal order={paymentOrder} rows={paymentRows} setRows={setPaymentRows} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} vouchers={payVouchers} setVouchers={setPayVouchers} rebate={payRebate} setRebate={setPayRebate} member={payMember} />}
       {settlement && <SettlementModal settlement={settlement} onComplete={completeSettlement} onClose={() => setSettlement(null)} />}
+      {memberPicker && <MemberPickerModal members={members} current={memberPicker === 'page' ? activePage.memberId : memberPicker.memberId} onPick={memberPicker === 'page' ? setMember : bindMemberToOrder} onClose={() => setMemberPicker(null)} />}
       {receipt && <ReceiptModal receipt={receipt} onClose={() => setReceipt(null)} />}
       {splitOrder && <SplitBillModal order={splitOrder} onConfirm={doSplit} onClose={() => setSplitOrder(null)} />}
       {refundOrder && <RefundModal order={refundOrder} orders={refundList} onPick={setRefundOrder} onConfirm={doRefund} onClose={() => setRefundOrder(null)} />}
@@ -447,15 +496,103 @@ function RecallModal({ holds, onPick, onClose }) {
   </section></div>;
 }
 
-function PaymentModal({ order, rows, setRows, onConfirm, onClose }) {
+function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setVouchers, rebate, setRebate, member }) {
+  const [code, setCode] = useState('');
+  const [amount, setAmount] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
   const tendered = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-  const change = Math.max(0, tendered - Number(order.total));
+  const voucherTotal = vouchers.reduce((s, v) => s + Number(v.amount || 0), 0);
+  const rebateAmt = Number(rebate || 0);
+  const deduction = Math.min(Number(order.total), voucherTotal + rebateAmt);
+  const due = Math.max(0, Number((Number(order.total) - deduction).toFixed(2)));
+  const change = Math.max(0, Number((tendered - due).toFixed(2)));
   const updateRow = (index, patch) => setRows(rows.map((row, i) => i === index ? { ...row, ...patch } : row));
-  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Payment · {order.orderNo}</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="payment-amount-box"><small>AMOUNT DUE</small><strong>¥{Number(order.total).toFixed(2)}</strong></div>{rows.map((row, index) => <div className="payment-field" key={index}><label>Payment Type<select value={row.method} onChange={(e) => updateRow(index, { method: e.target.value })}><option value="cash">Cash</option><option value="card">Card</option><option value="tab">Credit / Account</option><option value="cheque">Cheque</option></select></label><label>Amount<input type="number" min="0" step="0.01" value={row.amount} onChange={(e) => updateRow(index, { amount: e.target.value })} /></label></div>)}<button className="payment-add-row" onClick={() => setRows([...rows, { method: 'card', amount: '' }])}>+ Split Payment</button><div className="payment-change">Total Tendered <strong>¥{tendered.toFixed(2)}</strong></div><div className="payment-change">Change <strong>¥{change.toFixed(2)}</strong></div><div className="payment-denoms">{[1, 5, 10, 20, 50, 100].map((n) => <button key={n} onClick={() => updateRow(0, { amount: String(n) })}>¥{n}</button>)}</div><div className="legacy-window-actions"><button className="legacy-btn green" onClick={() => onConfirm(rows)}>Confirm Payment</button><button className="legacy-btn pink" onClick={onClose}>Cancel</button></div></div></section></div>;
+
+  const addVoucher = async () => {
+    const c = code.trim();
+    if (!c) { alert('请输入礼券码'); return; }
+    if (vouchers.some((x) => x.code.toUpperCase() === c.toUpperCase())) { alert('该礼券已添加'); return; }
+    setBusy(true);
+    try {
+      const want = Number(amount || 0);
+      const r = await api.get(`/vouchers/lookup?code=${encodeURIComponent(c)}${want > 0 ? `&amount=${want}` : ''}`);
+      const v = r.data;
+      if (!v.redeemable) { alert(`礼券 ${c} 不可用（${v.status}）`); return; }
+      const max = Number(v.maxRedeemable || 0);
+      const remaining = Math.max(0, Number((Number(order.total) - voucherTotal - rebateAmt).toFixed(2)));
+      let amt = want > 0 ? want : Math.min(max, remaining);
+      if (amt > max) { alert(`礼券余额仅 ${money(max)}，已按余额抵扣`); amt = max; }
+      if (amt > remaining) amt = remaining;
+      amt = Number(amt.toFixed(2));
+      if (!(amt > 0)) { alert('抵扣金额必须大于 0'); return; }
+      setVouchers([...vouchers, { code: v.voucher.code, amount: amt, voucherNo: v.voucher.voucherNo, maxRedeemable: max }]);
+      setCode(''); setAmount('');
+    } catch (e) { alert(e.response?.data?.error || '礼券无效'); }
+    finally { setBusy(false); }
+  };
+  const removeVoucher = (i) => setVouchers(vouchers.filter((_, idx) => idx !== i));
+  const rebateMax = Number(member?.rebateBalance || 0);
+  const onRebate = (val) => {
+    let n = Number(val || 0);
+    if (!Number.isFinite(n) || n < 0) n = 0;
+    const remaining = Math.max(0, Number((Number(order.total) - voucherTotal).toFixed(2)));
+    if (n > rebateMax) { alert(`返利余额仅 ${money(rebateMax)}`); n = rebateMax; }
+    if (n > remaining) n = remaining;
+    setRebate(val === '' ? '' : String(Number(n.toFixed(2))));
+  };
+
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Payment · {order.orderNo}</span><button onClick={onClose}>×</button></header><div className="legacy-window-body">
+    <div className="payment-amount-box"><small>AMOUNT DUE</small><strong>{money(due)}</strong>{deduction > 0 && <em className="payment-due-note">原价 {money(order.total)} − 抵扣 {money(deduction)}</em>}</div>
+
+    <div className="payment-deduction-block">
+      <div className="payment-deduction-head">Gift Voucher / Rebate 礼券与返利抵扣</div>
+      <div className="payment-voucher-add">
+        <input placeholder="Voucher code" value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addVoucher()} />
+        <input type="number" min="0" step="0.01" placeholder="Amount" value={amount} onChange={(e) => setAmount(e.target.value)} />
+        <button className="mini-action" disabled={busy} onClick={addVoucher}>{busy ? '…' : 'Add'}</button>
+      </div>
+      {vouchers.map((v, i) => <div className="payment-deduction-row" key={v.code}><span>{v.voucherNo} · {v.code}</span><b>−{money(v.amount)}</b><button className="mini-action danger" onClick={() => removeVoucher(i)}>×</button></div>)}
+      <div className="payment-rebate-row">
+        <span>Member Rebate{member ? ` · ${member.memberNo} ${member.name}` : ''}</span>
+        {member
+          ? <><input type="number" min="0" step="0.01" placeholder="0.00" value={rebate} onChange={(e) => onRebate(e.target.value)} /><small>可用 {money(rebateMax)}</small></>
+          : <small className="payment-rebate-off">此单未绑定会员，无法使用返利</small>}
+      </div>
+      {deduction > 0 && <div className="payment-change">Total Deduction <strong>−{money(deduction)}</strong></div>}
+    </div>
+
+    {rows.map((row, index) => <div className="payment-field" key={index}><label>Payment Type<select value={row.method} onChange={(e) => updateRow(index, { method: e.target.value })}><option value="cash">Cash</option><option value="card">Card</option><option value="tab">Credit / Account</option><option value="cheque">Cheque</option></select></label><label>Amount<input type="number" min="0" step="0.01" value={row.amount} onChange={(e) => updateRow(index, { amount: e.target.value })} /></label></div>)}<button className="payment-add-row" onClick={() => setRows([...rows, { method: 'card', amount: '' }])}>+ Split Payment</button><div className="payment-change">Total Tendered <strong>{money(tendered)}</strong></div><div className="payment-change">Change <strong>{money(change)}</strong></div><div className="payment-denoms">{[1, 5, 10, 20, 50, 100].map((n) => <button key={n} onClick={() => updateRow(0, { amount: String(n) })}>¥{n}</button>)}<button className="payment-exact" onClick={() => updateRow(0, { amount: due.toFixed(2) })}>Exact Due</button></div><div className="legacy-window-actions"><button className="legacy-btn green" onClick={() => onConfirm(rows)}>Confirm Payment</button><button className="legacy-btn pink" onClick={onClose}>Cancel</button></div></div></section></div>;
 }
 
 function SettlementModal({ settlement, onComplete, onClose }) {
-  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Settlement · Complete Sale</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="settlement-success">Payment recorded</div><div className="settlement-summary"><div><span>Order</span><strong>{settlement.order.orderNo}</strong></div><div><span>Amount Due</span><strong>¥{Number(settlement.order.total).toFixed(2)}</strong></div><div><span>Tendered</span><strong>¥{settlement.tendered.toFixed(2)}</strong></div><div><span>Change</span><strong className="change-value">¥{settlement.change.toFixed(2)}</strong></div><div><span>Payment Type</span><strong>{settlement.rows.map((row) => `${row.method}: ¥${Number(row.amount).toFixed(2)}`).join(' + ')}</strong></div></div><p className="settlement-note">确认 Settlement 后，这张单会完成结算、扣减库存、释放桌位并可打印小票。</p><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onComplete}>Complete Settlement</button><button className="legacy-btn pink" onClick={onClose}>Back</button></div></div></section></div>;
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const { vouchers = [], rebateAmount = 0, deduction = 0 } = settlement;
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Settlement · Complete Sale</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="settlement-success">Payment recorded</div><div className="settlement-summary"><div><span>Order</span><strong>{settlement.order.orderNo}</strong></div><div><span>Amount Due</span><strong>{money(settlement.due ?? settlement.order.total)}</strong></div>{deduction > 0 && <div><span>Deduction</span><strong>−{money(deduction)}</strong></div>}{vouchers.map((v) => <div key={v.code}><span>Voucher {v.code}</span><strong>−{money(v.amount)}</strong></div>)}{rebateAmount > 0 && <div><span>Member Rebate</span><strong>−{money(rebateAmount)}</strong></div>}<div><span>Tendered</span><strong>{money(settlement.tendered)}</strong></div><div><span>Change</span><strong className="change-value">{money(settlement.change)}</strong></div><div><span>Payment Type</span><strong>{settlement.rows.map((row) => `${row.method}: ${money(row.amount)}`).join(' + ')}</strong></div></div><p className="settlement-note">确认 Settlement 后，这张单会完成结算、核销礼券与返利、扣减库存、释放桌位并可打印小票。</p><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onComplete}>Complete Settlement</button><button className="legacy-btn pink" onClick={onClose}>Back</button></div></div></section></div>;
+}
+
+function MemberPickerModal({ members, current, onPick, onClose }) {
+  const [kw, setKw] = useState('');
+  const list = members.filter((m) => {
+    const k = kw.trim().toLowerCase();
+    if (!k) return true;
+    return `${m.memberNo} ${m.name} ${m.phone || ''}`.toLowerCase().includes(k);
+  }).slice(0, 40);
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 520 }}>
+    <header><span>Member · 会员绑定</span><button onClick={onClose}>×</button></header>
+    <div className="legacy-window-body">
+      <div className="payment-field"><label>Search<input placeholder="Member No. / 姓名 / 电话" value={kw} onChange={(e) => setKw(e.target.value)} /></label></div>
+      <div className="recall-list">
+        {list.map((m) => <div key={m.id} className={`recall-row ${String(m.id) === String(current) ? 'active' : ''}`}>
+          <div><b>{m.memberNo} · {m.name}</b><small>{m.phone || '-'} · 积分 {Number(m.points || 0)} · 返利 {`¥${Number(m.rebateBalance || 0).toFixed(2)}`} · 储值 {`¥${Number(m.creditBalance || 0).toFixed(2)}`}</small></div>
+          <button className="legacy-btn green" onClick={() => onPick(m)}>{String(m.id) === String(current) ? 'Current' : 'Select'}</button>
+        </div>)}
+        {!list.length && <div className="ops-empty">没有匹配的会员</div>}
+      </div>
+      <div className="legacy-window-actions"><button className="legacy-btn pink" onClick={() => onPick(null)}>Clear Member</button><button className="legacy-btn pink" onClick={onClose}>Close</button></div>
+    </div>
+  </section></div>;
 }
 
 function ReceiptModal({ receipt, onClose }) {
@@ -463,7 +600,7 @@ function ReceiptModal({ receipt, onClose }) {
   const print = () => {
     const w = window.open('', '_blank');
     const rows = receipt.items.map((i) => `<div>${i.qty} x ${i.name} ...... ${money(i.unitPrice * i.qty)}</div>`).join('');
-    w.document.write(`<html><body style="font-family:monospace;width:300px;padding:10px"><h3>${receipt.storeName}</h3><div>${receipt.address || ''}</div><div>GST: ${receipt.gstNo || '-'}</div><div>Invoice: ${receipt.invoiceNo || receipt.orderNo}</div><hr/>${rows}<hr/>${receipt.discount ? `<div>Discount -${money(receipt.discount)}</div>` : ''}${receipt.serviceCharge ? `<div>Service ${money(receipt.serviceCharge)}</div>` : ''}<div>Subtotal ${money(receipt.subtotal)}</div><div>GST ${receipt.taxRate || 0}% ${money(receipt.tax)}</div><b>Total ${money(receipt.total)}</b><hr/><div>${receipt.footer || ''}</div></body></html>`);
+    w.document.write(`<html><body style="font-family:monospace;width:300px;padding:10px"><h3>${receipt.storeName}</h3><div>${receipt.address || ''}</div><div>GST: ${receipt.gstNo || '-'}</div><div>Invoice: ${receipt.invoiceNo || receipt.orderNo}</div><hr/>${rows}<hr/>${receipt.discount ? `<div>Discount -${money(receipt.discount)}</div>` : ''}${receipt.serviceCharge ? `<div>Service ${money(receipt.serviceCharge)}</div>` : ''}<div>Subtotal ${money(receipt.subtotal)}</div><div>GST ${receipt.taxRate || 0}% ${money(receipt.tax)}</div><b>Total ${money(receipt.total)}</b>${receipt.voucherDiscount ? `<div>Voucher/Rebate -${money(receipt.voucherDiscount)}</div><b>Amount Paid ${money(Number(receipt.total || 0) - Number(receipt.voucherDiscount || 0))}</b>` : ''}${receipt.rebateEarned ? `<div>Rebate Earned ${money(receipt.rebateEarned)}</div>` : ''}<hr/><div>${receipt.footer || ''}</div></body></html>`);
     w.document.close(); w.print();
   };
   return <div className="legacy-window-wrap"><section className="legacy-window receipt-window" style={{ width: 340 }}><header><span>Receipt / Tax Invoice</span><button onClick={onClose}>×</button></header><div className="legacy-window-body">
@@ -479,6 +616,9 @@ function ReceiptModal({ receipt, onClose }) {
     <div className="flex justify-between"><span>Subtotal</span><span>{money(receipt.subtotal)}</span></div>
     <div className="flex justify-between"><span>GST {receipt.taxRate || 0}%{receipt.taxInclusive ? ' (incl.)' : ''}</span><span>{money(receipt.tax)}</span></div>
     <div className="flex justify-between font-bold"><span>Total</span><span>{money(receipt.total)}</span></div>
+    {receipt.voucherDiscount > 0 && <div className="flex justify-between"><span>Voucher / Rebate</span><span>-{money(receipt.voucherDiscount)}</span></div>}
+    {receipt.voucherDiscount > 0 && <div className="flex justify-between font-bold"><span>Amount Paid</span><span>{money(Number(receipt.total || 0) - Number(receipt.voucherDiscount || 0))}</span></div>}
+    {receipt.rebateEarned > 0 && <div className="flex justify-between"><span>Rebate Earned</span><span>{money(receipt.rebateEarned)}</span></div>}
     <div className="legacy-window-actions"><button className="legacy-btn green" onClick={print}>Print</button><button className="legacy-btn pink" onClick={onClose}>Exit</button></div>
   </div></section></div>;
 }

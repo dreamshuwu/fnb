@@ -20,6 +20,8 @@ const store = {
   unsettles: [], reprintLogs: [],
   // 新增：转台 / 并台审计
   orderTransfers: [],
+  // 新增：礼券 / 返利
+  vouchers: [], voucherTxns: [], rebates: [],
   // 新增：日结
   dayEnds: [],
 };
@@ -137,6 +139,9 @@ function seedDev() {
     currency: '¥',
     receiptFooter: 'Thank you, please come again!',
     roundTo5cent: false,
+    voucherPrefix: 'GV',
+    rebatePercent: 0,
+    rebateExpiryDays: 90,
   };
   for (const [key, value] of Object.entries(DEFAULTS)) store.settings.push({ id: nid(), orgId: '1', storeId: '1', key, value });
 
@@ -149,6 +154,49 @@ function seedDev() {
   store.promotions.push({ id: nid(), orgId: '1', storeId: '1', code: 'RM2OFF', name: 'RM2 Off', type: 'amount', value: 2, minSpend: 10, validFrom: null, validUntil: null, isActive: true, createdAt: now() });
 
   store.customerStock.push({ id: nid(), orgId: '1', storeId: '1', memberId: '1', memberNo: 'M0001', itemName: 'Heineken', qty: 6, unit: 'btl', note: 'Member kept stock', createdAt: now() });
+
+  // 礼券种子：一张未使用、一张已部分核销、一张已过期
+  const seedVoucher = (code, face, balance, status, extra = {}) => {
+    const v = {
+      id: nid(), orgId: '1', storeId: '1',
+      voucherNo: `GV20261003${String(store.vouchers.length + 1).padStart(3, '0')}`, code,
+      faceValue: face, balance, status,
+      issuedToMemberId: null, issuedToName: null, issuedToPhone: null,
+      soldAmount: face, note: null,
+      issuedAt: now(), expiresAt: null, voidedAt: null, voidReason: null,
+      createdBy: '1', createdByName: 'Admin', createdAt: now(), updatedAt: now(),
+      ...extra,
+    };
+    store.vouchers.push(v);
+    store.voucherTxns.push({
+      id: nid(), orgId: '1', storeId: '1', voucherId: v.id, voucherNo: v.voucherNo, code: v.code,
+      type: 'issue', amount: face, balanceAfter: face, orderId: null, orderNo: null,
+      memberId: null, reason: 'initial issue', createdBy: '1', createdByName: 'Admin', createdAt: now(),
+    });
+    if (balance < face) {
+      store.voucherTxns.push({
+        id: nid(), orgId: '1', storeId: '1', voucherId: v.id, voucherNo: v.voucherNo, code: v.code,
+        type: 'redeem', amount: round2(face - balance), balanceAfter: balance, orderId: null, orderNo: null,
+        memberId: null, reason: 'seed partial redemption', createdBy: '1', createdByName: 'Admin', createdAt: now(),
+      });
+    }
+    return v;
+  };
+  seedVoucher('GV-1001', 50, 50, 'active');
+  seedVoucher('GV-1002', 100, 35, 'active', { issuedToMemberId: '1', issuedToName: 'Demo Member', note: 'Partial used' });
+  seedVoucher('GV-1003', 20, 20, 'expired', { expiresAt: new Date(Date.now() - 86400000).toISOString() });
+
+  // 返利种子：给 Demo Member 一笔已赚取返利
+  const demoMember = store.members.find((m) => m.memberNo === 'M0001') || store.members[0];
+  if (demoMember) {
+    demoMember.rebateBalance = 8.5;
+    store.rebates.push({
+      id: nid(), orgId: '1', storeId: '1', memberId: demoMember.id, memberNo: demoMember.memberNo,
+      memberName: demoMember.name, type: 'earn', amount: 8.5, balanceAfter: 8.5,
+      orderId: null, orderNo: null, orderTotal: 85, percent: 10, reason: 'seed welcome rebate',
+      expiresAt: null, createdBy: '1', createdByName: 'Admin', createdAt: now(),
+    });
+  }
 
   for (const t of [
     ['sales_by_date', 'Sales By Date', ['orderNo', 'date', 'subtotal', 'discount', 'tax', 'total']],
@@ -197,11 +245,44 @@ const toOrder = (o) => ({
   unsettledAt: o.unsettledAt || null,
   createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: o.shiftId == null ? null : String(o.shiftId),
   salesPersonId: o.salesPersonId == null ? null : String(o.salesPersonId),
+  memberId: o.memberId == null ? null : String(o.memberId),
   mergedIntoOrderId: o.mergedIntoOrderId == null ? null : String(o.mergedIntoOrderId),
+  voucherDiscount: Number(o.voucherDiscount || 0), rebateRedeemed: Number(o.rebateRedeemed || 0),
   voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: o.voidApprovedBy == null ? null : String(o.voidApprovedBy), voidReason: o.voidReason || null,
   createdAt: o.createdAt, updatedAt: o.updatedAt || o.createdAt,
 });
-const toMember = (m) => ({ _id: m.id, id: m.id, memberNo: m.memberNo, name: m.name, phone: m.phone, creditBalance: Number(m.creditBalance || 0), points: Number(m.points || 0), status: m.status, createdAt: m.createdAt });
+const toMember = (m) => ({ _id: m.id, id: m.id, memberNo: m.memberNo, name: m.name, phone: m.phone, creditBalance: Number(m.creditBalance || 0), points: Number(m.points || 0), rebateBalance: Number(m.rebateBalance || 0), status: m.status, createdAt: m.createdAt });
+// ---- 礼券 / 返利 ----
+const toVoucher = (v) => ({
+  _id: v.id, id: v.id, orgId: v.orgId, storeId: v.storeId, voucherNo: v.voucherNo, code: v.code,
+  faceValue: Number(v.faceValue || 0), balance: Number(v.balance || 0),
+  usedAmount: round2(Number(v.faceValue || 0) - Number(v.balance || 0)),
+  status: v.status,
+  issuedToMemberId: v.issuedToMemberId == null ? null : String(v.issuedToMemberId),
+  issuedToName: v.issuedToName || null, issuedToPhone: v.issuedToPhone || null,
+  soldAmount: Number(v.soldAmount || 0), note: v.note || null,
+  issuedAt: v.issuedAt, expiresAt: v.expiresAt || null,
+  voidedAt: v.voidedAt || null, voidReason: v.voidReason || null,
+  createdBy: v.createdBy == null ? null : String(v.createdBy), createdByName: v.createdByName || null,
+  createdAt: v.createdAt, updatedAt: v.updatedAt || v.createdAt,
+});
+const toVoucherTxn = (t) => ({
+  _id: t.id, id: t.id, voucherId: String(t.voucherId), voucherNo: t.voucherNo, code: t.code,
+  type: t.type, amount: Number(t.amount || 0), balanceAfter: Number(t.balanceAfter || 0),
+  orderId: t.orderId == null ? null : String(t.orderId), orderNo: t.orderNo || null,
+  memberId: t.memberId == null ? null : String(t.memberId), reason: t.reason || null,
+  createdBy: t.createdBy == null ? null : String(t.createdBy), createdByName: t.createdByName || null,
+  createdAt: t.createdAt,
+});
+const toRebate = (r) => ({
+  _id: r.id, id: r.id, memberId: String(r.memberId), memberNo: r.memberNo || null, memberName: r.memberName || null,
+  type: r.type, amount: Number(r.amount || 0), balanceAfter: Number(r.balanceAfter || 0),
+  orderId: r.orderId == null ? null : String(r.orderId), orderNo: r.orderNo || null,
+  orderTotal: Number(r.orderTotal || 0), percent: Number(r.percent || 0),
+  reason: r.reason || null, expiresAt: r.expiresAt || null,
+  createdBy: r.createdBy == null ? null : String(r.createdBy), createdByName: r.createdByName || null,
+  createdAt: r.createdAt,
+});
 const toMovement = (m) => ({ _id: m.id, id: m.id, type: m.type, voucherNo: m.voucherNo, payTo: m.payTo, amount: Number(m.amount || 0), reason: m.reason, method: m.method, createdBy: m.createdBy, createdAt: m.createdAt });
 const toAttendance = (a) => ({ _id: a.id, id: a.id, userId: a.userId, userName: a.userName, action: a.action, code: a.code, time: a.time, note: a.note || '' });
 const toShift = (s) => ({ _id: s.id, id: s.id, cashierId: s.cashierId, openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0), closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0), status: s.status, openedAt: s.openedAt, closedAt: s.closedAt });
@@ -452,7 +533,7 @@ function buildReportDataset() {
       openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0),
       closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0),
     })),
-    members: store.members.map((m) => ({ ...m, points: Number(m.points || 0), creditBalance: Number(m.creditBalance || 0) })),
+    members: store.members.map((m) => ({ ...m, points: Number(m.points || 0), creditBalance: Number(m.creditBalance || 0), rebateBalance: Number(m.rebateBalance || 0) })),
     memberTopups: store.memberTopups.map((t) => ({ ...t, amount: Number(t.amount || 0) })),
     pointsLedger: store.pointsLedger,
     invoices: store.invoices.map((v) => ({ ...v, amount: Number(v.amount || 0), tax: Number(v.tax || 0) })),
@@ -465,6 +546,9 @@ function buildReportDataset() {
     attendance: store.attendance,
     reprintLogs: store.reprintLogs,
     orderTransfers: store.orderTransfers,
+    vouchers: store.vouchers.map(toVoucher),
+    voucherTxns: store.voucherTxns.map(toVoucherTxn),
+    rebates: store.rebates.map(toRebate),
     dayEnds: store.dayEnds.map((d) => ({ ...d, expectedCash: Number(d.expectedCash || 0), countedCash: Number(d.countedCash || 0), difference: Number(d.difference || 0) })),
     settings: getSettings(),
   };
@@ -663,6 +747,7 @@ export function createDevRouter(io) {
       holdLabel: held ? (b.holdLabel || `Hold ${store.orders.filter((x) => x.status === 'hold').length + 1}`) : null,
       heldAt: held ? now() : null, reprintCount: 0,
       createdBy: req.user.id, salesPersonId: b.salesPersonId ? String(b.salesPersonId) : null,
+      memberId: b.memberId ? String(b.memberId) : null, voucherDiscount: 0, rebateRedeemed: 0,
       shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
       createdAt: now(), updatedAt: now(),
     };
@@ -795,16 +880,67 @@ export function createDevRouter(io) {
     o.updatedAt = now();
     res.json(toOrder(o));
   });
+  // 结账前挂/换会员:返利抵扣必须基于订单上的会员,所以允许在 Payment 之前补挂。
+  r.put('/orders/:id/member', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (o.status === 'paid' || o.status === 'void') return res.status(400).json({ error: 'cannot change member on a closed order' });
+    const memberId = req.body.memberId ? String(req.body.memberId) : null;
+    if (memberId && !memberOf(memberId)) return res.status(400).json({ error: 'member not found' });
+    o.memberId = memberId;
+    o.updatedAt = now();
+    res.json(toOrder(o));
+  });
 
   r.post('/orders/:id/checkout', (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status === 'paid' || o.status === 'void') return res.status(400).json({ error: 'already closed' });
+
+    // ---- 先校验所有抵扣（礼券 / 返利），任何一项不通过就整体不落账 ----
+    const voucherInputs = (req.body.vouchers || []).map((x) => ({ code: x.code, amount: round2(x.amount) }));
+    const rebateAmount = round2(req.body.rebateAmount || 0);
+    const resolved = [];
+    let voucherTotal = 0;
+    for (const vi of voucherInputs) {
+      const v = voucherByCode(vi.code);
+      if (!v) return res.status(400).json({ error: `voucher not found: ${vi.code}` });
+      const st = voucherStatus(v);
+      if (st !== 'active') return res.status(400).json({ error: `voucher ${v.code} is ${st}` });
+      if (!(vi.amount > 0)) return res.status(400).json({ error: `voucher ${v.code} amount must be positive` });
+      if (vi.amount > Number(v.balance) + 0.001) return res.status(400).json({ error: `voucher ${v.code} balance insufficient (${round2(v.balance)})` });
+      resolved.push({ v, amount: vi.amount });
+      voucherTotal = round2(voucherTotal + vi.amount);
+    }
+    let rebateMember = null;
+    if (rebateAmount > 0) {
+      rebateMember = o.memberId ? memberOf(o.memberId) : null;
+      if (!rebateMember) return res.status(400).json({ error: 'rebate requires a member on the order' });
+      if (rebateAmount > Number(rebateMember.rebateBalance || 0) + 0.001) return res.status(400).json({ error: `rebate balance insufficient (${round2(rebateMember.rebateBalance)})` });
+    }
+    const discountTotal = round2(voucherTotal + rebateAmount);
+    const dueAfterDiscount = Math.max(0, round2(Number(o.total || 0) - discountTotal));
     const paidSum = (req.body.payments || []).reduce((s, x) => s + Number(x.amount), 0);
-    if (paidSum + Number(req.body.tip || 0) < Number(o.total || 0)) return res.status(400).json({ error: 'amount not covered' });
-    for (const pm of normalizePayments(req.body.payments, Number(o.total || 0))) {
+    if (paidSum + Number(req.body.tip || 0) < dueAfterDiscount) {
+      return res.status(400).json({ error: `amount not covered: due ${dueAfterDiscount}` });
+    }
+
+    // ---- 校验通过，正式落账 ----
+    const appliedVouchers = [];
+    for (const r0 of resolved) {
+      const rr = redeemVoucher(r0.v, r0.amount, { orderId: o.id, orderNo: o.orderNo, memberId: o.memberId, reason: 'redeemed at checkout' }, req.user);
+      if (!rr.ok) return res.status(400).json({ error: rr.error });   // 理论不可达，前面已校验
+      appliedVouchers.push({ code: r0.v.code, voucherNo: r0.v.voucherNo, amount: r0.amount, balanceAfter: r0.v.balance });
+      store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: 'voucher', amount: r0.amount, tip: 0, createdAt: now() });
+    }
+    if (rebateAmount > 0) {
+      pushRebate(rebateMember, 'redeem', rebateAmount, { orderId: o.id, orderNo: o.orderNo, orderTotal: Number(o.total || 0), reason: 'rebate redeemed at checkout' }, req.user);
+      store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: 'rebate', amount: rebateAmount, tip: 0, createdAt: now() });
+    }
+    for (const pm of normalizePayments(req.body.payments, dueAfterDiscount)) {
       store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: pm.method, amount: pm.amount, tip: 0, createdAt: now() });
     }
+    o.voucherDiscount = discountTotal; o.rebateRedeemed = rebateAmount;
     o.status = 'paid'; o.updatedAt = now();
     const s = getSettings();
     if (!o.invoiceNo) {
@@ -822,15 +958,42 @@ export function createDevRouter(io) {
       if (v.stockQty < Number(v.stockThreshold || 0)) low.push({ itemId: v.id, name: v.name, quantity: v.stockQty });
     }
     if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'needs_clean'; t.currentOrderId = null; } }
+
+    // ---- 自动返利：按 settings.rebatePercent 对实付金额计返利（会员单才计） ----
+    let rebateEarned = null;
+    const rebatePct = Number(s.rebatePercent || 0);
+    if (rebatePct > 0 && o.memberId) {
+      const earnMember = memberOf(o.memberId);
+      if (earnMember) {
+        const base = Math.max(0, round2(Number(o.total || 0) - discountTotal));
+        const earn = round2(base * rebatePct / 100);
+        if (earn > 0) {
+          const days = Number(s.rebateExpiryDays || 0);
+          const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : null;
+          const row = pushRebate(earnMember, 'earn', earn, {
+            orderId: o.id, orderNo: o.orderNo, orderTotal: base, percent: rebatePct,
+            reason: `auto rebate ${rebatePct}%`, expiresAt,
+          }, req.user);
+          rebateEarned = toRebate(row);
+        }
+      }
+    }
+
     io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
     if (low.length) io.to(`store:${o.storeId}`).emit('inventory:low', low);
     const payments = store.payments.filter((p) => p.orderId === o.id);
     res.json({
       order: toOrder(o),
+      appliedVouchers,
+      rebateRedeemed: rebateAmount,
+      rebateEarned,
+      dueAfterDiscount,
       receipt: {
         storeName: s.companyName || 'Demo Store', address: s.address || '', phone: s.phone || '', gstNo: s.gstNo || '',
         orderNo: o.orderNo, invoiceNo: o.invoiceNo, items: o.items, subtotal: o.subtotal, discount: o.discount,
         serviceCharge: o.serviceCharge, tax: o.tax, taxRate: s.taxRate, taxInclusive: s.taxInclusive, total: o.total,
+        voucherDiscount: discountTotal, rebateRedeemed: rebateAmount,
+        rebateEarned: rebateEarned ? Number(rebateEarned.amount || 0) : 0,
         payments, footer: s.receiptFooter || '', createdAt: o.createdAt,
       },
     });
@@ -1066,6 +1229,197 @@ export function createDevRouter(io) {
     const discount = p.type === 'percent' ? Math.round(amount * p.value) / 100 : Math.min(p.value, amount);
     res.json({ promotion: toPromotion(p), discount: Math.round(discount * 100) / 100 });
   });
+
+  // ================= 礼券 Gift Voucher =================
+  // 有效状态：过期的自动降级为 expired（惰性计算，不依赖定时任务）
+  const voucherStatus = (v) => {
+    if (v.status === 'void' || v.status === 'used') return v.status;
+    if (v.expiresAt && new Date(v.expiresAt).getTime() < Date.now()) return 'expired';
+    return v.status === 'active' ? 'active' : v.status;
+  };
+  const voucherByCode = (code) => store.vouchers.find((v) => String(v.code).toUpperCase() === String(code || '').trim().toUpperCase());
+  const nextVoucherCode = () => {
+    const prefix = getSettings().voucherPrefix || 'GV';
+    let max = 1000;
+    for (const v of store.vouchers) {
+      const m = String(v.code).match(/(\d+)\s*$/);
+      if (m) max = Math.max(max, Number(m[1]));
+    }
+    return `${prefix}-${max + 1}`;
+  };
+  const pushVoucherTxn = (v, type, amount, balanceAfter, extra = {}, user) => {
+    const row = {
+      id: nid(), orgId: '1', storeId: '1', voucherId: v.id, voucherNo: v.voucherNo, code: v.code,
+      type, amount: round2(amount), balanceAfter: round2(balanceAfter),
+      orderId: extra.orderId || null, orderNo: extra.orderNo || null, memberId: extra.memberId || null,
+      reason: extra.reason || null,
+      createdBy: user ? user.id : null, createdByName: user ? user.name : null, createdAt: now(),
+    };
+    store.voucherTxns.push(row);
+    return row;
+  };
+  // 核销校验 + 落账；返回 { ok, error, voucher, txn }，供 /redeem 与 checkout 复用
+  const redeemVoucher = (v, amount, ctx = {}, user) => {
+    if (!v) return { ok: false, error: 'voucher not found' };
+    const st = voucherStatus(v);
+    if (st === 'void') return { ok: false, error: 'voucher is void' };
+    if (st === 'expired') return { ok: false, error: 'voucher expired' };
+    if (Number(v.balance) <= 0) return { ok: false, error: 'voucher has no balance' };
+    const amt = round2(amount);
+    if (!(amt > 0)) return { ok: false, error: 'amount must be positive' };
+    if (amt > Number(v.balance) + 0.001) return { ok: false, error: `amount exceeds balance ${round2(v.balance)}` };
+    v.balance = round2(Number(v.balance) - amt);
+    if (v.balance <= 0) { v.balance = 0; v.status = 'used'; }
+    v.updatedAt = now();
+    const txn = pushVoucherTxn(v, 'redeem', amt, v.balance, ctx, user);
+    return { ok: true, voucher: v, txn };
+  };
+
+  r.get('/vouchers', (req, res) => {
+    let list = store.vouchers.map(toVoucher);
+    const status = req.query.status;
+    if (status && status !== 'all') list = list.filter((v) => voucherStatus(v) === status);
+    const q = String(req.query.q || '').trim().toLowerCase();
+    if (q) list = list.filter((v) => [v.code, v.voucherNo, v.issuedToName, v.issuedToPhone].some((f) => String(f || '').toLowerCase().includes(q)));
+    if (req.query.memberId) list = list.filter((v) => String(v.issuedToMemberId) === String(req.query.memberId));
+    list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    res.json(list);
+  });
+  // 注意：字面量路由必须排在 /:id 之前
+  r.get('/vouchers/summary', (req, res) => {
+    const all = store.vouchers.map((v) => ({ ...v, effectiveStatus: voucherStatus(v) }));
+    const outstanding = all.filter((v) => v.effectiveStatus === 'active').reduce((s, v) => s + Number(v.balance || 0), 0);
+    const faceIssued = all.reduce((s, v) => s + Number(v.faceValue || 0), 0);
+    const redeemed = all.reduce((s, v) => s + (Number(v.faceValue || 0) - Number(v.balance || 0)), 0);
+    const byStatus = all.reduce((a, v) => { a[v.effectiveStatus] = (a[v.effectiveStatus] || 0) + 1; return a; }, {});
+    res.json({
+      count: all.length, outstandingBalance: round2(outstanding),
+      faceIssued: round2(faceIssued), redeemedTotal: round2(redeemed), byStatus,
+    });
+  });
+  r.get('/vouchers/lookup', (req, res) => {
+    const v = voucherByCode(req.query.code);
+    if (!v) return res.status(404).json({ error: 'voucher not found' });
+    const amount = Number(req.query.amount || 0);
+    const st = voucherStatus(v);
+    res.json({
+      voucher: toVoucher(v), status: st,
+      redeemable: st === 'active' && Number(v.balance) > 0,
+      maxRedeemable: st === 'active' ? round2(v.balance) : 0,
+      suggestedAmount: amount > 0 ? Math.min(round2(amount), round2(v.balance)) : round2(v.balance),
+      recentTxns: store.voucherTxns.filter((t) => t.voucherId === v.id).slice(-5).map(toVoucherTxn),
+    });
+  });
+  r.get('/vouchers/:id', (req, res) => {
+    const v = store.vouchers.find((x) => x.id === req.params.id);
+    if (!v) return res.status(404).json({ error: 'not found' });
+    res.json({ ...toVoucher(v), status: voucherStatus(v), txns: store.voucherTxns.filter((t) => t.voucherId === v.id).map(toVoucherTxn) });
+  });
+  r.get('/vouchers/:id/txns', (req, res) => res.json(store.voucherTxns.filter((t) => t.voucherId === req.params.id).map(toVoucherTxn)));
+  r.post('/vouchers', (req, res) => {
+    const b = req.body || {};
+    const face = round2(b.faceValue);
+    if (!(face > 0)) return res.status(400).json({ error: 'faceValue must be positive' });
+    const code = String(b.code || '').trim() || nextVoucherCode();
+    if (voucherByCode(code)) return res.status(409).json({ error: 'voucher code already exists' });
+    const member = b.issuedToMemberId ? store.members.find((m) => String(m.id) === String(b.issuedToMemberId)) : null;
+    const seq = store.vouchers.length + 1;
+    const v = {
+      id: nid(), orgId: '1', storeId: '1',
+      voucherNo: b.voucherNo || `${getSettings().voucherPrefix || 'GV'}${new Date().toISOString().slice(0, 10).replace(/-/g, '')}${String(seq).padStart(3, '0')}`,
+      code, faceValue: face, balance: b.balance !== undefined ? round2(b.balance) : face,
+      status: 'active',
+      issuedToMemberId: member ? member.id : null,
+      issuedToName: b.issuedToName || (member ? member.name : null),
+      issuedToPhone: b.issuedToPhone || (member ? member.phone : null),
+      soldAmount: b.soldAmount !== undefined ? round2(b.soldAmount) : face,
+      note: b.note || null,
+      issuedAt: now(), expiresAt: b.expiresAt || null, voidedAt: null, voidReason: null,
+      createdBy: req.user.id, createdByName: req.user.name, createdAt: now(), updatedAt: now(),
+    };
+    store.vouchers.push(v);
+    pushVoucherTxn(v, 'issue', v.faceValue, v.balance, { memberId: v.issuedToMemberId, reason: b.note || 'voucher issued' }, req.user);
+    res.status(201).json(toVoucher(v));
+  });
+  r.post('/vouchers/:id/redeem', (req, res) => {
+    const v = store.vouchers.find((x) => x.id === req.params.id);
+    const r0 = redeemVoucher(v, req.body.amount, {
+      orderId: req.body.orderId || null, orderNo: req.body.orderNo || null, reason: req.body.reason || 'redeemed at cashier',
+    }, req.user);
+    if (!r0.ok) return res.status(400).json({ error: r0.error });
+    res.json({ voucher: toVoucher(r0.voucher), txn: toVoucherTxn(r0.txn) });
+  });
+  r.post('/vouchers/:id/void', (req, res) => {
+    const v = store.vouchers.find((x) => x.id === req.params.id);
+    if (!v) return res.status(404).json({ error: 'not found' });
+    if (v.status === 'void') return res.status(400).json({ error: 'already void' });
+    const hadBalance = Number(v.balance || 0);
+    v.status = 'void'; v.voidedAt = now(); v.voidReason = req.body.reason || 'voided by staff';
+    v.balance = 0; v.updatedAt = now();
+    pushVoucherTxn(v, 'void', hadBalance, 0, { reason: v.voidReason }, req.user);
+    res.json(toVoucher(v));
+  });
+
+  // ================= 返利 Rebate =================
+  const memberOf = (id) => store.members.find((m) => String(m.id) === String(id));
+  const pushRebate = (m, type, amount, extra = {}, user) => {
+    const delta = type === 'redeem' ? -Math.abs(round2(amount)) : round2(amount);
+    m.rebateBalance = Math.max(0, round2(Number(m.rebateBalance || 0) + delta));
+    const row = {
+      id: nid(), orgId: '1', storeId: '1', memberId: m.id, memberNo: m.memberNo, memberName: m.name,
+      type, amount: Math.abs(round2(amount)), balanceAfter: m.rebateBalance,
+      orderId: extra.orderId || null, orderNo: extra.orderNo || null,
+      orderTotal: extra.orderTotal || 0, percent: extra.percent || 0,
+      reason: extra.reason || null, expiresAt: extra.expiresAt || null,
+      createdBy: user ? user.id : null, createdByName: user ? user.name : null, createdAt: now(),
+    };
+    store.rebates.push(row);
+    return row;
+  };
+
+  r.get('/rebates', (req, res) => {
+    let list = store.rebates.map(toRebate);
+    if (req.query.memberId) list = list.filter((x) => String(x.memberId) === String(req.query.memberId));
+    if (req.query.type) list = list.filter((x) => x.type === req.query.type);
+    list.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    res.json(list);
+  });
+  r.get('/rebates/summary', (req, res) => {
+    const earned = store.rebates.filter((x) => x.type === 'earn').reduce((s, x) => s + Number(x.amount), 0);
+    const redeemed = store.rebates.filter((x) => x.type === 'redeem').reduce((s, x) => s + Number(x.amount), 0);
+    const outstanding = store.members.reduce((s, m) => s + Number(m.rebateBalance || 0), 0);
+    res.json({
+      earnedTotal: round2(earned), redeemedTotal: round2(redeemed),
+      outstandingBalance: round2(outstanding), entries: store.rebates.length,
+      membersWithRebate: store.members.filter((m) => Number(m.rebateBalance || 0) > 0).length,
+    });
+  });
+  r.post('/rebates', (req, res) => {
+    const b = req.body || {};
+    const m = memberOf(b.memberId);
+    if (!m) return res.status(404).json({ error: 'member not found' });
+    const amt = round2(b.amount);
+    if (!(amt > 0)) return res.status(400).json({ error: 'amount must be positive' });
+    const type = b.type === 'redeem' ? 'redeem' : 'earn';
+    if (type === 'redeem' && amt > Number(m.rebateBalance || 0) + 0.001) return res.status(400).json({ error: 'insufficient rebate balance' });
+    const row = pushRebate(m, type, amt, { reason: b.reason || 'manual adjustment', expiresAt: b.expiresAt || null }, req.user);
+    res.status(201).json({ member: toMember(m), entry: toRebate(row) });
+  });
+  r.post('/members/:id/rebate', (req, res) => {
+    const m = memberOf(req.params.id);
+    if (!m) return res.status(404).json({ error: 'member not found' });
+    const amt = round2(req.body.amount);
+    if (!(amt > 0)) return res.status(400).json({ error: 'amount must be positive' });
+    const type = req.body.type === 'redeem' ? 'redeem' : 'earn';
+    if (type === 'redeem' && amt > Number(m.rebateBalance || 0) + 0.001) return res.status(400).json({ error: 'insufficient rebate balance' });
+    const row = pushRebate(m, type, amt, {
+      orderId: req.body.orderId || null, orderNo: req.body.orderNo || null,
+      reason: req.body.reason || (type === 'earn' ? 'manual rebate' : 'rebate redeemed'),
+    }, req.user);
+    res.json({ member: toMember(m), entry: toRebate(row) });
+  });
+  // 会员返利流水（合并进原有 ledger）
+  r.get('/members/:id/rebate-ledger', (req, res) => res.json(store.rebates.filter((x) => String(x.memberId) === String(req.params.id)).map(toRebate)));
 
   // ---- 客户库存 Customer Stock ----
   r.get('/customer-stock', (req, res) => res.json(store.customerStock.map(toCustomerStock)));

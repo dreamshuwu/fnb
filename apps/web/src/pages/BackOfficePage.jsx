@@ -3,7 +3,8 @@ import { useSearchParams } from 'react-router-dom';
 import { api } from '../api/client.js';
 
 const TABS = [
-  ['promotions', 'Promotion'], ['customer-stock', 'Customer Stock'], ['stock-take', 'Periodical Stock'],
+  ['promotions', 'Promotion'], ['vouchers', 'Gift Voucher'], ['rebates', 'Member Rebate'],
+  ['customer-stock', 'Customer Stock'], ['stock-take', 'Periodical Stock'],
   ['barcode', 'Barcode'], ['gst', 'GST / Store Setup'], ['printers', 'Printers'], ['designer', 'Report Designer'],
 ];
 
@@ -20,6 +21,8 @@ export default function BackOfficePage() {
       <div className="operations-tabs">{TABS.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div>
       <div className="operations-content">
         {active === 'promotions' && <PromotionPanel />}
+        {active === 'vouchers' && <VoucherPanel />}
+        {active === 'rebates' && <RebatePanel />}
         {active === 'customer-stock' && <CustomerStockPanel />}
         {active === 'stock-take' && <StockTakePanel />}
         {active === 'barcode' && <BarcodePanel />}
@@ -58,6 +61,172 @@ function PromotionPanel() {
       {!rows.length && <Empty />}
     </div>
   </Panel>;
+}
+
+function VoucherPanel() {
+  const [rows, setRows] = useState([]); const [members, setMembers] = useState([]);
+  const [summary, setSummary] = useState(null); const [status, setStatus] = useState('all'); const [q, setQ] = useState('');
+  const [detail, setDetail] = useState(null);
+  const [form, setForm] = useState({ code: '', faceValue: '', soldAmount: '', issuedToMemberId: '', issuedToName: '', issuedToPhone: '', expiresAt: '', note: '' });
+  const load = async () => {
+    const qs = new URLSearchParams(); if (status !== 'all') qs.set('status', status); if (q) qs.set('q', q);
+    setRows((await api.get(`/vouchers?${qs}`)).data);
+    setSummary((await api.get('/vouchers/summary')).data);
+    setMembers((await api.get('/members')).data);
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [status]);
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const reset = () => setForm({ code: '', faceValue: '', soldAmount: '', issuedToMemberId: '', issuedToName: '', issuedToPhone: '', expiresAt: '', note: '' });
+  const issue = async () => {
+    const face = Number(form.faceValue || 0);
+    if (!(face > 0)) { alert('面值必须大于 0'); return; }
+    try {
+      await api.post('/vouchers', {
+        code: form.code.trim() || undefined, faceValue: face,
+        soldAmount: form.soldAmount === '' ? face : Number(form.soldAmount),
+        issuedToMemberId: form.issuedToMemberId || undefined,
+        issuedToName: form.issuedToName || undefined, issuedToPhone: form.issuedToPhone || undefined,
+        expiresAt: form.expiresAt || undefined, note: form.note || undefined,
+      });
+      reset(); load();
+    } catch (e) { alert(e.response?.data?.error || '发放失败'); }
+  };
+  const voidVoucher = async (v) => {
+    const reason = prompt(`作废礼券 ${v.code} 的原因:`, 'voided by admin');
+    if (!reason) return;
+    try { await api.post(`/vouchers/${v.id}/void`, { reason }); load(); }
+    catch (e) { alert(e.response?.data?.error || '作废失败'); }
+  };
+  const openDetail = async (v) => setDetail((await api.get(`/vouchers/${v.id}`)).data);
+  return <Panel title="Gift Voucher" subtitle="发放 / 查询 / 核销记录 / 作废 · 余额即未核销负债">
+    {summary && <div className="report-kpis voucher-kpis">
+      <span>Total <b>{summary.count}</b></span>
+      <span>Face Issued <b>{money(summary.faceIssued)}</b></span>
+      <span>Redeemed <b>{money(summary.redeemedTotal)}</b></span>
+      <span>Outstanding <b>{money(summary.outstandingBalance)}</b></span>
+      <span>Active <b>{summary.byStatus?.active || 0}</b> · Expired <b>{summary.byStatus?.expired || 0}</b> · Void <b>{summary.byStatus?.void || 0}</b></span>
+    </div>}
+    <div className="ops-form inline">
+      <Input label="Code (auto if blank)" value={form.code} onChange={(v) => setForm({ ...form, code: v })} placeholder="GV-2001" />
+      <Input label="Face Value" type="number" value={form.faceValue} onChange={(v) => setForm({ ...form, faceValue: v })} />
+      <Input label="Sold Amount" type="number" value={form.soldAmount} onChange={(v) => setForm({ ...form, soldAmount: v })} placeholder="= face" />
+      <label className="ops-field"><span>Issue To Member</span>
+        <select value={form.issuedToMemberId} onChange={(e) => setForm({ ...form, issuedToMemberId: e.target.value })}>
+          <option value="">— walk-in / gift —</option>
+          {members.map((m) => <option key={m.id} value={m.id}>{m.memberNo} · {m.name}</option>)}
+        </select>
+      </label>
+      <Input label="Issued To Name" value={form.issuedToName} onChange={(v) => setForm({ ...form, issuedToName: v })} placeholder="Corp / walk-in" />
+      <Input label="Phone" value={form.issuedToPhone} onChange={(v) => setForm({ ...form, issuedToPhone: v })} />
+      <Input label="Expires" type="date" value={form.expiresAt} onChange={(v) => setForm({ ...form, expiresAt: v })} />
+      <Input label="Note" value={form.note} onChange={(v) => setForm({ ...form, note: v })} />
+      <Action onClick={issue}>Issue Voucher</Action>
+    </div>
+    <div className="ops-form inline">
+      <label className="ops-field"><span>Status</span>
+        <select value={status} onChange={(e) => setStatus(e.target.value)}>
+          <option value="all">All</option><option value="active">Active</option><option value="used">Used</option>
+          <option value="expired">Expired</option><option value="void">Void</option>
+        </select>
+      </label>
+      <Input label="Search" value={q} onChange={setQ} placeholder="code / voucher no / name / phone" />
+      <Action tone="secondary" onClick={load}>Search</Action>
+    </div>
+    <div className="ops-table tall"><div className="ops-row ops-head"><span>Voucher No.</span><span>Code</span><span>Face</span><span>Used</span><span>Balance</span><span>Issued To</span><span>Status</span><span>Expires</span><span>Action</span></div>
+      {rows.map((v) => <div className="ops-row" key={v.id}>
+        <span>{v.voucherNo}</span><span>{v.code}</span><span>{money(v.faceValue)}</span><span>{money(v.usedAmount)}</span>
+        <span><b>{money(v.balance)}</b></span>
+        <span>{v.issuedToName || v.issuedToPhone || '-'}</span>
+        <span className={`voucher-status ${v.status}`}>{v.status}</span>
+        <span>{v.expiresAt ? new Date(v.expiresAt).toLocaleDateString('en-GB') : '-'}</span>
+        <span className="ops-inline-actions">
+          <button className="mini-action" onClick={() => openDetail(v)}>Detail</button>
+          {v.status !== 'void' && <button className="mini-action danger" onClick={() => voidVoucher(v)}>Void</button>}
+        </span>
+      </div>)}
+      {!rows.length && <Empty text="No voucher yet" />}
+    </div>
+    {detail && <div className="voucher-detail">
+      <div className="voucher-detail-head"><b>{detail.voucherNo} · {detail.code}</b><span>面值 {money(detail.faceValue)} · 余额 {money(detail.balance)} · {detail.status}</span><button className="mini-action" onClick={() => setDetail(null)}>Close</button></div>
+      <div className="ops-table"><div className="ops-row ops-head cols-5"><span>When</span><span>Type</span><span>Amount</span><span>Balance After</span><span>Order / Reason</span></div>
+        {(detail.txns || []).map((t) => <div className="ops-row cols-5" key={t.id}><span>{new Date(t.createdAt).toLocaleString('en-GB')}</span><span>{t.type}</span><span>{money(t.amount)}</span><span>{money(t.balanceAfter)}</span><span>{t.orderNo || t.reason || '-'}</span></div>)}
+        {!(detail.txns || []).length && <Empty text="No transaction" />}
+      </div>
+    </div>}
+  </Panel>;
+}
+
+function RebatePanel() {
+  const [members, setMembers] = useState([]); const [summary, setSummary] = useState(null);
+  const [settings, setSettings] = useState(null); const [msg, setMsg] = useState('');
+  const [form, setForm] = useState({ memberId: '', type: 'earn', amount: '', reason: '' });
+  const [ledger, setLedger] = useState(null);
+  const load = async () => {
+    setMembers((await api.get('/members')).data);
+    setSummary((await api.get('/rebates/summary')).data);
+    setSettings((await api.get('/settings')).data);
+  };
+  useEffect(() => { load(); }, []);
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const saveSettings = async () => {
+    const r = await api.put('/settings', { rebatePercent: Number(settings.rebatePercent || 0), rebateExpiryDays: Number(settings.rebateExpiryDays || 0) });
+    setSettings(r.data); setMsg('已保存'); setTimeout(() => setMsg(''), 1500);
+  };
+  const adjust = async () => {
+    if (!form.memberId) { alert('请选择会员'); return; }
+    const amt = Number(form.amount || 0);
+    if (!(amt > 0)) { alert('金额必须大于 0'); return; }
+    try {
+      await api.post(`/members/${form.memberId}/rebate`, { type: form.type, amount: amt, reason: form.reason || undefined });
+      setForm({ ...form, amount: '', reason: '' }); load();
+      if (ledger && String(ledger.member.id) === String(form.memberId)) openLedger(ledger.member);
+    } catch (e) { alert(e.response?.data?.error || '调整失败'); }
+  };
+  const openLedger = async (m) => setLedger({ member: m, rows: (await api.get(`/members/${m.id}/rebate-ledger`)).data });
+  const withRebate = members.filter((m) => Number(m.rebateBalance || 0) !== 0);
+  return <>
+    <Panel title="Member Rebate" subtitle="结账自动返利规则 + 手工调整 + 返利流水">
+      {summary && <div className="report-kpis voucher-kpis">
+        <span>Earned <b>{money(summary.earnedTotal)}</b></span>
+        <span>Redeemed <b>{money(summary.redeemedTotal)}</b></span>
+        <span>Outstanding <b>{money(summary.outstandingBalance)}</b></span>
+        <span>Members <b>{summary.membersWithRebate}</b></span>
+        <span>Entries <b>{summary.entries}</b></span>
+      </div>}
+      {settings && <div className="ops-form inline">
+        <Input label="Auto Rebate %" type="number" value={settings.rebatePercent ?? 0} onChange={(v) => setSettings({ ...settings, rebatePercent: v })} />
+        <Input label="Expiry (days, 0 = never)" type="number" value={settings.rebateExpiryDays ?? 0} onChange={(v) => setSettings({ ...settings, rebateExpiryDays: v })} />
+        <Action onClick={saveSettings}>Save Rules</Action>{msg && <span className="ops-saved">{msg}</span>}
+      </div>}
+      <div className="ops-form inline">
+        <label className="ops-field"><span>Member</span>
+          <select value={form.memberId} onChange={(e) => setForm({ ...form, memberId: e.target.value })}>
+            <option value="">Select member</option>
+            {members.map((m) => <option key={m.id} value={m.id}>{m.memberNo} · {m.name} (可用 {money(m.rebateBalance)})</option>)}
+          </select>
+        </label>
+        <label className="ops-field"><span>Type</span>
+          <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
+            <option value="earn">Earn 增加</option><option value="redeem">Redeem 扣减</option>
+          </select>
+        </label>
+        <Input label="Amount" type="number" value={form.amount} onChange={(v) => setForm({ ...form, amount: v })} />
+        <Input label="Reason" value={form.reason} onChange={(v) => setForm({ ...form, reason: v })} placeholder="goodwill / correction" />
+        <Action onClick={adjust}>Apply Adjustment</Action>
+      </div>
+      <div className="ops-table"><div className="ops-row ops-head cols-5"><span>Member No.</span><span>Name</span><span>Points</span><span>Rebate Balance</span><span>Action</span></div>
+        {members.map((m) => <div className="ops-row cols-5" key={m.id}><span>{m.memberNo}</span><span>{m.name}</span><span>{Number(m.points || 0)}</span><span><b>{money(m.rebateBalance)}</b></span><span className="ops-inline-actions"><button className="mini-action" onClick={() => openLedger(m)}>Ledger</button></span></div>)}
+        {!members.length && <Empty />}
+      </div>
+    </Panel>
+    {ledger && <Panel title={`Rebate Ledger · ${ledger.member.memberNo}`} subtitle={`${ledger.member.name} · 当前余额 ${money(ledger.member.rebateBalance)}`}>
+      <div className="ops-actions"><Action tone="secondary" onClick={() => setLedger(null)}>Close</Action></div>
+      <div className="ops-table tall"><div className="ops-row ops-head"><span>When</span><span>Type</span><span>Amount</span><span>Balance After</span><span>Order</span><span>Rate</span><span>Reason</span><span>By</span></div>
+        {ledger.rows.map((r) => <div className="ops-row" key={r.id}><span>{new Date(r.createdAt).toLocaleString('en-GB')}</span><span>{r.type}</span><span>{money(r.amount)}</span><span>{money(r.balanceAfter)}</span><span>{r.orderNo || '-'}</span><span>{r.percent ? `${r.percent}%` : '-'}</span><span>{r.reason || '-'}</span><span>{r.createdByName || '-'}</span></div>)}
+        {!ledger.rows.length && <Empty text="No rebate entry" />}
+      </div>
+    </Panel>}
+  </>;
 }
 
 function CustomerStockPanel() {

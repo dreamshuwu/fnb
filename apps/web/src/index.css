@@ -201,3 +201,36 @@ body { margin: 0; background: #f4f6fb; }
 .floor-table em { color: inherit; opacity: .65; font-size: 9px; font-style: normal; }
 /* View Current Sales：8 列固定宽度，避免 ORDNUM 挤掉 STIME */
 .current-sales-table .legacy-table-head, .current-sales-table .legacy-table-row { grid-template-columns: 92px minmax(70px, 1fr) minmax(78px, 1fr) 62px 128px 82px 88px 56px; }
+
+/* ---- Payment 礼券 / 返利抵扣区 ---- */
+.payment-amount-box em.payment-due-note { display: block; margin-top: 4px; color: #aebbd6; font-size: 11px; font-style: normal; }
+.payment-deduction-block { margin-bottom: 18px; padding: 14px 15px; border: 1px solid #e6eaf2; border-radius: 12px; background: #fafbfc; }
+.payment-deduction-head { margin-bottom: 10px; color: #66748a; font-size: 11px; font-weight: 700; letter-spacing: .3px; }
+.payment-voucher-add { display: grid; grid-template-columns: 1.5fr 1fr auto; gap: 8px; }
+.payment-voucher-add input { height: 36px; padding: 0 10px; border: 1px solid #e1e6ef; border-radius: 8px; color: #25324a; background: #fff; font-size: 12px; }
+.payment-voucher-add button { height: 36px; padding: 0 16px; }
+.payment-deduction-row { display: flex; align-items: center; gap: 10px; padding: 8px 2px 0; color: #5c6a80; font-size: 12px; }
+.payment-deduction-row span { flex: 1; }
+.payment-deduction-row b { color: #fb6b53; }
+.payment-deduction-row button { flex: 0 0 auto; }
+.payment-rebate-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed #e1e6ef; color: #5c6a80; font-size: 12px; }
+.payment-rebate-row > span { flex: 1; }
+.payment-rebate-row input { width: 110px; height: 34px; padding: 0 10px; border: 1px solid #e1e6ef; border-radius: 8px; color: #25324a; background: #fff; font-size: 12px; }
+.payment-rebate-row small { color: #8b97aa; font-size: 10px; white-space: nowrap; }
+.payment-rebate-row small.payment-rebate-off { color: #b9765f; }
+.payment-denoms button.payment-exact { color: #35bd88; background: #e9f8f2; font-weight: 700; }
+.recall-row.active { border-color: #35bd88; background: #f2fbf7; }
+
+/* ---- 后台礼券 / 返利 ---- */
+.voucher-kpis { display: flex; flex-wrap: wrap; gap: 10px 22px; padding: 12px 15px; margin-bottom: 14px; border: 1px solid #e6eaf2; border-radius: 12px; background: #fafbfc; }
+.voucher-kpis span { color: #8290a3; font-size: 12px; }
+.voucher-kpis b { color: #25324a; }
+.voucher-status { padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; text-align: center; }
+.voucher-status.active { color: #237b5c; background: #e9f8f2; }
+.voucher-status.used { color: #5c6a80; background: #eef2f6; }
+.voucher-status.expired { color: #8a6d18; background: #fff8df; }
+.voucher-status.void { color: #b1452f; background: #fdeceb; }
+.voucher-detail { margin-top: 14px; padding: 14px 15px; border: 1px solid #dbe7f5; border-radius: 13px; background: #f7fbff; }
+.voucher-detail-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; color: #2c5f8a; font-size: 12px; }
+.voucher-detail-head b { font-size: 13px; }
+.voucher-detail-head span { flex: 1; color: #8290a3; }

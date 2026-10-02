@@ -389,6 +389,40 @@ export async function initSchema() {
       created_by INT, created_by_name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (order_id), INDEX (type)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 礼券 Gift Voucher：有面值/余额的预付凭证，可多次部分核销 ----
+    `CREATE TABLE IF NOT EXISTS vouchers (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      voucher_no VARCHAR(64) NOT NULL, code VARCHAR(64) NOT NULL,
+      face_value DECIMAL(12,2) NOT NULL DEFAULT 0, balance DECIMAL(12,2) NOT NULL DEFAULT 0,
+      status VARCHAR(24) NOT NULL DEFAULT 'active',
+      issued_to_member_id INT, issued_to_name VARCHAR(255), issued_to_phone VARCHAR(64),
+      sold_amount DECIMAL(12,2) DEFAULT 0, note VARCHAR(255),
+      issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP NULL,
+      voided_at TIMESTAMP NULL, void_reason VARCHAR(255),
+      created_by INT, created_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), UNIQUE KEY uniq_voucher_code (org_id, store_id, code), INDEX (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS voucher_txns (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      voucher_id INT NOT NULL, voucher_no VARCHAR(64), code VARCHAR(64),
+      type VARCHAR(24) NOT NULL, amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      balance_after DECIMAL(12,2) NOT NULL DEFAULT 0,
+      order_id INT, order_no VARCHAR(64), member_id INT, reason VARCHAR(255),
+      created_by INT, created_by_name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (voucher_id), INDEX (order_id), INDEX (type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 返利 Rebate：会员的返利余额（对店是负债），与积分分开记账 ----
+    `CREATE TABLE IF NOT EXISTS rebates (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      member_id INT NOT NULL, member_no VARCHAR(64), member_name VARCHAR(255),
+      type VARCHAR(24) NOT NULL, amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      balance_after DECIMAL(12,2) NOT NULL DEFAULT 0,
+      order_id INT, order_no VARCHAR(64), order_total DECIMAL(12,2) DEFAULT 0,
+      percent DECIMAL(6,2) DEFAULT 0, reason VARCHAR(255), expires_at TIMESTAMP NULL,
+      created_by INT, created_by_name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (member_id), INDEX (order_id), INDEX (type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
   for (const s of stmts) await query(s);
 
@@ -424,6 +458,17 @@ export async function initSchema() {
     "ALTER TABLE order_transfers ADD COLUMN to_table_no VARCHAR(64)",
     "ALTER TABLE order_transfers ADD COLUMN created_by_name VARCHAR(255)",
     "ALTER TABLE orders ADD COLUMN merged_into_order_id INT",
+    // 礼券 / 返利
+    "ALTER TABLE orders ADD COLUMN voucher_discount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN rebate_redeemed DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN rebate_balance DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE vouchers ADD COLUMN issued_to_phone VARCHAR(64)",
+    "ALTER TABLE vouchers ADD COLUMN sold_amount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE vouchers ADD COLUMN voided_at TIMESTAMP NULL",
+    "ALTER TABLE vouchers ADD COLUMN void_reason VARCHAR(255)",
+    "ALTER TABLE rebates ADD COLUMN order_total DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE rebates ADD COLUMN percent DECIMAL(6,2) DEFAULT 0",
+    "ALTER TABLE rebates ADD COLUMN expires_at TIMESTAMP NULL",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -508,6 +553,12 @@ export const toOrder = (r) => ({
   unsettledAt: dt(r.unsettled_at),
   createdBy: r.created_by == null ? null : String(r.created_by),
   shiftId: r.shift_id == null ? null : String(r.shift_id),
+  // 前端依赖这些字段：销售员 / 会员 / 并台 / 礼券返利抵扣
+  salesPersonId: r.sales_person_id == null ? null : String(r.sales_person_id),
+  memberId: r.member_id == null ? null : String(r.member_id),
+  discountType: r.discount_type || null,
+  mergedIntoOrderId: r.merged_into_order_id == null ? null : String(r.merged_into_order_id),
+  voucherDiscount: Number(r.voucher_discount || 0), rebateRedeemed: Number(r.rebate_redeemed || 0),
   voidRequestedBy: r.void_requested_by == null ? null : String(r.void_requested_by),
   voidApprovedBy: r.void_approved_by == null ? null : String(r.void_approved_by),
   voidReason: r.void_reason,
@@ -540,6 +591,42 @@ export const toShift = (r) => ({
   openAmount: Number(r.open_amount || 0), closeAmount: Number(r.close_amount || 0),
   expectedAmount: Number(r.expected_amount || 0), status: r.status,
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+
+// ---- 礼券 / 返利 ----
+export const toVoucher = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  voucherNo: r.voucher_no, code: r.code,
+  faceValue: Number(r.face_value || 0), balance: Number(r.balance || 0),
+  usedAmount: Math.round((Number(r.face_value || 0) - Number(r.balance || 0)) * 100) / 100,
+  status: r.status,
+  issuedToMemberId: r.issued_to_member_id == null ? null : String(r.issued_to_member_id),
+  issuedToName: r.issued_to_name || null, issuedToPhone: r.issued_to_phone || null,
+  soldAmount: Number(r.sold_amount || 0), note: r.note || null,
+  issuedAt: dt(r.issued_at), expiresAt: dt(r.expires_at),
+  voidedAt: dt(r.voided_at), voidReason: r.void_reason || null,
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+export const toVoucherTxn = (r) => ({
+  _id: r.id, id: r.id,
+  voucherId: String(r.voucher_id), voucherNo: r.voucher_no, code: r.code,
+  type: r.type, amount: Number(r.amount || 0), balanceAfter: Number(r.balance_after || 0),
+  orderId: r.order_id == null ? null : String(r.order_id), orderNo: r.order_no || null,
+  memberId: r.member_id == null ? null : String(r.member_id), reason: r.reason || null,
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null, createdAt: dt(r.created_at),
+});
+export const toRebate = (r) => ({
+  _id: r.id, id: r.id,
+  memberId: String(r.member_id), memberNo: r.member_no || null, memberName: r.member_name || null,
+  type: r.type, amount: Number(r.amount || 0), balanceAfter: Number(r.balance_after || 0),
+  orderId: r.order_id == null ? null : String(r.order_id), orderNo: r.order_no || null,
+  orderTotal: Number(r.order_total || 0), percent: Number(r.percent || 0),
+  reason: r.reason || null, expiresAt: dt(r.expires_at),
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null, createdAt: dt(r.created_at),
 });
 
 // ---- User lookups (used by auth + sockets) ----

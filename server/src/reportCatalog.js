@@ -9,6 +9,7 @@ export const REPORT_CATEGORIES = [
   { key: 'cash', label: 'Cash 现金' },
   { key: 'gst', label: 'GST 税务' },
   { key: 'members', label: 'Members 会员' },
+  { key: 'vouchers', label: 'Vouchers 礼券' },
   { key: 'stock', label: 'Stock 库存' },
   { key: 'purchase', label: 'Purchase 采购' },
   { key: 'staff', label: 'Staff 员工' },
@@ -65,6 +66,13 @@ export const REPORT_CATALOG = [
   { key: 'member_points', label: 'Member Points', category: 'members', desc: '会员积分', columns: [['memberNo', 'Member No.', 'text'], ['name', 'Name', 'text'], ['points', 'Points', 'int'], ['creditBalance', 'Credit', 'money']] },
   { key: 'member_topup', label: 'Member Top Up', category: 'members', desc: '会员充值', columns: [['receiptNo', 'Receipt No.', 'text'], ['memberNo', 'Member No.', 'text'], ['amount', 'Amount', 'money'], ['date', 'Date', 'date']] },
   { key: 'member_ledger', label: 'Member Ledger', category: 'members', desc: '会员积分流水', columns: [['memberNo', 'Member No.', 'text'], ['type', 'Type', 'text'], ['points', 'Points', 'int'], ['date', 'Date', 'date']] },
+  { key: 'rebate_ledger', label: 'Rebate Ledger', category: 'members', desc: '会员返利流水(赚取/抵扣)', columns: [['date', 'Date', 'date'], ['memberNo', 'Member No.', 'text'], ['memberName', 'Name', 'text'], ['type', 'Type', 'text'], ['amount', 'Amount', 'money'], ['balanceAfter', 'Balance', 'money'], ['orderNo', 'Order No.', 'text'], ['percent', 'Rate %', 'int'], ['user', 'By', 'text']] },
+  { key: 'rebate_liability', label: 'Rebate Liability', category: 'members', desc: '会员返利未用余额(负债)', columns: [['memberNo', 'Member No.', 'text'], ['name', 'Name', 'text'], ['phone', 'Phone', 'text'], ['points', 'Points', 'int'], ['rebateBalance', 'Rebate Balance', 'money']] },
+
+  // ---------- Vouchers ----------
+  { key: 'voucher_issued', label: 'Voucher Issued', category: 'vouchers', desc: '礼券发放明细', columns: [['voucherNo', 'Voucher No.', 'text'], ['code', 'Code', 'text'], ['faceValue', 'Face Value', 'money'], ['soldAmount', 'Sold', 'money'], ['issuedTo', 'Issued To', 'text'], ['status', 'Status', 'text'], ['issuedAt', 'Issued', 'date'], ['expiresAt', 'Expires', 'date'], ['user', 'By', 'text']] },
+  { key: 'voucher_redemption', label: 'Voucher Redemption', category: 'vouchers', desc: '礼券核销明细', columns: [['date', 'Date', 'date'], ['voucherNo', 'Voucher No.', 'text'], ['code', 'Code', 'text'], ['orderNo', 'Order No.', 'text'], ['memberNo', 'Member No.', 'text'], ['amount', 'Redeemed', 'money'], ['balanceAfter', 'Balance', 'money'], ['user', 'By', 'text']] },
+  { key: 'voucher_liability', label: 'Voucher Liability', category: 'vouchers', desc: '未核销礼券余额(负债)', columns: [['voucherNo', 'Voucher No.', 'text'], ['code', 'Code', 'text'], ['faceValue', 'Face Value', 'money'], ['usedAmount', 'Used', 'money'], ['balance', 'Balance', 'money'], ['status', 'Status', 'text'], ['issuedTo', 'Issued To', 'text'], ['expiresAt', 'Expires', 'date']] },
 
   // ---------- Stock ----------
   { key: 'stock_report', label: 'Stock Report', category: 'stock', desc: '库存现状', columns: [['code', 'Code', 'text'], ['name', 'Item', 'text'], ['stockQty', 'On Hand', 'int'], ['stockThreshold', 'Threshold', 'int']] },

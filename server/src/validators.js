@@ -87,8 +87,13 @@ export const createOrderSchema = z.object({
 });
 
 export const checkoutSchema = z.object({
+  // 注意：voucher / rebate 故意不放进 method 枚举 —— 抵扣必须走下面的
+  // vouchers[] / rebateAmount，服务端才会真正扣减礼券余额和会员返利余额，
+  // 否则客户端可以伪造一笔"礼券付款"而不核销任何券。
   payments: z.array(z.object({ method: z.enum(['cash', 'card', 'tab', 'cheque', 'credit']), amount: z.number().min(0) })).min(1),
   tip: z.number().optional(),
+  vouchers: z.array(z.object({ code: z.string().min(1), amount: z.number().min(0) })).optional(),
+  rebateAmount: z.number().min(0).optional(),
 });
 
 export const voidSchema = z.object({ reason: z.string().min(1) });

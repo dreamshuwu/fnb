@@ -7,6 +7,13 @@ const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
 const dayKey = (d) => String(d || '').slice(0, 10);
 const monthKey = (d) => String(d || '').slice(0, 7);
 
+/** 礼券的有效状态:过期按 expiresAt 惰性判定,与 /vouchers 接口口径一致。 */
+function voucherEffectiveStatus(v) {
+  if (v.status === 'void' || v.status === 'used') return v.status;
+  if (v.expiresAt && new Date(v.expiresAt).getTime() < Date.now()) return 'expired';
+  return v.status || 'active';
+}
+
 /** 把 from/to(YYYY-MM-DD) 转成闭区间时间范围。 */
 export function rangeBounds(from, to) {
   return {
@@ -53,6 +60,8 @@ const TOTAL_COLUMN = {
   cash_bill: 'amount', payout: 'amount', cash_movement: 'amount', close_shift: 'closeAmount',
   shift_variance: 'difference', gst_summary: 'outputTax', gst_detail: 'total',
   member_list: 'creditBalance', member_points: 'creditBalance', member_topup: 'amount',
+  rebate_ledger: 'amount', rebate_liability: 'rebateBalance',
+  voucher_issued: 'faceValue', voucher_redemption: 'amount', voucher_liability: 'balance',
   stock_valuation: 'value', purchase_summary: 'total', purchase_by_supplier: 'total',
   cashier_performance: 'total', day_end_history: 'countedCash',
 };
@@ -298,6 +307,59 @@ function computeRows(type, ds, inRange, range) {
       return (ds.pointsLedger || []).filter((p) => inRange(p.createdAt))
         .map((p) => ({ memberNo: (byId.get(String(p.memberId)) || {}).memberNo || '-', type: p.reason || p.type || 'adjust', points: Number(p.delta ?? p.points ?? 0), date: p.createdAt }));
     }
+    case 'rebate_ledger':
+      return (ds.rebates || []).filter((r) => inRange(r.createdAt))
+        .map((r) => ({
+          date: r.createdAt,
+          memberNo: r.memberNo || '-',
+          memberName: r.memberName || '-',
+          type: r.type || 'adjust',
+          amount: round2(r.amount),
+          balanceAfter: round2(r.balanceAfter),
+          orderNo: r.orderNo || '-',
+          percent: Number(r.percent || 0),
+          user: r.createdByName || '-',
+        }))
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+    case 'rebate_liability':
+      return (ds.members || []).filter((m) => Number(m.rebateBalance || 0) !== 0)
+        .map((m) => ({ memberNo: m.memberNo, name: m.name, phone: m.phone || '-', points: Number(m.points || 0), rebateBalance: round2(m.rebateBalance) }))
+        .sort((a, b) => b.rebateBalance - a.rebateBalance);
+
+    // ---------------------------------------------------------- Vouchers
+    case 'voucher_issued':
+      return (ds.vouchers || []).filter((v) => inRange(v.issuedAt))
+        .map((v) => ({
+          voucherNo: v.voucherNo, code: v.code,
+          faceValue: round2(v.faceValue), soldAmount: round2(v.soldAmount),
+          issuedTo: v.issuedToName || v.issuedToPhone || '-',
+          status: voucherEffectiveStatus(v),
+          issuedAt: v.issuedAt, expiresAt: v.expiresAt || '-',
+          user: v.createdByName || '-',
+        }))
+        .sort((a, b) => new Date(b.issuedAt) - new Date(a.issuedAt));
+    case 'voucher_redemption': {
+      const memberById = new Map((ds.members || []).map((m) => [String(m.id), m]));
+      return (ds.voucherTxns || []).filter((t) => t.type === 'redeem' && inRange(t.createdAt))
+        .map((t) => ({
+          date: t.createdAt,
+          voucherNo: t.voucherNo || '-', code: t.code || '-', orderNo: t.orderNo || '-',
+          memberNo: (memberById.get(String(t.memberId)) || {}).memberNo || '-',
+          amount: round2(t.amount), balanceAfter: round2(t.balanceAfter),
+          user: t.createdByName || '-',
+        }))
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+    }
+    case 'voucher_liability':
+      return (ds.vouchers || []).filter((v) => voucherEffectiveStatus(v) !== 'void')
+        .map((v) => ({
+          voucherNo: v.voucherNo, code: v.code,
+          faceValue: round2(v.faceValue), usedAmount: round2(v.usedAmount), balance: round2(v.balance),
+          status: voucherEffectiveStatus(v),
+          issuedTo: v.issuedToName || v.issuedToPhone || '-',
+          expiresAt: v.expiresAt || '-',
+        }))
+        .sort((a, b) => b.balance - a.balance);
 
     // ---------------------------------------------------------- Stock
     case 'stock_report':

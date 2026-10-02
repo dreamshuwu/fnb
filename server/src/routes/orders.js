@@ -283,15 +283,74 @@ router.post('/:id/checkout', async (req, res) => {
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (['paid', 'void', 'refunded', 'split'].includes(row.status)) return res.status(400).json({ error: 'already closed' });
+
+  // ---- 先校验所有抵扣（礼券 / 返利），任何一项不通过就整体不落账 ----
+  const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+  const voucherInputs = (p.vouchers || []).map((x) => ({ code: x.code, amount: round2(x.amount) }));
+  const rebateAmount = round2(p.rebateAmount || 0);
+  const resolved = [];
+  let voucherTotal = 0;
+  for (const vi of voucherInputs) {
+    const vr = await getRow('SELECT * FROM vouchers WHERE org_id=? AND store_id=? AND UPPER(code)=UPPER(?)', [orgId, storeId, String(vi.code || '').trim()]);
+    if (!vr) return res.status(400).json({ error: `voucher not found: ${vi.code}` });
+    const vst = (vr.status === 'void' || vr.status === 'used') ? vr.status
+      : (vr.expires_at && new Date(vr.expires_at).getTime() < Date.now()) ? 'expired'
+      : (vr.status === 'active' ? 'active' : vr.status);
+    if (vst !== 'active') return res.status(400).json({ error: `voucher ${vr.code} is ${vst}` });
+    if (!(vi.amount > 0)) return res.status(400).json({ error: `voucher ${vr.code} amount must be positive` });
+    if (vi.amount > Number(vr.balance) + 0.001) return res.status(400).json({ error: `voucher ${vr.code} balance insufficient (${round2(vr.balance)})` });
+    resolved.push({ vr, amount: vi.amount });
+    voucherTotal = round2(voucherTotal + vi.amount);
+  }
+  let rebateMember = null;
+  if (rebateAmount > 0) {
+    if (!row.member_id) return res.status(400).json({ error: 'rebate requires a member on the order' });
+    rebateMember = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [row.member_id, orgId, storeId]);
+    if (!rebateMember) return res.status(400).json({ error: 'member not found' });
+    if (rebateAmount > Number(rebateMember.rebate_balance || 0) + 0.001) return res.status(400).json({ error: `rebate balance insufficient (${round2(rebateMember.rebate_balance)})` });
+  }
+  const discountTotal = round2(voucherTotal + rebateAmount);
+  const dueAfterDiscount = Math.max(0, round2(Number(row.total || 0) - discountTotal));
   const paidSum = p.payments.reduce((s, x) => s + x.amount, 0);
-  if (paidSum + (p.tip || 0) < Number(row.total || 0)) return res.status(400).json({ error: 'amount not covered' });
-  for (const pm of normalizePayments(p.payments, Number(row.total || 0))) {
+  if (paidSum + (p.tip || 0) < dueAfterDiscount) {
+    return res.status(400).json({ error: `amount not covered: due ${dueAfterDiscount}` });
+  }
+
+  // ---- 校验通过，正式落账 ----
+  const appliedVouchers = [];
+  for (const r0 of resolved) {
+    const newBalance = round2(Number(r0.vr.balance) - r0.amount);
+    await query('UPDATE vouchers SET balance=?, status=?, updated_at=NOW() WHERE id=?', [newBalance, newBalance <= 0 ? 'used' : r0.vr.status, r0.vr.id]);
+    await insert(
+      'INSERT INTO voucher_txns (org_id,store_id,voucher_id,voucher_no,code,type,amount,balance_after,order_id,order_no,member_id,reason,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      [orgId, storeId, r0.vr.id, r0.vr.voucher_no, r0.vr.code, 'redeem', r0.amount, newBalance, row.id, row.order_no, row.member_id || null, 'redeemed at checkout', req.user.id, req.user.name || null]
+    );
+    appliedVouchers.push({ code: r0.vr.code, voucherNo: r0.vr.voucher_no, amount: r0.amount, balanceAfter: newBalance });
+    await insert(
+      `INSERT INTO payments (org_id, store_id, order_id, method, amount, tip, created_by) VALUES (?,?,?,?,?,?,?)`,
+      [orgId, storeId, row.id, 'voucher', r0.amount, 0, req.user.id]
+    );
+  }
+  if (rebateAmount > 0) {
+    await query('UPDATE members SET rebate_balance=GREATEST(0, rebate_balance-?) WHERE id=?', [rebateAmount, rebateMember.id]);
+    const after = Number((await getRow('SELECT rebate_balance FROM members WHERE id=?', [rebateMember.id])).rebate_balance);
+    await insert(
+      'INSERT INTO rebates (org_id,store_id,member_id,member_no,member_name,type,amount,balance_after,order_id,order_no,order_total,reason,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      [orgId, storeId, rebateMember.id, rebateMember.member_no, rebateMember.name, 'redeem', rebateAmount, after, row.id, row.order_no, Number(row.total || 0), 'rebate redeemed at checkout', req.user.id, req.user.name || null]
+    );
+    await insert(
+      `INSERT INTO payments (org_id, store_id, order_id, method, amount, tip, created_by) VALUES (?,?,?,?,?,?,?)`,
+      [orgId, storeId, row.id, 'rebate', rebateAmount, 0, req.user.id]
+    );
+  }
+  for (const pm of normalizePayments(p.payments, dueAfterDiscount)) {
     await insert(
       `INSERT INTO payments (org_id, store_id, order_id, method, amount, tip, created_by)
        VALUES (?,?,?,?,?,?,?)`,
       [orgId, storeId, row.id, pm.method, pm.amount, 0, req.user.id]
     );
   }
+  await query('UPDATE orders SET voucher_discount=?, rebate_redeemed=? WHERE id=?', [discountTotal, rebateAmount, row.id]);
   const settings = await loadSettings(orgId, storeId);
   const invCount = await getRow('SELECT COUNT(*) AS c FROM invoices WHERE org_id=? AND store_id=?', [orgId, storeId]);
   const invoiceNo = `${settings.invoicePrefix || 'INV'}-${new Date().getFullYear()}-${String(Number(invCount?.c || 0) + 1).padStart(5, '0')}`;
@@ -300,6 +359,29 @@ router.post('/:id/checkout', async (req, res) => {
   const io = req.app.get('io');
   const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
   await deductInventory(order, req.user, io);
+
+  // ---- 自动返利：按 settings.rebatePercent 对实付金额计返利（会员单才计） ----
+  let rebateEarned = null;
+  const rebatePct = Number(settings.rebatePercent || 0);
+  if (rebatePct > 0 && row.member_id) {
+    const em = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [row.member_id, orgId, storeId]);
+    if (em) {
+      const base = Math.max(0, round2(Number(row.total || 0) - discountTotal));
+      const earn = round2(base * rebatePct / 100);
+      if (earn > 0) {
+        const days = Number(settings.rebateExpiryDays || 0);
+        const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString().slice(0, 19).replace('T', ' ') : null;
+        await query('UPDATE members SET rebate_balance=rebate_balance+? WHERE id=?', [earn, em.id]);
+        const after = Number((await getRow('SELECT rebate_balance FROM members WHERE id=?', [em.id])).rebate_balance);
+        const rid = await insert(
+          'INSERT INTO rebates (org_id,store_id,member_id,member_no,member_name,type,amount,balance_after,order_id,order_no,order_total,percent,reason,expires_at,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          [orgId, storeId, em.id, em.member_no, em.name, 'earn', earn, after, row.id, row.order_no, base, rebatePct, `auto rebate ${rebatePct}%`, expiresAt, req.user.id, req.user.name || null]
+        );
+        rebateEarned = { id: String(rid), memberId: String(em.id), memberNo: em.member_no, amount: earn, balanceAfter: after, percent: rebatePct };
+      }
+    }
+  }
+
   emitToStore(io, storeId, 'order:closed', String(order.id));
   if (order.tableId) {
     await query(
@@ -310,12 +392,18 @@ router.post('/:id/checkout', async (req, res) => {
   const payments = await query('SELECT * FROM payments WHERE order_id=?', [row.id]);
   res.json({
     order,
+    appliedVouchers,
+    rebateRedeemed: rebateAmount,
+    rebateEarned,
+    dueAfterDiscount,
     receipt: {
       storeName: settings.companyName || 'Store',
       address: settings.address || '', phone: settings.phone || '', gstNo: settings.gstNo || '',
       orderNo: order.orderNo, invoiceNo, items: order.items,
       subtotal: order.subtotal, discount: order.discount, serviceCharge: order.serviceCharge,
       tax: order.tax, taxRate: settings.taxRate, taxInclusive: settings.taxInclusive, total: order.total,
+      voucherDiscount: discountTotal, rebateRedeemed: rebateAmount,
+      rebateEarned: rebateEarned ? Number(rebateEarned.amount || 0) : 0,
       payments: payments.map(toPayment), footer: settings.receiptFooter || '', createdAt: order.createdAt,
     },
   });
@@ -424,6 +512,21 @@ router.put('/:id/sales-person', async (req, res) => {
   if (!row) return res.status(404).json({ error: 'not found' });
   const sp = req.body.salesPersonId ? Number(req.body.salesPersonId) : null;
   await query('UPDATE orders SET sales_person_id=?, updated_at=NOW() WHERE id=?', [sp, row.id]);
+  res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
+});
+
+// 结账前挂/换会员:返利抵扣必须基于订单上的会员,所以允许在 Payment 之前补挂。
+router.put('/:id/member', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.status === 'paid' || row.status === 'void') return res.status(400).json({ error: 'cannot change member on a closed order' });
+  const mid = req.body.memberId ? Number(req.body.memberId) : null;
+  if (mid) {
+    const m = await getRow('SELECT id FROM members WHERE id=? AND org_id=? AND store_id=?', [mid, orgId, storeId]);
+    if (!m) return res.status(400).json({ error: 'member not found' });
+  }
+  await query('UPDATE orders SET member_id=?, updated_at=NOW() WHERE id=?', [mid, row.id]);
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 

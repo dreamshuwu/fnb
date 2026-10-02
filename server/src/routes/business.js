@@ -8,7 +8,42 @@ import { buildCsv, buildXlsx, buildPrintHtml } from '../exporters.js';
 const router = Router();
 router.use(authenticate);
 const dt = (v) => v == null ? null : (v instanceof Date ? v.toISOString() : String(v));
-const member = (r) => ({ _id: r.id, id: r.id, memberNo: r.member_no, name: r.name, phone: r.phone, creditBalance: Number(r.credit_balance || 0), points: Number(r.points || 0), status: r.status, createdAt: dt(r.created_at) });
+const member = (r) => ({ _id: r.id, id: r.id, memberNo: r.member_no, name: r.name, phone: r.phone, creditBalance: Number(r.credit_balance || 0), points: Number(r.points || 0), rebateBalance: Number(r.rebate_balance || 0), status: r.status, createdAt: dt(r.created_at) });
+const voucher = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id, voucherNo: r.voucher_no, code: r.code,
+  faceValue: Number(r.face_value || 0), balance: Number(r.balance || 0),
+  usedAmount: round2(Number(r.face_value || 0) - Number(r.balance || 0)), status: r.status,
+  issuedToMemberId: r.issued_to_member_id == null ? null : String(r.issued_to_member_id),
+  issuedToName: r.issued_to_name || null, issuedToPhone: r.issued_to_phone || null,
+  soldAmount: Number(r.sold_amount || 0), note: r.note || null,
+  issuedAt: dt(r.issued_at), expiresAt: dt(r.expires_at),
+  voidedAt: dt(r.voided_at), voidReason: r.void_reason || null,
+  createdBy: r.created_by == null ? null : String(r.created_by), createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+const voucherTxn = (r) => ({
+  _id: r.id, id: r.id, voucherId: String(r.voucher_id), voucherNo: r.voucher_no, code: r.code,
+  type: r.type, amount: Number(r.amount || 0), balanceAfter: Number(r.balance_after || 0),
+  orderId: r.order_id == null ? null : String(r.order_id), orderNo: r.order_no || null,
+  memberId: r.member_id == null ? null : String(r.member_id), reason: r.reason || null,
+  createdBy: r.created_by == null ? null : String(r.created_by), createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at),
+});
+const rebate = (r) => ({
+  _id: r.id, id: r.id, memberId: String(r.member_id), memberNo: r.member_no || null, memberName: r.member_name || null,
+  type: r.type, amount: Number(r.amount || 0), balanceAfter: Number(r.balance_after || 0),
+  orderId: r.order_id == null ? null : String(r.order_id), orderNo: r.order_no || null,
+  orderTotal: Number(r.order_total || 0), percent: Number(r.percent || 0),
+  reason: r.reason || null, expiresAt: dt(r.expires_at),
+  createdBy: r.created_by == null ? null : String(r.created_by), createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at),
+});
+// 过期自动降级（惰性判断，与 devMode 行为一致）
+const voucherStatus = (r) => {
+  if (r.status === 'void' || r.status === 'used') return r.status;
+  if (r.expires_at && new Date(r.expires_at).getTime() < Date.now()) return 'expired';
+  return r.status === 'active' ? 'active' : r.status;
+};
 const movement = (r) => ({ _id: r.id, id: r.id, type: r.type, voucherNo: r.voucher_no, payTo: r.pay_to, amount: Number(r.amount || 0), reason: r.reason, method: r.method, createdBy: r.created_by, createdAt: dt(r.created_at) });
 const attendance = (r) => ({ _id: r.id, id: r.id, userId: r.user_id, userName: r.user_name, action: r.action, code: r.code, note: r.note || '', time: dt(r.event_time) });
 const shift = (r) => ({ _id: r.id, id: r.id, cashierId: r.cashier_id, openAmount: Number(r.open_amount || 0), expectedAmount: Number(r.expected_amount || 0), closeAmount: Number(r.close_amount || 0), difference: Number(r.difference_amount || 0), status: r.status, openedAt: dt(r.created_at), closedAt: dt(r.updated_at) });
@@ -20,6 +55,183 @@ router.put('/members/:id', async (req, res) => { const { orgId, storeId } = tena
 router.post('/members/:id/top-up', async (req, res) => { const { orgId, storeId } = tenant(req); const amount = Number(req.body.amount || 0); const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!m || amount <= 0) return res.status(400).json({ error: 'invalid member or amount' }); await query('UPDATE members SET credit_balance=credit_balance+? WHERE id=?', [amount, m.id]); const id = await insert('INSERT INTO member_topups (org_id,store_id,member_id,receipt_no,amount,created_by) VALUES (?,?,?,?,?,?)', [orgId, storeId, m.id, `TU${Date.now()}`, amount, req.user.id]); res.json({ member: member(await getRow('SELECT * FROM members WHERE id=?', [m.id])), topup: await getRow('SELECT * FROM member_topups WHERE id=?', [id]) }); });
 router.post('/members/:id/points', async (req, res) => { const { orgId, storeId } = tenant(req); const delta = Number(req.body.delta || 0); await query('UPDATE members SET points=GREATEST(0,points+?) WHERE id=? AND org_id=? AND store_id=?', [delta, req.params.id, orgId, storeId]); await insert('INSERT INTO points_ledger (org_id,store_id,member_id,delta,reason,created_by) VALUES (?,?,?,?,?,?)', [orgId, storeId, req.params.id, delta, req.body.reason || 'manual', req.user.id]); res.json(member(await getRow('SELECT * FROM members WHERE id=?', [req.params.id]))); });
 router.post('/members/:id/knock-off', async (req, res) => { const { orgId, storeId } = tenant(req); const amount = Number(req.body.amount || 0); const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!m || amount <= 0 || amount > Number(m.credit_balance)) return res.status(400).json({ error: 'invalid amount' }); await query('UPDATE members SET credit_balance=credit_balance-? WHERE id=?', [amount, m.id]); res.json({ member: member(await getRow('SELECT * FROM members WHERE id=?', [m.id])), knockedOff: amount, receiptNo: `RV${Date.now()}` }); });
+
+// ================= 礼券 Gift Voucher =================
+// 注意：字面量路由必须排在 /:id 之前
+router.get('/vouchers', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT * FROM vouchers WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId]);
+  // 用数据库行的 expires_at 计算生效状态，覆盖 mapper 里的原始 status
+  let list = rows.map((r) => ({ ...voucher(r), status: voucherStatus(r) }));
+  if (req.query.status && req.query.status !== 'all') list = list.filter((v) => v.status === req.query.status);
+  if (req.query.memberId) list = list.filter((v) => String(v.issuedToMemberId) === String(req.query.memberId));
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (q) list = list.filter((v) => [v.code, v.voucherNo, v.issuedToName, v.issuedToPhone].some((f) => String(f || '').toLowerCase().includes(q)));
+  res.json(list);
+});
+router.get('/vouchers/summary', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT * FROM vouchers WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  let outstanding = 0, faceIssued = 0, redeemed = 0;
+  const byStatus = {};
+  for (const r of rows) {
+    const st = voucherStatus(r);
+    byStatus[st] = (byStatus[st] || 0) + 1;
+    faceIssued += Number(r.face_value || 0);
+    redeemed += Number(r.face_value || 0) - Number(r.balance || 0);
+    if (st === 'active') outstanding += Number(r.balance || 0);
+  }
+  res.json({ count: rows.length, outstandingBalance: round2(outstanding), faceIssued: round2(faceIssued), redeemedTotal: round2(redeemed), byStatus });
+});
+router.get('/vouchers/lookup', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const code = String(req.query.code || '').trim();
+  const r = await getRow('SELECT * FROM vouchers WHERE org_id=? AND store_id=? AND UPPER(code)=UPPER(?)', [orgId, storeId, code]);
+  if (!r) return res.status(404).json({ error: 'voucher not found' });
+  const st = voucherStatus(r);
+  const amount = Number(req.query.amount || 0);
+  const txns = await query('SELECT * FROM voucher_txns WHERE voucher_id=? ORDER BY id DESC LIMIT 5', [r.id]);
+  res.json({
+    voucher: { ...voucher(r), status: st }, status: st,
+    redeemable: st === 'active' && Number(r.balance) > 0,
+    maxRedeemable: st === 'active' ? round2(r.balance) : 0,
+    suggestedAmount: amount > 0 ? Math.min(round2(amount), round2(r.balance)) : round2(r.balance),
+    recentTxns: txns.map(voucherTxn).reverse(),
+  });
+});
+router.get('/vouchers/:id', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM vouchers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not found' });
+  const txns = await query('SELECT * FROM voucher_txns WHERE voucher_id=? ORDER BY id', [r.id]);
+  res.json({ ...voucher(r), status: voucherStatus(r), txns: txns.map(voucherTxn) });
+});
+router.get('/vouchers/:id/txns', async (req, res) => {
+  const rows = await query('SELECT * FROM voucher_txns WHERE voucher_id=? ORDER BY id', [req.params.id]);
+  res.json(rows.map(voucherTxn));
+});
+router.post('/vouchers', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const b = req.body || {};
+  const face = round2(b.faceValue);
+  if (!(face > 0)) return res.status(400).json({ error: 'faceValue must be positive' });
+  let code = String(b.code || '').trim();
+  if (!code) {
+    const s = await loadSettings(orgId, storeId);
+    const prefix = s.voucherPrefix || 'GV';
+    const maxRow = await getRow("SELECT MAX(CAST(SUBSTRING_INDEX(code,'-',-1) AS UNSIGNED)) AS mx FROM vouchers WHERE org_id=? AND store_id=?", [orgId, storeId]);
+    code = `${prefix}-${Math.max(1000, Number(maxRow?.mx || 0)) + 1}`;
+  }
+  const dupe = await getRow('SELECT id FROM vouchers WHERE org_id=? AND store_id=? AND UPPER(code)=UPPER(?)', [orgId, storeId, code]);
+  if (dupe) return res.status(409).json({ error: 'voucher code already exists' });
+  const seq = (await getRow('SELECT COUNT(*) AS n FROM vouchers WHERE org_id=? AND store_id=?', [orgId, storeId]))?.n || 0;
+  const voucherNo = b.voucherNo || `${(await loadSettings(orgId, storeId)).voucherPrefix || 'GV'}${new Date().toISOString().slice(0, 10).replace(/-/g, '')}${String(Number(seq) + 1).padStart(3, '0')}`;
+  const id = await insert(
+    'INSERT INTO vouchers (org_id,store_id,voucher_no,code,face_value,balance,status,issued_to_member_id,issued_to_name,issued_to_phone,sold_amount,note,expires_at,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, voucherNo, code, face, b.balance !== undefined ? round2(b.balance) : face, 'active',
+     b.issuedToMemberId || null, b.issuedToName || null, b.issuedToPhone || null,
+     b.soldAmount !== undefined ? round2(b.soldAmount) : face, b.note || null, b.expiresAt || null,
+     req.user.id, req.user.name || null]
+  );
+  const row = await getRow('SELECT * FROM vouchers WHERE id=?', [id]);
+  await insert(
+    'INSERT INTO voucher_txns (org_id,store_id,voucher_id,voucher_no,code,type,amount,balance_after,member_id,reason,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, id, voucherNo, code, 'issue', face, Number(row.balance), b.issuedToMemberId || null, b.note || 'voucher issued', req.user.id, req.user.name || null]
+  );
+  res.status(201).json(voucher(row));
+});
+router.post('/vouchers/:id/redeem', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM vouchers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not found' });
+  const st = voucherStatus(r);
+  if (st === 'void') return res.status(400).json({ error: 'voucher is void' });
+  if (st === 'expired') return res.status(400).json({ error: 'voucher expired' });
+  const amt = round2(req.body.amount);
+  if (!(amt > 0)) return res.status(400).json({ error: 'amount must be positive' });
+  if (amt > Number(r.balance) + 0.001) return res.status(400).json({ error: `amount exceeds balance ${round2(r.balance)}` });
+  const newBalance = round2(Number(r.balance) - amt);
+  const newStatus = newBalance <= 0 ? 'used' : r.status;
+  await query('UPDATE vouchers SET balance=?, status=?, updated_at=NOW() WHERE id=?', [newBalance, newStatus, r.id]);
+  const txnId = await insert(
+    'INSERT INTO voucher_txns (org_id,store_id,voucher_id,voucher_no,code,type,amount,balance_after,order_id,order_no,reason,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, r.id, r.voucher_no, r.code, 'redeem', amt, newBalance, req.body.orderId || null, req.body.orderNo || null, req.body.reason || 'redeemed at cashier', req.user.id, req.user.name || null]
+  );
+  res.json({ voucher: voucher(await getRow('SELECT * FROM vouchers WHERE id=?', [r.id])), txn: voucherTxn(await getRow('SELECT * FROM voucher_txns WHERE id=?', [txnId])) });
+});
+router.post('/vouchers/:id/void', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM vouchers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not found' });
+  if (r.status === 'void') return res.status(400).json({ error: 'already void' });
+  const had = Number(r.balance || 0);
+  const reason = req.body.reason || 'voided by staff';
+  await query("UPDATE vouchers SET status='void', balance=0, voided_at=NOW(), void_reason=?, updated_at=NOW() WHERE id=?", [reason, r.id]);
+  await insert(
+    'INSERT INTO voucher_txns (org_id,store_id,voucher_id,voucher_no,code,type,amount,balance_after,reason,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, r.id, r.voucher_no, r.code, 'void', had, 0, reason, req.user.id, req.user.name || null]
+  );
+  res.json(voucher(await getRow('SELECT * FROM vouchers WHERE id=?', [r.id])));
+});
+
+// ================= 返利 Rebate =================
+router.get('/rebates', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const params = [orgId, storeId];
+  let sql = 'SELECT * FROM rebates WHERE org_id=? AND store_id=?';
+  if (req.query.memberId) { sql += ' AND member_id=?'; params.push(req.query.memberId); }
+  if (req.query.type) { sql += ' AND type=?'; params.push(req.query.type); }
+  sql += ' ORDER BY id DESC LIMIT 500';
+  res.json((await query(sql, params)).map(rebate));
+});
+router.get('/rebates/summary', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT * FROM rebates WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const earned = rows.filter((r) => r.type === 'earn').reduce((s, r) => s + Number(r.amount || 0), 0);
+  const redeemed = rows.filter((r) => r.type === 'redeem').reduce((s, r) => s + Number(r.amount || 0), 0);
+  const bal = await getRow('SELECT COALESCE(SUM(rebate_balance),0) AS total, SUM(CASE WHEN rebate_balance>0 THEN 1 ELSE 0 END) AS n FROM members WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  res.json({ earnedTotal: round2(earned), redeemedTotal: round2(redeemed), outstandingBalance: round2(bal?.total || 0), entries: rows.length, membersWithRebate: Number(bal?.n || 0) });
+});
+router.post('/rebates', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const b = req.body || {};
+  const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [b.memberId, orgId, storeId]);
+  if (!m) return res.status(404).json({ error: 'member not found' });
+  const amt = round2(b.amount);
+  if (!(amt > 0)) return res.status(400).json({ error: 'amount must be positive' });
+  const type = b.type === 'redeem' ? 'redeem' : 'earn';
+  if (type === 'redeem' && amt > Number(m.rebate_balance || 0) + 0.001) return res.status(400).json({ error: 'insufficient rebate balance' });
+  const delta = type === 'redeem' ? -amt : amt;
+  await query('UPDATE members SET rebate_balance=GREATEST(0, rebate_balance+?) WHERE id=?', [delta, m.id]);
+  const after = Number((await getRow('SELECT rebate_balance FROM members WHERE id=?', [m.id])).rebate_balance);
+  const id = await insert(
+    'INSERT INTO rebates (org_id,store_id,member_id,member_no,member_name,type,amount,balance_after,reason,expires_at,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, m.id, m.member_no, m.name, type, amt, after, b.reason || 'manual adjustment', b.expiresAt || null, req.user.id, req.user.name || null]
+  );
+  res.status(201).json({ member: member(await getRow('SELECT * FROM members WHERE id=?', [m.id])), entry: rebate(await getRow('SELECT * FROM rebates WHERE id=?', [id])) });
+});
+router.post('/members/:id/rebate', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!m) return res.status(404).json({ error: 'member not found' });
+  const amt = round2(req.body.amount);
+  if (!(amt > 0)) return res.status(400).json({ error: 'amount must be positive' });
+  const type = req.body.type === 'redeem' ? 'redeem' : 'earn';
+  if (type === 'redeem' && amt > Number(m.rebate_balance || 0) + 0.001) return res.status(400).json({ error: 'insufficient rebate balance' });
+  const delta = type === 'redeem' ? -amt : amt;
+  await query('UPDATE members SET rebate_balance=GREATEST(0, rebate_balance+?) WHERE id=?', [delta, m.id]);
+  const after = Number((await getRow('SELECT rebate_balance FROM members WHERE id=?', [m.id])).rebate_balance);
+  const id = await insert(
+    'INSERT INTO rebates (org_id,store_id,member_id,member_no,member_name,type,amount,balance_after,order_id,order_no,reason,created_by,created_by_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [orgId, storeId, m.id, m.member_no, m.name, type, amt, after, req.body.orderId || null, req.body.orderNo || null,
+     req.body.reason || (type === 'earn' ? 'manual rebate' : 'rebate redeemed'), req.user.id, req.user.name || null]
+  );
+  res.json({ member: member(await getRow('SELECT * FROM members WHERE id=?', [m.id])), entry: rebate(await getRow('SELECT * FROM rebates WHERE id=?', [id])) });
+});
+router.get('/members/:id/rebate-ledger', async (req, res) => {
+  const rows = await query('SELECT * FROM rebates WHERE member_id=? ORDER BY id DESC LIMIT 200', [req.params.id]);
+  res.json(rows.map(rebate));
+});
 
 router.get('/finance/movements', async (req, res) => { const { orgId, storeId } = tenant(req); res.json((await query('SELECT * FROM cash_movements WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map(movement)); });
 router.post('/finance/movements', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO cash_movements (org_id,store_id,type,voucher_no,pay_to,amount,reason,method,created_by) VALUES (?,?,?,?,?,?,?,?,?)', [orgId, storeId, b.type || 'cash_in', b.voucherNo || `V${Date.now()}`, b.payTo || '', Number(b.amount || 0), b.reason || '', b.method || 'cash', req.user.id]); res.status(201).json(movement(await getRow('SELECT * FROM cash_movements WHERE id=?', [id]))); });
@@ -165,7 +377,7 @@ async function buildReportDataset(orgId, storeId) {
   const safe = async (sql, params) => { try { return await query(sql, params); } catch { return []; } };
   const [orders, payments, refunds, unsettles, cashMovements, shifts, members, memberTopups, pointsLedger,
     invoices, creditNotes, variants, categories, customerStock, stockTakes, suppliers, purchaseOrders,
-    attendanceRows, reprintLogs, dayEnds, orderTransfers, settings] = await Promise.all([
+    attendanceRows, reprintLogs, dayEnds, orderTransfers, vouchers, voucherTxns, rebates, settings] = await Promise.all([
     query('SELECT o.*, t.number AS table_no, u.name AS cashier_name, sp.name AS sales_person_name, m.member_no, m.name AS member_name FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by LEFT JOIN users sp ON sp.id=o.sales_person_id LEFT JOIN members m ON m.id=o.member_id WHERE o.org_id=? AND o.store_id=?', [orgId, storeId]),
     query('SELECT * FROM payments WHERE org_id=? AND store_id=?', [orgId, storeId]),
     query('SELECT * FROM refunds WHERE org_id=? AND store_id=?', [orgId, storeId]),
@@ -187,6 +399,9 @@ async function buildReportDataset(orgId, storeId) {
     safe('SELECT * FROM reprint_logs WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM day_ends WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM order_transfers WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM vouchers WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM voucher_txns WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM rebates WHERE org_id=? AND store_id=?', [orgId, storeId]),
     loadSettings(orgId, storeId),
   ]);
 
@@ -220,7 +435,7 @@ async function buildReportDataset(orgId, storeId) {
     unsettles: unsettles.map((u) => ({ ...u, orderNo: u.order_no, createdAt: dt(u.created_at), amount: Number(u.amount || 0) })),
     cashMovements: cashMovements.map((m) => ({ ...m, voucherNo: m.voucher_no, payTo: m.pay_to, createdAt: dt(m.created_at), amount: Number(m.amount || 0) })),
     shifts: shifts.map((s) => ({ id: s.id, openedAt: dt(s.created_at), closedAt: s.status === 'closed' ? dt(s.updated_at) : null, openAmount: Number(s.open_amount || 0), expectedAmount: Number(s.expected_amount || 0), closeAmount: Number(s.close_amount || 0), difference: Number(s.difference_amount || 0), status: s.status })),
-    members: members.map((m) => ({ ...m, memberNo: m.member_no, points: Number(m.points || 0), creditBalance: Number(m.credit_balance || 0) })),
+    members: members.map((m) => ({ ...m, memberNo: m.member_no, points: Number(m.points || 0), creditBalance: Number(m.credit_balance || 0), rebateBalance: Number(m.rebate_balance || 0) })),
     memberTopups: memberTopups.map((t) => ({ ...t, memberId: t.member_id, receiptNo: t.receipt_no, createdAt: dt(t.created_at), amount: Number(t.amount || 0) })),
     pointsLedger: pointsLedger.map((p) => ({ ...p, memberId: p.member_id, createdAt: dt(p.created_at) })),
     invoices: invoices.map((v) => ({ ...v, orderId: v.order_id, invoiceNo: v.invoice_no, createdAt: dt(v.created_at), amount: Number(v.amount || 0), tax: Number(v.tax || 0) })),
@@ -234,6 +449,9 @@ async function buildReportDataset(orgId, storeId) {
     reprintLogs: reprintLogs.map((l) => ({ ...l, orderNo: l.order_no, kind: l.kind, createdAt: dt(l.created_at) })),
     dayEnds: dayEnds.map((d) => ({ date: d.end_date instanceof Date ? d.end_date.toISOString().slice(0, 10) : String(d.end_date).slice(0, 10), expectedCash: Number(d.expected_cash || 0), countedCash: Number(d.counted_cash || 0), difference: Number(d.difference || 0), closedAt: dt(d.created_at) })),
     orderTransfers: orderTransfers.map((t) => ({ ...t, orderNo: t.order_no, fromTableNo: t.from_table_no, toTableNo: t.to_table_no, mergedOrderNos: parseJSON(t.merged_order_nos) || [], amount: Number(t.amount || 0), createdByName: t.created_by_name, createdAt: dt(t.created_at) })),
+    vouchers: vouchers.map((v) => ({ ...v, voucherNo: v.voucher_no, faceValue: Number(v.face_value || 0), balance: Number(v.balance || 0), usedAmount: round2(Number(v.face_value || 0) - Number(v.balance || 0)), issuedToName: v.issued_to_name, issuedToPhone: v.issued_to_phone, soldAmount: Number(v.sold_amount || 0), issuedAt: dt(v.issued_at), expiresAt: v.expires_at ? dt(v.expires_at) : null, createdByName: v.created_by_name })),
+    voucherTxns: voucherTxns.map((t) => ({ ...t, voucherId: t.voucher_id, voucherNo: t.voucher_no, memberId: t.member_id, orderNo: t.order_no, amount: Number(t.amount || 0), balanceAfter: Number(t.balance_after || 0), createdByName: t.created_by_name, createdAt: dt(t.created_at) })),
+    rebates: rebates.map((r) => ({ ...r, memberId: r.member_id, memberNo: r.member_no, memberName: r.member_name, orderNo: r.order_no, amount: Number(r.amount || 0), balanceAfter: Number(r.balance_after || 0), orderTotal: Number(r.order_total || 0), percent: Number(r.percent || 0), createdByName: r.created_by_name, createdAt: dt(r.created_at) })),
     settings,
   };
 }
