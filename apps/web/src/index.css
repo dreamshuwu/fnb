@@ -160,3 +160,11 @@ body { margin: 0; background: #f4f6fb; }
 .dayend-status { align-self: center; padding: 7px 12px; border-radius: 8px; font-size: 11px; font-weight: 750; }.dayend-status.open { color: #8a6d18; background: #fff8df; }.dayend-status.closed { color: #237b5c; background: #e9f8f2; }.dayend-sub { margin: 20px 0 10px; color: #25324a; font-size: 13px; font-weight: 750; }.method-summary .muted { color: #a3adbc; background: #f7f9fc; }
 .cash-recon { border: 1px solid #e7ebf2; border-radius: 11px; overflow: hidden; }.cash-recon > div { display: flex; justify-content: space-between; padding: 9px 13px; border-bottom: 1px solid #eef1f6; color: #7e8ba1; font-size: 12px; }.cash-recon > div:last-child { border-bottom: 0; }.cash-recon > div b { color: #25324a; }.cash-recon > div.total { background: #f7f9fc; }.cash-recon > div.total b { color: #172033; font-size: 15px; }.cash-count { margin-top: 14px; }.cash-diff { margin-top: 10px; padding: 11px 14px; border-radius: 10px; font-size: 13px; font-weight: 750; }.cash-diff.ok { color: #237b5c; background: #e9f8f2; }.cash-diff.over { color: #8a6d18; background: #fff8df; }.cash-diff.short { color: #c84e3d; background: #fff2ed; }
 
+
+/* Report center: date presets, export toolbar, designer */
+.report-presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.report-presets button { padding: 7px 11px; border: 1px solid #e1e6ef; border-radius: 8px; color: #728097; background: #fff; font-size: 11px; font-weight: 700; }
+.report-presets button:hover { color: #fb6b53; border-color: #ffc9bd; }
+.report-presets button.active { color: #fff; border-color: #fb6b53; background: #fb6b53; }
+.report-desc { margin: 0 0 12px; padding: 9px 13px; border-left: 3px solid #fb6b53; border-radius: 0 8px 8px 0; color: #7e8ba1; background: #f7f9fc; font-size: 11px; }
+.ops-field select optgroup { color: #a3adbc; font-weight: 700; }

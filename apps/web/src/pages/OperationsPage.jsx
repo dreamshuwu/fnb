@@ -15,15 +15,7 @@ const REPRINT_TYPES = [
 
 const DOC_KINDS = [['bill', 'Bill'], ['receipt', 'Receipt'], ['order', 'Order Slip'], ['kitchen', 'Kitchen'], ['bar', 'Bar']];
 
-const REPORT_TYPES = [
-  ['sales_by_date', 'Sales By Date'], ['sales_by_product', 'Sales By Product'], ['sales_by_payment', 'Sales By Payment Type'],
-  ['sales_by_hour', 'Sales By Hour'], ['sales_by_cashier', 'Sales By Cashier'], ['sales_by_table', 'Sales By Table'],
-  ['sales_by_department', 'Sales By Department'], ['top_products', 'Top Products'],
-  ['void_report', 'Void / Cancellation'], ['refund_report', 'Refund Report'], ['discount_report', 'Discount Report'],
-  ['stock_report', 'Stock Report'], ['customer_stock', 'Customer Stock'], ['member_points', 'Member Points'],
-  ['knock_off', 'Knock Off'], ['cash_bill', 'Cash Bill'], ['payout', 'Payout / Withdraw'],
-  ['credit_note', 'Credit Note'], ['close_shift', 'Close Shift'], ['gst_summary', 'GST Summary'],
-];
+// 报表类型由后端 /reports/catalog 动态提供(见 ReportPanel),此处不再硬编码。
 
 export default function OperationsPage() {
   const [params, setParams] = useSearchParams();
@@ -390,7 +382,158 @@ function DocumentModal({ doc, kind, onKind, onReprint, onClose }) {
   </section></div>;
 }
 
+// ---------------------------------------------------------------- 报表中心
+// 报表元数据由后端 /reports/catalog 提供,前端不再硬编码;支持日期区间、
+// 三种导出(CSV / Excel / 打印页)与报表设计器(保存/加载模板)。
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
+
+const datePresets = () => {
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const today = new Date();
+  const y = new Date(today); y.setDate(y.getDate() - 1);
+  const d7 = new Date(today); d7.setDate(d7.getDate() - 6);
+  const d30 = new Date(today); d30.setDate(d30.getDate() - 29);
+  const mStart = new Date(today.getFullYear(), today.getMonth(), 1);
+  const lmEnd = new Date(today.getFullYear(), today.getMonth(), 0);
+  const lmStart = new Date(lmEnd.getFullYear(), lmEnd.getMonth(), 1);
+  return [
+    ['Today', iso(today), iso(today)],
+    ['Yesterday', iso(y), iso(y)],
+    ['Last 7 days', iso(d7), iso(today)],
+    ['Last 30 days', iso(d30), iso(today)],
+    ['This month', iso(mStart), iso(today)],
+    ['Last month', iso(lmStart), iso(lmEnd)],
+    ['All time', '', ''],
+  ];
+};
+
+function exportUrl(type, format, from, to) {
+  const qs = new URLSearchParams({ type, format });
+  if (from) qs.set('from', from);
+  if (to) qs.set('to', to);
+  const t = localStorage.getItem('token');
+  if (t) qs.set('token', t);
+  return `${API_BASE}/reports/export?${qs.toString()}`;
+}
+
 function ReportPanel() {
-  const [type, setType] = useState('sales_by_date'); const [report, setReport] = useState(null); const run = async () => setReport((await api.get(`/reports/query?type=${type}`)).data); const columns = report?.rows?.length ? Object.keys(report.rows[0]) : [];
-  return <Panel title="Reports" subtitle="20+ report templates · Sales · Void · Refund · Stock · GST"><div className="ops-form inline"><label className="ops-field"><span>Report Type</span><select value={type} onChange={(e) => setType(e.target.value)}>{REPORT_TYPES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}</select></label><Action onClick={run}>Run Report</Action><Action tone="secondary" onClick={() => window.print()}>Print</Action></div>{report && <div className="report-result"><div className="report-kpis"><span>Total <b>¥{Number(report.total).toFixed(2)}</b></span><span>Rows <b>{report.count}</b></span></div><div className="ops-table"><div className="ops-row ops-head">{columns.map((c) => <span key={c}>{c}</span>)}</div>{report.rows.map((row, i) => <div className="ops-row" key={i}>{columns.map((c) => <span key={c}>{typeof row[c] === 'number' ? Number(row[c]).toFixed(2) : String(row[c] ?? '-')}</span>)}</div>)}{!report.rows.length && <Empty text="No data for this report" />}</div></div>}</Panel>;
+  const [catalog, setCatalog] = useState({ categories: [], reports: [] });
+  const [type, setType] = useState('sales_by_date');
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [report, setReport] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [templates, setTemplates] = useState([]);
+  const [tplName, setTplName] = useState('');
+
+  const loadTemplates = async () => setTemplates((await api.get('/report-templates')).data);
+  useEffect(() => {
+    api.get('/reports/catalog').then((r) => setCatalog(r.data));
+    loadTemplates();
+  }, []);
+
+  const meta = catalog.reports.find((r) => r.key === type);
+  const columns = meta?.columns?.map(([key, label, kind]) => ({ key, label, kind })) || [];
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const qs = new URLSearchParams({ type });
+      if (from) qs.set('from', from);
+      if (to) qs.set('to', to);
+      setReport((await api.get(`/reports/query?${qs.toString()}`)).data);
+    } finally { setBusy(false); }
+  };
+  useEffect(() => { if (catalog.reports.length) run(); /* eslint-disable-next-line */ }, [type, catalog.reports.length]);
+
+  const openExport = (format) => {
+    const url = exportUrl(type, format, from, to);
+    if (format === 'html') window.open(url, '_blank');
+    else window.location.href = url; // 触发浏览器下载
+  };
+  const applyPreset = (f, t) => { setFrom(f); setTo(t); };
+  const saveTemplate = async () => {
+    if (!tplName.trim()) { alert('请填写模板名称'); return; }
+    await api.post('/report-templates', { name: tplName.trim(), type, filters: { from, to }, format: 'xlsx' });
+    setTplName(''); loadTemplates();
+  };
+  const loadTemplate = (t) => { setType(t.type); setFrom(t.filters?.from || ''); setTo(t.filters?.to || ''); };
+  const delTemplate = async (t) => { if (!window.confirm(`删除模板「${t.name}」?`)) return; await api.delete(`/report-templates/${t.id}`); loadTemplates(); };
+
+  const fmtCell = (v, kind) => {
+    if (v == null || v === '') return '-';
+    if (kind === 'money') return `¥${Number(v).toFixed(2)}`;
+    if (kind === 'date') { const d = new Date(v); return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString('en-GB', { hour12: false }); }
+    return String(v);
+  };
+  const colCount = Math.min(columns.length, 9);
+
+  return <>
+    <Panel title="Reports" subtitle={`${catalog.reports.length} 报表模板 · 日期区间 · CSV / Excel / 打印导出`}>
+      <div className="ops-form inline">
+        <label className="ops-field wide"><span>Report</span>
+          <select value={type} onChange={(e) => setType(e.target.value)}>
+            {catalog.categories.map((c) => (
+              <optgroup key={c.key} label={c.label}>
+                {catalog.reports.filter((r) => r.category === c.key).map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        </label>
+        <Input label="From" type="date" value={from} onChange={setFrom} />
+        <Input label="To" type="date" value={to} onChange={setTo} />
+        <Action onClick={run}>Run Report</Action>
+      </div>
+      <div className="report-presets">
+        {datePresets().map(([label, f, t]) => (
+          <button key={label} className={from === f && to === t ? 'active' : ''} onClick={() => applyPreset(f, t)}>{label}</button>
+        ))}
+      </div>
+      <div className="ops-actions">
+        <Action tone="secondary" onClick={() => openExport('csv')}>Export CSV</Action>
+        <Action tone="secondary" onClick={() => openExport('xlsx')}>Export Excel</Action>
+        <Action tone="secondary" onClick={() => openExport('html')}>Print / PDF</Action>
+      </div>
+
+      {meta?.desc && <div className="report-desc">{meta.desc}</div>}
+
+      {report && <div className="report-result">
+        <div className="report-kpis">
+          <span>Rows <b>{report.count}</b></span>
+          <span>Total <b>¥{Number(report.total).toFixed(2)}</b></span>
+          <span>Period <b>{from || to ? `${from || '…'} → ${to || '…'}` : 'All dates'}</b></span>
+        </div>
+        <div className="ops-table tall">
+          <div className={`ops-row ops-head cols-${colCount}`}>{columns.map((c) => <span key={c.key}>{c.label}</span>)}</div>
+          {report.rows.map((row, i) => (
+            <div className={`ops-row cols-${colCount}`} key={i}>
+              {columns.map((c) => <span key={c.key}>{fmtCell(row[c.key], c.kind)}</span>)}
+            </div>
+          ))}
+          {!report.rows.length && <Empty text="No data for this report" />}
+        </div>
+      </div>}
+    </Panel>
+
+    <Panel title="Report Designer" subtitle="把当前报表类型 + 日期区间 + 导出格式存成模板,下次一键复用">
+      <div className="ops-form inline">
+        <Input label="Template Name" value={tplName} onChange={setTplName} placeholder="Daily Sales Snapshot" />
+        <Action onClick={saveTemplate}>Save Template</Action>
+      </div>
+      <div className="ops-table">
+        <div className="ops-row ops-head cols-5"><span>Name</span><span>Report</span><span>Period</span><span>Format</span><span>Action</span></div>
+        {templates.map((t) => <div className="ops-row cols-5" key={t.id}>
+          <span>{t.name}</span>
+          <span>{catalog.reports.find((r) => r.key === t.type)?.label || t.type}</span>
+          <span>{t.filters?.from || t.filters?.to ? `${t.filters.from || '…'} → ${t.filters.to || '…'}` : 'All dates'}</span>
+          <span>{t.format || 'csv'}</span>
+          <span className="ops-inline-actions">
+            <button className="mini-action" onClick={() => loadTemplate(t)}>Load</button>
+            {!t.isSystem && <button className="mini-action danger" onClick={() => delTemplate(t)}>Delete</button>}
+          </span>
+        </div>)}
+        {!templates.length && <Empty text="No saved templates yet" />}
+      </div>
+    </Panel>
+  </>;
 }

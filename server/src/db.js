@@ -87,6 +87,7 @@ export async function initSchema() {
       name VARCHAR(255) NOT NULL,
       color VARCHAR(32),
       sort_order INT,
+      station VARCHAR(32) DEFAULT 'Kitchen',
       is_active TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -189,6 +190,9 @@ export async function initSchema() {
       unsettled_at TIMESTAMP NULL,
       created_by INT,
       shift_id INT,
+      member_id INT,
+      sales_person_id INT,
+      discount_type VARCHAR(64),
       void_requested_by INT,
       void_approved_by INT,
       void_reason TEXT,
@@ -340,6 +344,7 @@ export async function initSchema() {
     `CREATE TABLE IF NOT EXISTS report_templates (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
       type VARCHAR(64), name VARCHAR(255), columns TEXT, is_system TINYINT(1) DEFAULT 0,
+      filters TEXT, sort TEXT, format VARCHAR(16) DEFAULT 'csv',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS printers (
@@ -397,6 +402,14 @@ export async function initSchema() {
     "ALTER TABLE credit_notes ADD COLUMN restock TINYINT(1) DEFAULT 1",
     "ALTER TABLE credit_notes ADD COLUMN posted_at TIMESTAMP NULL",
     "ALTER TABLE orders MODIFY COLUMN status ENUM('open','hold','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open'",
+    // 报表增强:会员/销售员/折扣类型 + 出品部门 + 报表模板筛选条件
+    "ALTER TABLE orders ADD COLUMN member_id INT",
+    "ALTER TABLE orders ADD COLUMN sales_person_id INT",
+    "ALTER TABLE orders ADD COLUMN discount_type VARCHAR(64)",
+    "ALTER TABLE menu_categories ADD COLUMN station VARCHAR(32) DEFAULT 'Kitchen'",
+    "ALTER TABLE report_templates ADD COLUMN filters TEXT",
+    "ALTER TABLE report_templates ADD COLUMN sort TEXT",
+    "ALTER TABLE report_templates ADD COLUMN format VARCHAR(16) DEFAULT 'csv'",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -428,6 +441,7 @@ export const toUser = (r) => ({
 export const toMenuCategory = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id, name: r.name,
   color: r.color || null,
+  station: r.station || 'Kitchen',
   sortOrder: r.sort_order, isActive: !!r.is_active,
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
 });

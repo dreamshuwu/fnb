@@ -16,10 +16,13 @@ export function signTokens(user) {
 }
 
 export async function authenticate(req, res, next) {
+  // 支持 ?token= —— 浏览器直接下载/新窗口打开导出文件时无法带 Authorization 头
   const header = req.headers.authorization;
-  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+  const bearer = header?.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = bearer || (typeof req.query.token === 'string' ? req.query.token : null);
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
     const user = await getUserById(decoded.sub);
     if (!user || !user.isActive) return res.status(401).json({ error: 'unauthorized' });
     req.user = user;

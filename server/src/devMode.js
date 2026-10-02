@@ -4,6 +4,9 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { signTokens, JWT_SECRET } from './middleware/auth.js';
+import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from './reportCatalog.js';
+import { runReport, reportTitle, makeFilter } from './reportEngine.js';
+import { buildCsv, buildXlsx, buildPrintHtml } from './exporters.js';
 
 const store = {
   users: [], categories: [], bases: [], modifiers: [], baseModifiers: [], variants: [],
@@ -27,6 +30,12 @@ const CATS = [
   ['NESCAFE', '#14b8a6', 5], ['OTHER', '#64748b', 6], ['FRESH', '#06b6d4', 7],
   ['CAN DRINK', '#3b82f6', 8], ['BEER', '#d97706', 9],
 ];
+// 出品部门(用于 Sales By Department 报表):水吧 / 零售柜台
+const STATION_BY_CAT = {
+  KOPI: 'Beverage Bar', TEH: 'Beverage Bar', SUSU: 'Beverage Bar', MILO: 'Beverage Bar',
+  NESCAFE: 'Beverage Bar', FRESH: 'Beverage Bar', 'CAN DRINK': 'Beverage Bar', BEER: 'Beverage Bar',
+  OTHER: 'Counter / Retail',
+};
 const DRINK_BASES = [
   ['Kopi', 'KOPI', 3.0], ['Teh', 'TEH', 3.0], ['Susu', 'SUSU', 2.4], ['Milo', 'MILO', 3.8], ['Nescafe', 'NESCAFE', 3.8],
 ];
@@ -58,7 +67,7 @@ function seedDev() {
   const catIds = {};
   for (const [name, color, sort] of CATS) {
     const id = nid();
-    store.categories.push({ id, orgId: '1', storeId: '1', name, color, sortOrder: sort, isActive: true });
+    store.categories.push({ id, orgId: '1', storeId: '1', name, color, sortOrder: sort, isActive: true, station: STATION_BY_CAT[name] || 'Kitchen' });
     catIds[name] = id;
   }
   const baseIds = {};
@@ -197,7 +206,7 @@ const toRefund = (r) => ({ _id: r.id, id: r.id, refundNo: r.refundNo, orderId: S
 const toPromotion = (p) => ({ _id: p.id, id: p.id, code: p.code, name: p.name, type: p.type, value: Number(p.value || 0), minSpend: Number(p.minSpend || 0), validFrom: p.validFrom || null, validUntil: p.validUntil || null, isActive: !!p.isActive, createdAt: p.createdAt });
 const toCustomerStock = (c) => ({ _id: c.id, id: c.id, memberId: String(c.memberId), memberNo: c.memberNo, itemName: c.itemName, qty: Number(c.qty || 0), unit: c.unit || 'pcs', note: c.note || '', createdAt: c.createdAt });
 const toStockTake = (s) => ({ _id: s.id, id: s.id, takeNo: s.takeNo, status: s.status, lines: s.lines || [], createdBy: s.createdBy, createdAt: s.createdAt, postedAt: s.postedAt || null });
-const toReportTemplate = (t) => ({ _id: t.id, id: t.id, type: t.type, name: t.name, columns: t.columns || [], isSystem: !!t.isSystem, createdAt: t.createdAt });
+const toReportTemplate = (t) => ({ _id: t.id, id: t.id, type: t.type, name: t.name, columns: t.columns || [], filters: t.filters || {}, sort: t.sort || null, format: t.format || 'csv', isSystem: !!t.isSystem, createdAt: t.createdAt });
 const toPrinter = (p) => ({ _id: p.id, id: p.id, name: p.name, target: p.target, connection: p.connection, width: Number(p.width || 80), isDefault: !!p.isDefault, isActive: !!p.isActive });
 const toCreditNote = (c) => ({
   _id: c.id, id: c.id, creditNo: c.creditNo, customerName: c.customerName, orderNo: c.orderNo,
@@ -360,10 +369,13 @@ function buildDocument(o, kind = 'bill') {
 }
 
 function devAuthenticate(req, res, next) {
+  // 支持 ?token= —— 浏览器直接下载/新窗口打开导出文件时无法带 Authorization 头
   const h = req.headers.authorization;
-  if (!h?.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+  const bearer = h?.startsWith('Bearer ') ? h.slice(7) : null;
+  const token = bearer || (typeof req.query.token === 'string' ? req.query.token : null);
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
-    const d = jwt.verify(h.slice(7), JWT_SECRET);
+    const d = jwt.verify(token, JWT_SECRET);
     const u = store.users.find((x) => x.id === String(d.sub));
     if (!u || !u.isActive) return res.status(401).json({ error: 'unauthorized' });
     req.user = { id: u.id, orgId: u.orgId, storeId: u.storeId, role: u.role, name: u.name, phone: u.phone };
@@ -371,6 +383,83 @@ function devAuthenticate(req, res, next) {
   } catch {
     res.status(401).json({ error: 'unauthorized' });
   }
+}
+
+// ---------------------------------------------------------------------------
+// 报表数据集:把内存 store 整理成 reportEngine 需要的统一结构。
+// 关键在 enrich —— 订单行项目补上 category / station,订单补上桌号、收银员、会员。
+// ---------------------------------------------------------------------------
+function buildReportDataset() {
+  const userById = (id) => store.users.find((u) => u.id === String(id));
+  const tableById = (id) => store.tables.find((t) => t.id === String(id));
+  const memberById = (id) => store.members.find((m) => m.id === String(id));
+
+  const variantById = new Map(store.variants.map((v) => [String(v.id), v]));
+  const baseById = new Map(store.bases.map((b) => [String(b.id), b]));
+  const catById = new Map(store.categories.map((c) => [String(c.id), c]));
+
+  const decorateItem = (it) => {
+    const v = variantById.get(String(it.variantId || it.itemId));
+    const b = v ? baseById.get(String(v.baseId)) : null;
+    const c = b ? catById.get(String(b.categoryId)) : null;
+    return {
+      ...it,
+      code: it.code || (v ? v.code : ''),
+      name: it.name || (v ? v.name : ''),
+      qty: Number(it.qty || 0),
+      unitPrice: Number(it.unitPrice || 0),
+      amount: Number(it.qty || 0) * Number(it.unitPrice || 0),
+      category: c ? c.name : 'Uncategorised',
+      station: c ? (c.station || 'Kitchen') : 'Kitchen',
+    };
+  };
+
+  const orders = store.orders.map((o) => {
+    const u = userById(o.createdBy);
+    const t = tableById(o.tableId);
+    const m = memberById(o.memberId);
+    return {
+      ...o,
+      items: (o.items || []).map(decorateItem),
+      tableNo: t ? t.number : null,
+      cashierName: u ? u.name : 'Unknown',
+      salesPersonName: (userById(o.salesPersonId) || u || {}).name || 'Unknown',
+      memberNo: m ? m.memberNo : null,
+      memberName: m ? m.name : null,
+      subtotal: Number(o.subtotal || 0),
+      discount: Number(o.discount || 0),
+      serviceCharge: Number(o.serviceCharge || 0),
+      tax: Number(o.tax || 0),
+      total: Number(o.total || 0),
+    };
+  });
+
+  return {
+    orders,
+    payments: store.payments.map((p) => ({ ...p, amount: Number(p.amount || 0) })),
+    refunds: store.refunds.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
+    unsettles: store.unsettles.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
+    cashMovements: store.cashMovements.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
+    shifts: store.shifts.map((s) => ({
+      ...s,
+      openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0),
+      closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0),
+    })),
+    members: store.members.map((m) => ({ ...m, points: Number(m.points || 0), creditBalance: Number(m.creditBalance || 0) })),
+    memberTopups: store.memberTopups.map((t) => ({ ...t, amount: Number(t.amount || 0) })),
+    pointsLedger: store.pointsLedger,
+    invoices: store.invoices.map((v) => ({ ...v, amount: Number(v.amount || 0), tax: Number(v.tax || 0) })),
+    creditNotes: store.creditNotes.map((c) => ({ ...c, total: Number(c.total || 0) })),
+    variants: store.variants.map((v) => ({ ...v, stockQty: Number(v.stockQty || 0), stockThreshold: Number(v.stockThreshold || 0), cost: Number(v.cost || 0) })),
+    customerStock: store.customerStock,
+    stockTakes: store.stockTakes,
+    suppliers: store.suppliers,
+    purchaseOrders: store.purchaseOrders.map((p) => ({ ...p, total: Number(p.total || 0) })),
+    attendance: store.attendance,
+    reprintLogs: store.reprintLogs,
+    dayEnds: store.dayEnds.map((d) => ({ ...d, expectedCash: Number(d.expectedCash || 0), countedCash: Number(d.countedCash || 0), difference: Number(d.difference || 0) })),
+    settings: getSettings(),
+  };
 }
 
 export function createDevRouter(io) {
@@ -926,8 +1015,20 @@ export function createDevRouter(io) {
   r.get('/report-templates', (req, res) => res.json(store.reportTemplates.map(toReportTemplate)));
   r.post('/report-templates', (req, res) => {
     const b = req.body || {};
-    const t = { id: nid(), orgId: '1', storeId: '1', type: b.type || 'custom', name: b.name || 'Custom Report', columns: b.columns || [], isSystem: false, createdAt: now() };
+    const t = {
+      id: nid(), orgId: '1', storeId: '1',
+      type: b.type || 'sales_by_date', name: b.name || 'Custom Report',
+      columns: b.columns || [], filters: b.filters || {}, sort: b.sort || null,
+      format: b.format || 'csv', isSystem: false, createdAt: now(),
+    };
     store.reportTemplates.push(t); res.status(201).json(toReportTemplate(t));
+  });
+  r.put('/report-templates/:id', (req, res) => {
+    const t = store.reportTemplates.find((x) => x.id === req.params.id);
+    if (!t) return res.status(404).json({ error: 'not found' });
+    const b = req.body || {};
+    for (const k of ['type', 'name', 'columns', 'filters', 'sort', 'format']) if (b[k] !== undefined) t[k] = b[k];
+    res.json(toReportTemplate(t));
   });
   r.delete('/report-templates/:id', (req, res) => { store.reportTemplates = store.reportTemplates.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
 
@@ -970,13 +1071,18 @@ export function createDevRouter(io) {
     res.json({ ok: true, job });
   });
 
-  // ---- GST 汇总报表 ----
+  // ---- GST 汇总报表(支持日期区间) ----
   r.get('/reports/gst', (req, res) => {
-    const paid = store.orders.filter((o) => o.status === 'paid' || o.status === 'refunded');
+    const from = req.query.from || null;
+    const to = req.query.to || null;
+    const inRange = makeFilter(from, to);
     const s = getSettings();
-    const outputTax = paid.reduce((sum, o) => sum + Number(o.tax || 0), 0);
-    const refundTax = store.refunds.reduce((sum, r) => sum + Number(r.amount || 0) * (Number(s.taxRate || 0) / (100 + Number(s.taxRate || 0))), 0);
-    res.json({ from: req.query.from || null, to: req.query.to || null, taxRate: s.taxRate, taxInclusive: s.taxInclusive, taxableSales: paid.reduce((sum, o) => sum + Number(o.total || 0), 0), outputTax: Math.round(outputTax * 100) / 100, refundTax: Math.round(refundTax * 100) / 100, netTax: Math.round((outputTax - refundTax) * 100) / 100, invoiceCount: store.invoices.length });
+    const paid = store.orders.filter((o) => (o.status === 'paid' || o.status === 'refunded') && inRange(o.createdAt));
+    const outputTax = round2(paid.reduce((sum, o) => sum + Number(o.tax || 0), 0));
+    const refunded = store.refunds.filter((x) => inRange(x.createdAt)).reduce((sum, r) => sum + Number(r.amount || 0), 0);
+    const rate = Number(s.taxRate || 0);
+    const refundTax = rate ? round2(refunded * (rate / (100 + rate))) : 0;
+    res.json({ from, to, taxRate: s.taxRate, taxInclusive: s.taxInclusive, taxableSales: round2(paid.reduce((sum, o) => sum + Number(o.total || 0), 0)), outputTax, refundTax, netTax: round2(outputTax - refundTax), invoiceCount: store.invoices.filter((v) => inRange(v.createdAt)).length });
   });
 
   // ---- 重打中心：按类型/日期/桌号/收银员检索历史单据 ----
@@ -1194,79 +1300,43 @@ export function createDevRouter(io) {
   r.post('/purchases', (req, res) => { const b = req.body || {}; const p = { id: nid(), poNo: b.poNo || `PO${Date.now()}`, supplierId: b.supplierId || null, items: b.items || [], total: Number(b.total || 0), status: 'open', createdAt: now() }; store.purchaseOrders.unshift(p); res.status(201).json(p); });
   r.post('/purchases/:id/receive', (req, res) => { const p = store.purchaseOrders.find((x) => x.id === req.params.id); if (!p) return res.status(404).json({ error: 'not found' }); p.status = 'received'; p.receivedAt = now(); for (const item of p.items || []) { const inv = store.inventory.find((x) => x.id === String(item.itemId)); if (inv) inv.quantity += Number(item.qty || 0); } res.json(p); });
 
-  // ---- 通用报表查询，供 ReportsPage / 后台使用 ----
+  // ---- 报表目录:前端据此渲染分组下拉与列定义 ----
+  r.get('/reports/catalog', (req, res) => res.json({ categories: REPORT_CATEGORIES, reports: REPORT_CATALOG }));
+
+  // ---- 通用报表查询(统一走 reportEngine,开发预览与生产口径一致) ----
   r.get('/reports/query', (req, res) => {
     const type = req.query.type || 'sales_by_date';
-    const paid = store.orders.filter((o) => o.status === 'paid' || o.status === 'refunded');
-    const s = getSettings();
-    const userById = (id) => store.users.find((u) => u.id === String(id));
-    const tableById = (id) => store.tables.find((t) => t.id === String(id));
-    let rows = [];
-    switch (type) {
-      case 'sales_by_product':
-        rows = Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const k = i.code || i.name; a[k] = a[k] || { code: k, name: i.name, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {}));
-        break;
-      case 'sales_by_payment':
-        rows = Object.entries(store.payments.reduce((a, p) => { a[p.method] = (a[p.method] || 0) + Number(p.amount); return a; }, {})).map(([method, amount]) => ({ method, amount: Math.round(amount * 100) / 100 }));
-        break;
-      case 'sales_by_hour':
-        rows = Object.values(paid.reduce((a, o) => { const h = new Date(o.createdAt).getHours(); const k = `${String(h).padStart(2, '0')}:00`; a[k] = a[k] || { hour: k, orders: 0, total: 0 }; a[k].orders++; a[k].total += Number(o.total); return a; }, {})).sort((x, y) => x.hour.localeCompare(y.hour));
-        break;
-      case 'sales_by_cashier':
-        rows = Object.values(paid.reduce((a, o) => { const u = userById(o.createdBy); const k = u ? u.name : String(o.createdBy); a[k] = a[k] || { cashier: k, orders: 0, total: 0 }; a[k].orders++; a[k].total += Number(o.total); return a; }, {}));
-        break;
-      case 'sales_by_table':
-        rows = Object.values(paid.reduce((a, o) => { const t = tableById(o.tableId); const k = t ? t.number : (o.type === 'takeaway' ? 'Takeaway' : 'Walk-in'); a[k] = a[k] || { table: k, orders: 0, total: 0 }; a[k].orders++; a[k].total += Number(o.total); return a; }, {}));
-        break;
-      case 'sales_by_department':
-        rows = Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const v = store.variants.find((x) => x.id === String(i.variantId || i.itemId)); const b = v && store.bases.find((x) => x.id === String(v.baseId)); const c = b && store.categories.find((x) => x.id === String(b.categoryId)); const k = c ? c.name : 'Other'; a[k] = a[k] || { department: k, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {}));
-        break;
-      case 'void_report':
-        rows = store.orders.filter((o) => o.status === 'void' || o.status === 'void_pending').map((o) => ({ orderNo: o.orderNo, date: o.createdAt, reason: o.voidReason || '', status: o.status, total: Number(o.total || 0) }));
-        break;
-      case 'refund_report':
-        rows = store.refunds.map((r) => ({ refundNo: r.refundNo, orderNo: r.orderNo, date: r.createdAt, amount: Number(r.amount || 0), method: r.method, reason: r.reason }));
-        break;
-      case 'discount_report':
-        rows = paid.filter((o) => Number(o.discount || 0) > 0).map((o) => ({ orderNo: o.orderNo, date: o.createdAt, subtotal: Number(o.subtotal), discount: Number(o.discount), total: Number(o.total) }));
-        break;
-      case 'stock_report':
-        rows = store.variants.map((v) => ({ name: v.name, code: v.code, stockQty: Number(v.stockQty || 0), stockThreshold: Number(v.stockThreshold || 0) }));
-        break;
-      case 'customer_stock':
-        rows = store.customerStock.map((c) => ({ memberNo: c.memberNo, itemName: c.itemName, qty: Number(c.qty), unit: c.unit }));
-        break;
-      case 'member_points':
-        rows = store.members.map((m) => ({ memberNo: m.memberNo, name: m.name, points: Number(m.points), creditBalance: Number(m.creditBalance) }));
-        break;
-      case 'knock_off':
-        rows = store.memberTopups.map((t) => { const m = store.members.find((x) => x.id === String(t.memberId)); return { receiptNo: t.receiptNo, memberNo: m ? m.memberNo : '', amount: Number(t.amount), date: t.createdAt }; });
-        break;
-      case 'cash_bill':
-        rows = store.payments.map((p) => ({ orderNo: (store.orders.find((o) => o.id === String(p.orderId)) || {}).orderNo || '', method: p.method, amount: Number(p.amount), date: p.createdAt }));
-        break;
-      case 'payout':
-        rows = store.cashMovements.filter((m) => m.type === 'payout' || m.type === 'withdraw').map((m) => ({ voucherNo: m.voucherNo, payTo: m.payTo, amount: Number(m.amount), reason: m.reason, date: m.createdAt }));
-        break;
-      case 'credit_note':
-        rows = store.creditNotes.map((c) => ({ creditNo: c.creditNo, customerName: c.customerName, orderNo: c.orderNo, reason: c.reason, gst: !!c.gst }));
-        break;
-      case 'top_products':
-        rows = Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const k = i.code || i.name; a[k] = a[k] || { code: k, name: i.name, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {})).sort((x, y) => y.qty - x.qty).slice(0, 10);
-        break;
-      case 'close_shift':
-        rows = store.shifts.map((sh) => ({ shiftId: sh.id, openedAt: sh.openedAt, closedAt: sh.closedAt, openAmount: Number(sh.openAmount), expectedAmount: Number(sh.expectedAmount), closeAmount: Number(sh.closeAmount), difference: Number(sh.difference), status: sh.status }));
-        break;
-      case 'gst_summary': {
-        const outputTax = paid.reduce((sum, o) => sum + Number(o.tax || 0), 0);
-        rows = [{ taxableSales: Math.round(paid.reduce((sum, o) => sum + Number(o.total || 0), 0) * 100) / 100, taxRate: s.taxRate, outputTax: Math.round(outputTax * 100) / 100, invoices: store.invoices.length }];
-        break;
-      }
-      default:
-        rows = paid.map((o) => ({ orderNo: o.orderNo, date: o.createdAt, subtotal: Number(o.subtotal), discount: Number(o.discount), tax: Number(o.tax), total: Number(o.total), status: o.status }));
+    res.json(runReport(type, buildReportDataset(), { from: req.query.from, to: req.query.to }));
+  });
+
+  // ---- 报表导出:CSV / Excel(xlsx) / 打印页(浏览器另存为 PDF) ----
+  r.get('/reports/export', (req, res) => {
+    const type = req.query.type || 'sales_by_date';
+    const format = String(req.query.format || 'csv').toLowerCase();
+    const from = req.query.from || null;
+    const to = req.query.to || null;
+    const ds = buildReportDataset();
+    const result = runReport(type, ds, { from, to });
+    const columns = reportColumns(type, result.rows);
+    const title = reportTitle(type);
+    const rangeLabel = from || to ? `${from || '...'} → ${to || '...'}` : 'All dates';
+    const meta = [['Report', title], ['Period', rangeLabel], ['Store', ds.settings.companyName || '-'], ['Rows', result.rows.length]];
+    const fileBase = `${type}_${new Date().toISOString().slice(0, 10)}`;
+
+    if (format === 'xlsx' || format === 'excel') {
+      const buf = buildXlsx(title, columns, result.rows, { title, subtitle: rangeLabel });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.xlsx"`);
+      return res.end(buf);
     }
-    const total = type === 'refund_report' ? store.refunds.reduce((x, r) => x + Number(r.amount || 0), 0) : paid.reduce((x, o) => x + Number(o.total || 0), 0);
-    res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, total: Math.round(total * 100) / 100, count: rows.length });
+    if (format === 'html' || format === 'pdf') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.end(buildPrintHtml({ title, subtitle: `${rangeLabel} · ${ds.settings.companyName || ''}`, columns, rows: result.rows, meta }));
+    }
+    const csv = buildCsv(columns, result.rows, { Report: title, Period: rangeLabel, Store: ds.settings.companyName || '' });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
+    res.end(csv);
   });
 
   return r;

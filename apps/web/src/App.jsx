@@ -8,7 +8,6 @@ import KDSPage from './pages/KDSPage.jsx';
 import MenuPage from './pages/MenuPage.jsx';
 import TablesPage from './pages/TablesPage.jsx';
 import InventoryPage from './pages/InventoryPage.jsx';
-import ReportsPage from './pages/ReportsPage.jsx';
 import OperationsPage from './pages/OperationsPage.jsx';
 import BackOfficePage from './pages/BackOfficePage.jsx';
 
@@ -71,14 +70,7 @@ export default function App() {
             </Require>
           }
         />
-        <Route
-          path="reports"
-          element={
-            <Require role={['admin', 'manager']}>
-              <ReportsPage />
-            </Require>
-          }
-        />
+        <Route path="reports" element={<Require role={['admin', 'manager']}><Navigate to="/operations?tab=reports" replace /></Require>} />
       </Route>
       <Route path="*" element={<Navigate to="/" />} />
     </Routes>

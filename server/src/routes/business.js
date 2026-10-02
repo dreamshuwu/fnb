@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { query, getRow, insert, stringifyJSON, parseJSON } from '../db.js';
 import { authenticate, tenant } from '../middleware/auth.js';
+import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from '../reportCatalog.js';
+import { runReport, reportTitle, makeFilter } from '../reportEngine.js';
+import { buildCsv, buildXlsx, buildPrintHtml } from '../exporters.js';
 
 const router = Router();
 router.use(authenticate);
@@ -152,7 +155,125 @@ router.get('/purchases', async (req, res) => { const { orgId, storeId } = tenant
 router.post('/purchases', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO purchase_orders (org_id,store_id,po_no,supplier_id,items,total) VALUES (?,?,?,?,?,?)', [orgId, storeId, b.poNo || `PO${Date.now()}`, b.supplierId || null, stringifyJSON(b.items || []), Number(b.total || 0)]); res.status(201).json(await getRow('SELECT * FROM purchase_orders WHERE id=?', [id])); });
 router.post('/purchases/:id/receive', async (req, res) => { const { orgId, storeId } = tenant(req); const p = await getRow('SELECT * FROM purchase_orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!p) return res.status(404).json({ error: 'not found' }); const items = parseJSON(p.items); for (const item of items) await query('UPDATE inventory_items SET quantity=quantity+? WHERE id=? AND org_id=? AND store_id=?', [Number(item.qty || 0), Number(item.itemId), orgId, storeId]); await query('UPDATE purchase_orders SET status="received",received_at=NOW() WHERE id=?', [p.id]); res.json(await getRow('SELECT * FROM purchase_orders WHERE id=?', [p.id])); });
 
-router.get('/reports/query', async (req, res) => { const { orgId, storeId } = tenant(req); const type = req.query.type || 'sales_by_date'; const paid = await query('SELECT order_no AS orderNo,created_at AS date,subtotal,discount,tax,total,status FROM orders WHERE org_id=? AND store_id=? AND status="paid" ORDER BY created_at DESC', [orgId, storeId]); let rows = paid; if (type === 'sales_by_payment') rows = await query('SELECT method,SUM(amount) AS amount FROM payments WHERE org_id=? AND store_id=? GROUP BY method', [orgId, storeId]); res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, total: paid.reduce((s, o) => s + Number(o.total || 0), 0), count: paid.length }); });
+// ===========================================================================
+// 报表中心:目录 / 查询 / 导出
+// 与 devMode 共用 reportEngine + reportCatalog,保证两种后端报表口径完全一致。
+// ===========================================================================
+
+/** 把 MySQL 数据整理成 reportEngine 的统一 dataset。 */
+async function buildReportDataset(orgId, storeId) {
+  const safe = async (sql, params) => { try { return await query(sql, params); } catch { return []; } };
+  const [orders, payments, refunds, unsettles, cashMovements, shifts, members, memberTopups, pointsLedger,
+    invoices, creditNotes, variants, categories, customerStock, stockTakes, suppliers, purchaseOrders,
+    attendanceRows, reprintLogs, dayEnds, settings] = await Promise.all([
+    query('SELECT o.*, t.number AS table_no, u.name AS cashier_name, sp.name AS sales_person_name, m.member_no, m.name AS member_name FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by LEFT JOIN users sp ON sp.id=o.sales_person_id LEFT JOIN members m ON m.id=o.member_id WHERE o.org_id=? AND o.store_id=?', [orgId, storeId]),
+    query('SELECT * FROM payments WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM refunds WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM unsettles WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM cash_movements WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM shifts WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM members WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM member_topups WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM points_ledger WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM invoices WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM credit_notes WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT v.*, c.name AS category_name, c.station AS station FROM menu_variants v LEFT JOIN menu_bases b ON b.id=v.base_id LEFT JOIN menu_categories c ON c.id=b.category_id WHERE v.org_id=? AND v.store_id=?', [orgId, storeId]),
+    query('SELECT * FROM menu_categories WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM customer_stock WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM stock_takes WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM suppliers WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM purchase_orders WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM attendance WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM reprint_logs WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM day_ends WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    loadSettings(orgId, storeId),
+  ]);
+
+  const variantById = new Map(variants.map((v) => [String(v.id), v]));
+  const decorate = (it) => {
+    const v = variantById.get(String(it.variantId || it.itemId));
+    const qty = Number(it.qty || 0);
+    const unitPrice = Number(it.unitPrice || 0);
+    return {
+      ...it, qty, unitPrice,
+      code: it.code || (v ? v.code : ''),
+      name: it.name || (v ? v.name : ''),
+      amount: qty * unitPrice,
+      category: (v && v.category_name) || 'Uncategorised',
+      station: (v && v.station) || 'Kitchen',
+    };
+  };
+
+  return {
+    orders: orders.map((o) => ({
+      id: o.id, orderNo: o.order_no, createdAt: dt(o.created_at), status: o.status, type: o.type,
+      tableNo: o.table_no, cashierName: o.cashier_name || 'Unknown', salesPersonName: o.sales_person_name || o.cashier_name || 'Unknown',
+      memberNo: o.member_no || null, memberName: o.member_name || null,
+      discountType: o.discount_type || null, voidReason: o.void_reason || null,
+      items: parseJSON(o.items).map(decorate),
+      subtotal: Number(o.subtotal || 0), discount: Number(o.discount || 0),
+      serviceCharge: Number(o.service_charge || 0), tax: Number(o.tax || 0), total: Number(o.total || 0),
+    })),
+    payments: payments.map((p) => ({ ...p, orderId: p.order_id, createdAt: dt(p.created_at), amount: Number(p.amount || 0) })),
+    refunds: refunds.map((r) => ({ ...r, refundNo: r.refund_no, orderNo: r.order_no, createdAt: dt(r.created_at), amount: Number(r.amount || 0), reason: r.reason || '' })),
+    unsettles: unsettles.map((u) => ({ ...u, orderNo: u.order_no, createdAt: dt(u.created_at), amount: Number(u.amount || 0) })),
+    cashMovements: cashMovements.map((m) => ({ ...m, voucherNo: m.voucher_no, payTo: m.pay_to, createdAt: dt(m.created_at), amount: Number(m.amount || 0) })),
+    shifts: shifts.map((s) => ({ id: s.id, openedAt: dt(s.created_at), closedAt: s.status === 'closed' ? dt(s.updated_at) : null, openAmount: Number(s.open_amount || 0), expectedAmount: Number(s.expected_amount || 0), closeAmount: Number(s.close_amount || 0), difference: Number(s.difference_amount || 0), status: s.status })),
+    members: members.map((m) => ({ ...m, memberNo: m.member_no, points: Number(m.points || 0), creditBalance: Number(m.credit_balance || 0) })),
+    memberTopups: memberTopups.map((t) => ({ ...t, memberId: t.member_id, receiptNo: t.receipt_no, createdAt: dt(t.created_at), amount: Number(t.amount || 0) })),
+    pointsLedger: pointsLedger.map((p) => ({ ...p, memberId: p.member_id, createdAt: dt(p.created_at) })),
+    invoices: invoices.map((v) => ({ ...v, orderId: v.order_id, invoiceNo: v.invoice_no, createdAt: dt(v.created_at), amount: Number(v.amount || 0), tax: Number(v.tax || 0) })),
+    creditNotes: creditNotes.map((c) => ({ ...c, creditNo: c.credit_no, customerName: c.customer_name, orderNo: c.order_no, status: c.status, createdAt: dt(c.created_at), total: Number(c.total || 0), items: parseJSON(c.items) })),
+    variants: variants.map((v) => ({ ...v, stockQty: Number(v.stock_qty || 0), stockThreshold: Number(v.stock_threshold || 0), cost: Number(v.cost || 0), price: Number(v.price || 0) })),
+    customerStock: customerStock.map((c) => ({ ...c, memberNo: c.member_no, itemName: c.item_name, qty: Number(c.qty || 0) })),
+    stockTakes: stockTakes.map((s) => ({ ...s, takeNo: s.take_no, createdAt: dt(s.created_at), lines: parseJSON(s.lines) })),
+    suppliers: suppliers.map((s) => ({ ...s, id: s.id })),
+    purchaseOrders: purchaseOrders.map((p) => ({ ...p, poNo: p.po_no, supplierId: p.supplier_id, createdAt: dt(p.created_at), total: Number(p.total || 0) })),
+    attendance: attendanceRows.map((a) => ({ ...a, userName: a.user_name, time: dt(a.event_time || a.created_at) })),
+    reprintLogs: reprintLogs.map((l) => ({ ...l, orderNo: l.order_no, kind: l.kind, createdAt: dt(l.created_at) })),
+    dayEnds: dayEnds.map((d) => ({ date: d.end_date instanceof Date ? d.end_date.toISOString().slice(0, 10) : String(d.end_date).slice(0, 10), expectedCash: Number(d.expected_cash || 0), countedCash: Number(d.counted_cash || 0), difference: Number(d.difference || 0), closedAt: dt(d.created_at) })),
+    settings,
+  };
+}
+
+router.get('/reports/catalog', (req, res) => res.json({ categories: REPORT_CATEGORIES, reports: REPORT_CATALOG }));
+
+router.get('/reports/query', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const ds = await buildReportDataset(orgId, storeId);
+  res.json(runReport(req.query.type || 'sales_by_date', ds, { from: req.query.from, to: req.query.to }));
+});
+
+router.get('/reports/export', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const type = req.query.type || 'sales_by_date';
+  const format = String(req.query.format || 'csv').toLowerCase();
+  const from = req.query.from || null;
+  const to = req.query.to || null;
+  const ds = await buildReportDataset(orgId, storeId);
+  const result = runReport(type, ds, { from, to });
+  const columns = reportColumns(type, result.rows);
+  const title = reportTitle(type);
+  const rangeLabel = from || to ? `${from || '...'} → ${to || '...'}` : 'All dates';
+  const meta = [['Report', title], ['Period', rangeLabel], ['Store', ds.settings.companyName || '-'], ['Rows', result.rows.length]];
+  const fileBase = `${type}_${new Date().toISOString().slice(0, 10)}`;
+
+  if (format === 'xlsx' || format === 'excel') {
+    const buf = buildXlsx(title, columns, result.rows, { title, subtitle: rangeLabel });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.xlsx"`);
+    return res.end(buf);
+  }
+  if (format === 'html' || format === 'pdf') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.end(buildPrintHtml({ title, subtitle: `${rangeLabel} · ${ds.settings.companyName || ''}`, columns, rows: result.rows, meta }));
+  }
+  const csv = buildCsv(columns, result.rows, { Report: title, Period: rangeLabel, Store: ds.settings.companyName || '' });
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
+  res.end(csv);
+});
+
 
 // ---- 门店设置 / GST ----
 router.get('/settings', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT setting_key,setting_value FROM app_settings WHERE org_id=? AND store_id=?', [orgId, storeId]); const o = {}; for (const r of rows) { try { o[r.setting_key] = JSON.parse(r.setting_value); } catch { o[r.setting_key] = r.setting_value; } } res.json(o); });
@@ -188,8 +309,15 @@ router.put('/stock-takes/:id', async (req, res) => { const { orgId, storeId } = 
 router.post('/stock-takes/:id/post', async (req, res) => { const { orgId, storeId } = tenant(req); const st = await getRow('SELECT * FROM stock_takes WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!st) return res.status(404).json({ error: 'not found' }); if (st.status !== 'draft') return res.status(400).json({ error: 'already posted' }); for (const line of parseJSON(st.lines)) { if (line.countedQty == null) continue; await query('UPDATE menu_variants SET stock_qty=? WHERE id=? AND org_id=? AND store_id=?', [line.countedQty, line.itemId, orgId, storeId]); } await query('UPDATE stock_takes SET status="posted",posted_at=NOW() WHERE id=?', [st.id]); res.json({ ok: true }); });
 
 // ---- 报表设计器 ----
-router.get('/report-templates', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT * FROM report_templates WHERE org_id=? AND store_id=? ORDER BY id ASC', [orgId, storeId]); res.json(rows.map((r) => ({ _id: r.id, id: r.id, type: r.type, name: r.name, columns: parseJSON(r.columns), isSystem: !!r.is_system }))); });
-router.post('/report-templates', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO report_templates (org_id,store_id,type,name,columns,is_system) VALUES (?,?,?,?,?,0)', [orgId, storeId, b.type || 'custom', b.name || 'Custom Report', stringifyJSON(b.columns || [])]); res.status(201).json(await getRow('SELECT * FROM report_templates WHERE id=?', [id])); });
+const reportTemplate = (r) => ({
+  _id: r.id, id: r.id, type: r.type, name: r.name,
+  columns: parseJSON(r.columns), filters: parseJSON(r.filters) || {},
+  sort: parseJSON(r.sort) || null, format: r.format || 'csv',
+  isSystem: !!r.is_system, createdAt: dt(r.created_at),
+});
+router.get('/report-templates', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT * FROM report_templates WHERE org_id=? AND store_id=? ORDER BY id ASC', [orgId, storeId]); res.json(rows.map(reportTemplate)); });
+router.post('/report-templates', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO report_templates (org_id,store_id,type,name,columns,filters,sort,format,is_system) VALUES (?,?,?,?,?,?,?,?,0)', [orgId, storeId, b.type || 'sales_by_date', b.name || 'Custom Report', stringifyJSON(b.columns || []), stringifyJSON(b.filters || {}), b.sort ? stringifyJSON(b.sort) : null, b.format || 'csv']); res.status(201).json(reportTemplate(await getRow('SELECT * FROM report_templates WHERE id=?', [id]))); });
+router.put('/report-templates/:id', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; await query('UPDATE report_templates SET type=COALESCE(?,type),name=COALESCE(?,name),columns=COALESCE(?,columns),filters=COALESCE(?,filters),sort=COALESCE(?,sort),format=COALESCE(?,format) WHERE id=? AND org_id=? AND store_id=? AND is_system=0', [b.type ?? null, b.name ?? null, b.columns ? stringifyJSON(b.columns) : null, b.filters ? stringifyJSON(b.filters) : null, b.sort ? stringifyJSON(b.sort) : null, b.format ?? null, req.params.id, orgId, storeId]); res.json(reportTemplate(await getRow('SELECT * FROM report_templates WHERE id=?', [req.params.id]))); });
 router.delete('/report-templates/:id', async (req, res) => { const { orgId, storeId } = tenant(req); await query('DELETE FROM report_templates WHERE id=? AND org_id=? AND store_id=? AND is_system=0', [req.params.id, orgId, storeId]); res.json({ ok: true }); });
 
 // ---- 硬件 ----
@@ -199,8 +327,26 @@ router.put('/hardware/printers/:id', async (req, res) => { const { orgId, storeI
 router.post('/hardware/print', async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const target = b.target || 'receipt'; const printer = await getRow('SELECT * FROM printers WHERE org_id=? AND store_id=? AND target=? AND is_active=1 LIMIT 1', [orgId, storeId, target]); const o = b.orderId ? await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [b.orderId, orgId, storeId]) : null; const lines = []; if (target === 'kitchen' || target === 'bar') { lines.push(`== ${target.toUpperCase()} COPY ==`); if (o) { lines.push(o.order_no); for (const it of parseJSON(o.items)) lines.push(`${it.qty} x ${it.code} ${it.name}`); } } else if (o) { lines.push(o.order_no); for (const it of parseJSON(o.items)) lines.push(`${it.qty} x ${it.name}  ${(Number(it.unitPrice) * Number(it.qty)).toFixed(2)}`); lines.push(`TOTAL ${Number(o.total).toFixed(2)}`); } const payload = lines.join('\n'); const id = await insert('INSERT INTO print_jobs (org_id,store_id,target,printer_id,order_id,payload,created_by) VALUES (?,?,?,?,?,?,?)', [orgId, storeId, target, printer ? printer.id : null, o ? o.id : null, payload, req.user.id]); res.status(201).json({ jobId: id, printerId: printer ? printer.id : null, escpos: payload }); });
 router.post('/hardware/drawer', async (req, res) => { const { orgId, storeId } = tenant(req); const id = await insert('INSERT INTO print_jobs (org_id,store_id,target,payload,status,created_by) VALUES (?,?,?,?,?,?)', [orgId, storeId, 'drawer', 'ESC/POS: 1B 70 00 19 FA', 'sent', req.user.id]); res.json({ ok: true, jobId: id }); });
 
-// ---- GST 汇总 ----
-router.get('/reports/gst', async (req, res) => { const { orgId, storeId } = tenant(req); const paid = await query('SELECT total,tax FROM orders WHERE org_id=? AND store_id=? AND status IN ("paid","refunded")', [orgId, storeId]); const setRows = await query('SELECT setting_key,setting_value FROM app_settings WHERE org_id=? AND store_id=?', [orgId, storeId]); const s = {}; for (const r of setRows) { try { s[r.setting_key] = JSON.parse(r.setting_value); } catch { s[r.setting_key] = r.setting_value; } } const outputTax = paid.reduce((x, o) => x + Number(o.tax || 0), 0); res.json({ from: req.query.from || null, to: req.query.to || null, taxRate: s.taxRate, taxInclusive: s.taxInclusive, taxableSales: paid.reduce((x, o) => x + Number(o.total || 0), 0), outputTax: Math.round(outputTax * 100) / 100, netTax: Math.round(outputTax * 100) / 100 }); });
+// ---- GST 汇总(走统一报表引擎,支持日期区间) ----
+router.get('/reports/gst', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const ds = await buildReportDataset(orgId, storeId);
+  const from = req.query.from || null;
+  const to = req.query.to || null;
+  const inRange = makeFilter(from, to);
+  const rate = Number(ds.settings.taxRate || 0);
+  const paid = ds.orders.filter((o) => (o.status === 'paid' || o.status === 'refunded') && inRange(o.createdAt));
+  const refunded = ds.refunds.filter((r) => inRange(r.createdAt)).reduce((x, r) => x + Number(r.amount || 0), 0);
+  const grossTax = round2(paid.reduce((x, o) => x + Number(o.tax || 0), 0));
+  const refundTax = rate ? round2(refunded * (rate / (100 + rate))) : 0;
+  res.json({
+    from, to,
+    taxRate: ds.settings.taxRate, taxInclusive: ds.settings.taxInclusive,
+    taxableSales: round2(paid.reduce((x, o) => x + Number(o.total || 0), 0)),
+    outputTax: grossTax, refundTax, netTax: round2(grossTax - refundTax),
+    invoiceCount: ds.invoices.filter((v) => inRange(v.createdAt)).length,
+  });
+});
 
 // ---- 重打中心 ----
 router.get('/reports/reprint', async (req, res) => {
