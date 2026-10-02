@@ -10,6 +10,7 @@ import TablesPage from './pages/TablesPage.jsx';
 import InventoryPage from './pages/InventoryPage.jsx';
 import ReportsPage from './pages/ReportsPage.jsx';
 import OperationsPage from './pages/OperationsPage.jsx';
+import BackOfficePage from './pages/BackOfficePage.jsx';
 
 function Require({ role, children }) {
   const { user } = useAuth();
@@ -36,6 +37,7 @@ export default function App() {
         <Route index element={<DesktopPage />} />
         <Route path="desktop" element={<DesktopPage />} />
         <Route path="operations" element={<Require role={['admin', 'manager', 'cashier']}><OperationsPage /></Require>} />
+        <Route path="backoffice" element={<Require role={['admin', 'manager']}><BackOfficePage /></Require>} />
         <Route path="cashier" element={<CashierPage />} />
         <Route
           path="kds"

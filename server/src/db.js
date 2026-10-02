@@ -172,12 +172,17 @@ export async function initSchema() {
       table_id INT,
       customer_name VARCHAR(255),
       phone VARCHAR(64),
-      status ENUM('open','kitchen','preparing','ready','served','paid','void_pending','void') DEFAULT 'open',
+      status ENUM('open','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open',
       items TEXT,
       subtotal DECIMAL(12,2) DEFAULT 0,
       discount DECIMAL(12,2) DEFAULT 0,
+      service_charge DECIMAL(12,2) DEFAULT 0,
       tax DECIMAL(12,2) DEFAULT 0,
       total DECIMAL(12,2) DEFAULT 0,
+      refunded_amount DECIMAL(12,2) DEFAULT 0,
+      invoice_no VARCHAR(64),
+      split_from_order_id INT,
+      split_group_no INT,
       created_by INT,
       shift_id INT,
       void_requested_by INT,
@@ -290,8 +295,76 @@ export async function initSchema() {
       status VARCHAR(32) DEFAULT 'open', received_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (supplier_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS order_splits (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      parent_order_id INT NOT NULL, mode VARCHAR(32), split_count INT DEFAULT 0, created_by INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (parent_order_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS refunds (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      refund_no VARCHAR(64), order_id INT, order_no VARCHAR(64), amount DECIMAL(12,2) NOT NULL,
+      method VARCHAR(32) DEFAULT 'cash', reason TEXT, items TEXT, restock TINYINT(1) DEFAULT 1,
+      created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (order_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS invoices (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      order_id INT, invoice_no VARCHAR(64), amount DECIMAL(12,2) DEFAULT 0, tax DECIMAL(12,2) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (order_id), INDEX (invoice_no)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS promotions (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64), name VARCHAR(255), type VARCHAR(32) DEFAULT 'percent', value DECIMAL(12,2) DEFAULT 0,
+      min_spend DECIMAL(12,2) DEFAULT 0, valid_from DATE NULL, valid_until DATE NULL,
+      is_active TINYINT(1) DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS customer_stock (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      member_id INT, member_no VARCHAR(64), item_name VARCHAR(255), qty DECIMAL(12,2) DEFAULT 0,
+      unit VARCHAR(32) DEFAULT 'pcs', note TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (member_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS stock_takes (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      take_no VARCHAR(64), status VARCHAR(32) DEFAULT 'draft', lines TEXT, created_by INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, posted_at TIMESTAMP NULL, INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS report_templates (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      type VARCHAR(64), name VARCHAR(255), columns TEXT, is_system TINYINT(1) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS printers (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      name VARCHAR(255), target VARCHAR(32) DEFAULT 'receipt', connection VARCHAR(32) DEFAULT 'usb',
+      width INT DEFAULT 80, is_default TINYINT(1) DEFAULT 0, is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS print_jobs (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      target VARCHAR(32), printer_id INT, order_id INT, payload TEXT, status VARCHAR(32) DEFAULT 'queued',
+      created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS app_settings (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      setting_key VARCHAR(64), setting_value TEXT, UNIQUE KEY uniq_setting (org_id, store_id, setting_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
   for (const s of stmts) await query(s);
+
+  // ---- 增量迁移：给既有库补列（尽力而为，失败忽略） ----
+  const alters = [
+    "ALTER TABLE orders ADD COLUMN service_charge DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN refunded_amount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN invoice_no VARCHAR(64)",
+    "ALTER TABLE orders ADD COLUMN split_from_order_id INT",
+    "ALTER TABLE orders ADD COLUMN split_group_no INT",
+    "ALTER TABLE orders MODIFY COLUMN status ENUM('open','kitchen','preparing','ready','served','paid','void_pending','void','refunded','split') DEFAULT 'open'",
+  ];
+  for (const a of alters) {
+    try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
+  }
 }
 
 // ---- Mappers: DB row -> API object (camelCase + _id string) ----
@@ -362,7 +435,11 @@ export const toOrder = (r) => ({
   customerName: r.customer_name, phone: r.phone, status: r.status,
   items: parseJSON(r.items),
   subtotal: Number(r.subtotal || 0), discount: Number(r.discount || 0),
+  serviceCharge: Number(r.service_charge || 0),
   tax: Number(r.tax || 0), total: Number(r.total || 0),
+  refundedAmount: Number(r.refunded_amount || 0), invoiceNo: r.invoice_no || null,
+  splitFromOrderId: r.split_from_order_id == null ? null : String(r.split_from_order_id),
+  splitGroupNo: r.split_group_no == null ? null : r.split_group_no,
   createdBy: r.created_by == null ? null : String(r.created_by),
   shiftId: r.shift_id == null ? null : String(r.shift_id),
   voidRequestedBy: r.void_requested_by == null ? null : String(r.void_requested_by),

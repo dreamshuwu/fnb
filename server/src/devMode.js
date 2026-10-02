@@ -10,6 +10,9 @@ const store = {
   tables: [], orders: [], inventory: [], payments: [],
   members: [], memberTopups: [], pointsLedger: [], cashMovements: [], creditNotes: [],
   attendance: [], shifts: [], suppliers: [], purchaseOrders: [], settings: [], seq: 1,
+  // 新增：Split Bill / Refund / Void / 促销 / 客户库存 / 盘点 / 报表设计器 / 硬件
+  orderSplits: [], refunds: [], promotions: [], customerStock: [], stockTakes: [],
+  reportTemplates: [], printJobs: [], printers: [], invoices: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -105,6 +108,45 @@ function seedDev() {
   store.suppliers.push({ id: nid(), orgId: '1', storeId: '1', code: 'SUP-001', name: 'Demo Supplier', phone: '', contact: '', status: 'active', createdAt: now() });
   store.shifts.push({ id: nid(), orgId: '1', storeId: '1', cashierId: '3', openAmount: 0, expectedAmount: 0, closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null });
   store.settings.push({ id: nid(), orgId: '1', storeId: '1', key: 'taxRate', value: 0 });
+
+  // ---- 默认门店设置（GST / 发票 / 服务费 / 硬件） ----
+  const DEFAULTS = {
+    companyName: 'Kopitiam Demo Sdn Bhd',
+    address: 'No. 1, Jalan Demo, 50000 Kuala Lumpur',
+    phone: '03-1234 5678',
+    gstNo: 'GST-000123456789',
+    taxRate: 6,
+    taxInclusive: true,
+    serviceChargeRate: 0,
+    invoicePrefix: 'INV',
+    currency: '¥',
+    receiptFooter: 'Thank you, please come again!',
+    roundTo5cent: false,
+  };
+  for (const [key, value] of Object.entries(DEFAULTS)) store.settings.push({ id: nid(), orgId: '1', storeId: '1', key, value });
+
+  store.printers.push({ id: nid(), orgId: '1', storeId: '1', name: 'Counter Receipt', target: 'receipt', connection: 'usb', width: 80, isDefault: true, isActive: true });
+  store.printers.push({ id: nid(), orgId: '1', storeId: '1', name: 'Kitchen Printer', target: 'kitchen', connection: 'lan', width: 80, isDefault: false, isActive: true });
+  store.printers.push({ id: nid(), orgId: '1', storeId: '1', name: 'Bar Printer', target: 'bar', connection: 'lan', width: 58, isDefault: false, isActive: true });
+  store.printers.push({ id: nid(), orgId: '1', storeId: '1', name: 'Office A4', target: 'a4', connection: 'system', width: 210, isDefault: false, isActive: true });
+
+  store.promotions.push({ id: nid(), orgId: '1', storeId: '1', code: 'HAPPY10', name: 'Happy Hour 10%', type: 'percent', value: 10, minSpend: 20, validFrom: null, validUntil: null, isActive: true, createdAt: now() });
+  store.promotions.push({ id: nid(), orgId: '1', storeId: '1', code: 'RM2OFF', name: 'RM2 Off', type: 'amount', value: 2, minSpend: 10, validFrom: null, validUntil: null, isActive: true, createdAt: now() });
+
+  store.customerStock.push({ id: nid(), orgId: '1', storeId: '1', memberId: '1', memberNo: 'M0001', itemName: 'Heineken', qty: 6, unit: 'btl', note: 'Member kept stock', createdAt: now() });
+
+  for (const t of [
+    ['sales_by_date', 'Sales By Date', ['orderNo', 'date', 'subtotal', 'discount', 'tax', 'total']],
+    ['sales_by_product', 'Sales By Product', ['code', 'name', 'qty', 'amount']],
+    ['sales_by_payment', 'Sales By Payment Type', ['method', 'amount']],
+    ['sales_by_cashier', 'Sales By Cashier', ['cashier', 'orders', 'total']],
+    ['sales_by_table', 'Sales By Table', ['table', 'orders', 'total']],
+    ['void_report', 'Void / Cancellation', ['orderNo', 'date', 'reason', 'status', 'total']],
+    ['refund_report', 'Refund Report', ['refundNo', 'orderNo', 'date', 'amount', 'method', 'reason']],
+    ['stock_report', 'Stock Report', ['name', 'code', 'stockQty', 'stockThreshold']],
+  ]) {
+    store.reportTemplates.push({ id: nid(), orgId: '1', storeId: '1', type: t[0], name: t[1], columns: t[2], isSystem: true, createdAt: now() });
+  }
 }
 
 // ---- mappers(与 db.js 输出保持一致,前端按这些字段渲染) ----
@@ -134,6 +176,8 @@ const toOrder = (o) => ({
   _id: o.id, id: o.id, orgId: o.orgId, storeId: o.storeId, orderNo: o.orderNo, type: o.type,
   tableId: o.tableId == null ? null : String(o.tableId), customerName: o.customerName, phone: o.phone, status: o.status,
   items: o.items || [], subtotal: Number(o.subtotal || 0), discount: Number(o.discount || 0), tax: Number(o.tax || 0), total: Number(o.total || 0),
+  serviceCharge: Number(o.serviceCharge || 0), refundedAmount: Number(o.refundedAmount || 0), invoiceNo: o.invoiceNo || null,
+  splitFromOrderId: o.splitFromOrderId == null ? null : String(o.splitFromOrderId), splitGroupNo: o.splitGroupNo ?? null,
   createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: o.shiftId == null ? null : String(o.shiftId),
   voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: o.voidApprovedBy == null ? null : String(o.voidApprovedBy), voidReason: o.voidReason || null,
   createdAt: o.createdAt, updatedAt: o.updatedAt || o.createdAt,
@@ -143,11 +187,56 @@ const toMovement = (m) => ({ _id: m.id, id: m.id, type: m.type, voucherNo: m.vou
 const toAttendance = (a) => ({ _id: a.id, id: a.id, userId: a.userId, userName: a.userName, action: a.action, code: a.code, time: a.time, note: a.note || '' });
 const toShift = (s) => ({ _id: s.id, id: s.id, cashierId: s.cashierId, openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0), closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0), status: s.status, openedAt: s.openedAt, closedAt: s.closedAt });
 const toSupplier = (s) => ({ _id: s.id, id: s.id, code: s.code, name: s.name, phone: s.phone, contact: s.contact, status: s.status, createdAt: s.createdAt });
+const toRefund = (r) => ({ _id: r.id, id: r.id, refundNo: r.refundNo, orderId: String(r.orderId), orderNo: r.orderNo, amount: Number(r.amount || 0), method: r.method || 'cash', reason: r.reason || '', items: r.items || [], restock: !!r.restock, createdBy: r.createdBy, createdAt: r.createdAt });
+const toPromotion = (p) => ({ _id: p.id, id: p.id, code: p.code, name: p.name, type: p.type, value: Number(p.value || 0), minSpend: Number(p.minSpend || 0), validFrom: p.validFrom || null, validUntil: p.validUntil || null, isActive: !!p.isActive, createdAt: p.createdAt });
+const toCustomerStock = (c) => ({ _id: c.id, id: c.id, memberId: String(c.memberId), memberNo: c.memberNo, itemName: c.itemName, qty: Number(c.qty || 0), unit: c.unit || 'pcs', note: c.note || '', createdAt: c.createdAt });
+const toStockTake = (s) => ({ _id: s.id, id: s.id, takeNo: s.takeNo, status: s.status, lines: s.lines || [], createdBy: s.createdBy, createdAt: s.createdAt, postedAt: s.postedAt || null });
+const toReportTemplate = (t) => ({ _id: t.id, id: t.id, type: t.type, name: t.name, columns: t.columns || [], isSystem: !!t.isSystem, createdAt: t.createdAt });
+const toPrinter = (p) => ({ _id: p.id, id: p.id, name: p.name, target: p.target, connection: p.connection, width: Number(p.width || 80), isDefault: !!p.isDefault, isActive: !!p.isActive });
+
+// ---- 门店设置 ----
+function getSettings() {
+  const o = {};
+  for (const s of store.settings) o[s.key] = s.value;
+  return o;
+}
+function setSettings(patch) {
+  for (const [key, value] of Object.entries(patch || {})) {
+    const row = store.settings.find((s) => s.key === key);
+    if (row) row.value = value;
+    else store.settings.push({ id: nid(), orgId: '1', storeId: '1', key, value });
+  }
+  return getSettings();
+}
+const taxRate = () => Number(getSettings().taxRate || 0);
 
 function computeTotals(items, taxRate = 0) {
   const subtotal = items.reduce((s, i) => s + Number(i.unitPrice) * Number(i.qty), 0);
   const tax = Math.round(subtotal * taxRate) / 100;
   return { subtotal, tax, total: subtotal + tax };
+}
+
+// GST 感知的总额计算：支持含税/未税价、服务费、5 分钱取整
+function computeOrderTotals(items, discount = 0) {
+  const s = getSettings();
+  const rate = Number(s.taxRate || 0) / 100;
+  const svcRate = Number(s.serviceChargeRate || 0) / 100;
+  const gross = items.reduce((sum, i) => sum + Number(i.unitPrice) * Number(i.qty), 0);
+  const disc = Math.max(0, Math.min(Number(discount || 0), gross));
+  const net = gross - disc;
+  const serviceCharge = Math.round(net * svcRate * 100) / 100;
+  const base = net + serviceCharge;
+  let tax;
+  let total;
+  if (s.taxInclusive) {
+    tax = Math.round((base - base / (1 + rate)) * 100) / 100;
+    total = base;
+  } else {
+    tax = Math.round(base * rate * 100) / 100;
+    total = base + tax;
+  }
+  if (s.roundTo5cent) total = Math.round(total * 20) / 20;
+  return { subtotal: gross, discount: disc, serviceCharge, tax, total: Math.round(total * 100) / 100 };
 }
 function orderNo() {
   const d = new Date();
@@ -274,6 +363,13 @@ export function createDevRouter(io) {
     if (req.query.categoryId) list = list.filter((v) => v.categoryId === String(req.query.categoryId));
     res.json(list.map(toVariant));
   });
+  // 条码扫描：按 barcode 或 code 精确查找（Smcin 条码管理）
+  r.get('/menu/variants/barcode/:code', (req, res) => {
+    const code = String(req.params.code);
+    const v = store.variants.find((x) => (x.barcode && x.barcode === code) || x.code === code);
+    if (!v) return res.status(404).json({ error: 'barcode not found' });
+    res.json(toVariant(v));
+  });
   r.post('/menu/variants', (req, res) => {
     const b = req.body;
     const v = {
@@ -341,13 +437,13 @@ export function createDevRouter(io) {
   r.post('/orders', (req, res) => {
     const b = req.body;
     const items = (b.items || []).map((i) => ({ ...i, status: 'pending' }));
-    const { subtotal, tax, total: grossTotal } = computeTotals(items, 0);
-    const discount = Math.max(0, Number(b.discount || 0));
-    const total = Math.max(0, grossTotal - discount);
+    const totals = computeOrderTotals(items, b.discount || 0);
     const o = {
       id: nid(), orgId: '1', storeId: '1', orderNo: orderNo(), type: b.type || 'dine_in',
       tableId: b.tableId ? String(b.tableId) : null, customerName: b.customerName || null, phone: b.phone || null,
-      status: 'open', items, subtotal, discount, tax, total, createdBy: req.user.id, shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
+      status: 'open', items, subtotal: totals.subtotal, discount: totals.discount, serviceCharge: totals.serviceCharge,
+      tax: totals.tax, total: totals.total, refundedAmount: 0, invoiceNo: null,
+      createdBy: req.user.id, shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
       createdAt: now(), updatedAt: now(),
     };
     store.orders.push(o);
@@ -362,7 +458,8 @@ export function createDevRouter(io) {
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status !== 'open') return res.status(400).json({ error: 'order not open' });
     o.items.push({ ...req.body, status: 'pending' });
-    const t = computeTotals(o.items, 0); o.subtotal = t.subtotal; o.tax = t.tax; o.total = t.total; o.updatedAt = now();
+    const totals = computeOrderTotals(o.items, o.discount);
+    Object.assign(o, totals); o.updatedAt = now();
     res.json(toOrder(o));
   });
   r.put('/orders/:id/status', (req, res) => {
@@ -389,6 +486,12 @@ export function createDevRouter(io) {
       store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: pm.method, amount: pm.amount, tip: 0, createdAt: now() });
     }
     o.status = 'paid'; o.updatedAt = now();
+    const s = getSettings();
+    if (!o.invoiceNo) {
+      const seq = store.invoices.length + 1;
+      o.invoiceNo = `${s.invoicePrefix || 'INV'}-${new Date().getFullYear()}-${String(seq).padStart(5, '0')}`;
+      store.invoices.push({ id: nid(), orderId: o.id, invoiceNo: o.invoiceNo, amount: o.total, tax: o.tax, createdAt: now() });
+    }
     // 扣成品库存（全部追踪）
     const low = [];
     for (const it of o.items) {
@@ -404,7 +507,12 @@ export function createDevRouter(io) {
     const payments = store.payments.filter((p) => p.orderId === o.id);
     res.json({
       order: toOrder(o),
-      receipt: { storeName: 'Demo Store', orderNo: o.orderNo, items: o.items, subtotal: o.subtotal, tax: o.tax, total: o.total, payments, createdAt: o.createdAt },
+      receipt: {
+        storeName: s.companyName || 'Demo Store', address: s.address || '', phone: s.phone || '', gstNo: s.gstNo || '',
+        orderNo: o.orderNo, invoiceNo: o.invoiceNo, items: o.items, subtotal: o.subtotal, discount: o.discount,
+        serviceCharge: o.serviceCharge, tax: o.tax, taxRate: s.taxRate, taxInclusive: s.taxInclusive, total: o.total,
+        payments, footer: s.receiptFooter || '', createdAt: o.createdAt,
+      },
     });
   });
   r.post('/orders/:id/void', (req, res) => {
@@ -423,6 +531,260 @@ export function createDevRouter(io) {
     io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
     if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'free'; t.currentOrderId = null; } }
     res.json(toOrder(o));
+  });
+  r.post('/orders/:id/void/reject', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (o.status !== 'void_pending') return res.status(400).json({ error: 'not pending' });
+    o.status = 'open'; o.voidRequestedBy = null; o.voidReason = null; o.voidRejectReason = req.body?.reason || null; o.updatedAt = now();
+    io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
+    res.json(toOrder(o));
+  });
+
+  // ---- 发票 / Tax Invoice ----
+  r.get('/orders/:id/invoice', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    const s = getSettings();
+    const payments = store.payments.filter((p) => p.orderId === o.id);
+    res.json({
+      invoiceNo: o.invoiceNo || `DRAFT-${o.orderNo}`,
+      orderNo: o.orderNo, date: o.createdAt, status: o.status,
+      seller: { name: s.companyName, address: s.address, phone: s.phone, gstNo: s.gstNo },
+      customer: { name: o.customerName || 'Walk-in Customer', phone: o.phone || '' },
+      items: o.items, subtotal: o.subtotal, discount: o.discount, serviceCharge: o.serviceCharge,
+      tax: o.tax, taxRate: s.taxRate, taxInclusive: s.taxInclusive, total: o.total,
+      payments: payments.map((p) => ({ method: p.method, amount: Number(p.amount) })),
+      refundedAmount: o.refundedAmount || 0,
+    });
+  });
+
+  // ---- Split Bill ----
+  r.get('/orders/:id/splits', (req, res) => {
+    res.json(store.orders.filter((o) => String(o.splitFromOrderId) === String(req.params.id)).map(toOrder));
+  });
+  r.post('/orders/:id/split', (req, res) => {
+    const parent = store.orders.find((x) => x.id === req.params.id);
+    if (!parent) return res.status(404).json({ error: 'not found' });
+    if (!['open', 'kitchen', 'ready', 'served'].includes(parent.status)) return res.status(400).json({ error: 'cannot split this order' });
+    const b = req.body || {};
+    const mode = b.mode || 'equal';
+    const groups = []; // 每组 items
+    if (mode === 'item') {
+      // b.groups = [[itemIndex, ...], [...]]
+      for (const idxs of b.groups || []) {
+        const items = idxs.map((i) => parent.items[i]).filter(Boolean).map((i) => ({ ...i, status: 'pending' }));
+        if (items.length) groups.push(items);
+      }
+    } else if (mode === 'pax') {
+      const pax = Math.max(2, Number(b.pax || 2));
+      const buckets = Array.from({ length: pax }, () => []);
+      parent.items.forEach((it, i) => buckets[i % pax].push({ ...it, status: 'pending' }));
+      groups.push(...buckets.filter((g) => g.length));
+    } else {
+      // equal / amount：按金额均分，生成占位项目，保留原单为母单
+      const parts = Math.max(2, Number(b.parts || 2));
+      const per = Math.round((parent.total / parts) * 100) / 100;
+      for (let i = 0; i < parts; i++) {
+        const amount = i === parts - 1 ? Math.round((parent.total - per * (parts - 1)) * 100) / 100 : per;
+        groups.push([{ code: `SPLIT-${i + 1}`, name: `Split share ${i + 1}`, unitPrice: amount, qty: 1, status: 'pending' }]);
+      }
+    }
+    if (!groups.length) return res.status(400).json({ error: 'nothing to split' });
+    const created = [];
+    groups.forEach((items, gi) => {
+      const totals = computeOrderTotals(items, 0);
+      const child = {
+        id: nid(), orgId: '1', storeId: '1', orderNo: `${parent.orderNo}-S${gi + 1}`, type: parent.type,
+        tableId: parent.tableId, customerName: parent.customerName, phone: parent.phone, status: 'open',
+        items, subtotal: totals.subtotal, discount: 0, serviceCharge: totals.serviceCharge, tax: totals.tax, total: totals.total,
+        refundedAmount: 0, invoiceNo: null, splitFromOrderId: parent.id, splitGroupNo: gi + 1,
+        createdBy: req.user.id, shiftId: parent.shiftId, voidReason: null, createdAt: now(), updatedAt: now(),
+      };
+      store.orders.push(child); created.push(child);
+    });
+    store.orderSplits.push({ id: nid(), parentOrderId: parent.id, mode, count: created.length, createdAt: now(), createdBy: req.user.id });
+    parent.status = 'split'; parent.updatedAt = now();
+    io.to(`store:${parent.storeId}`).emit('order:closed', String(parent.id));
+    res.status(201).json({ parent: toOrder(parent), children: created.map(toOrder) });
+  });
+
+  // ---- Refund ----
+  r.get('/refunds', (req, res) => res.json(store.refunds.map(toRefund)));
+  r.post('/orders/:id/refund', (req, res) => {
+    const o = store.orders.find((x) => x.id === req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    if (!['paid', 'served'].includes(o.status)) return res.status(400).json({ error: 'only paid orders can be refunded' });
+    const b = req.body || {};
+    const restock = b.restock !== false;
+    let amount = Number(b.amount || 0);
+    const refundItems = [];
+    if (Array.isArray(b.items) && b.items.length) {
+      // 按项目退款：b.items = [{ index|code, qty }]
+      for (const rl of b.items) {
+        const src = o.items[rl.index] || o.items.find((i) => i.code === rl.code);
+        if (!src) continue;
+        const qty = Math.min(Number(rl.qty || src.qty), src.qty);
+        const lineAmt = Math.round(qty * Number(src.unitPrice) * 100) / 100;
+        amount += lineAmt;
+        refundItems.push({ code: src.code, name: src.name, qty, unitPrice: src.unitPrice });
+        if (restock) {
+          const v = store.variants.find((x) => x.id === String(src.variantId || src.itemId));
+          if (v) v.stockQty = Number(v.stockQty) + qty;
+        }
+      }
+    } else {
+      amount = amount || Math.round((Number(o.total) - Number(o.refundedAmount || 0)) * 100) / 100;
+      if (restock) {
+        for (const it of o.items) {
+          const v = store.variants.find((x) => x.id === String(it.variantId || it.itemId));
+          if (v) v.stockQty = Number(v.stockQty) + Number(it.qty);
+        }
+      }
+    }
+    if (amount <= 0) return res.status(400).json({ error: 'refund amount must be positive' });
+    if (Number(o.refundedAmount || 0) + amount > Number(o.total) + 0.001) return res.status(400).json({ error: 'refund exceeds order total' });
+    o.refundedAmount = Math.round((Number(o.refundedAmount || 0) + amount) * 100) / 100;
+    if (o.refundedAmount >= Number(o.total) - 0.001) o.status = 'refunded';
+    o.updatedAt = now();
+    const refund = {
+      id: nid(), orgId: '1', storeId: '1', refundNo: `RF${Date.now()}`, orderId: o.id, orderNo: o.orderNo,
+      amount, method: b.method || 'cash', reason: b.reason || 'customer refund', items: refundItems, restock,
+      createdBy: req.user.id, createdAt: now(),
+    };
+    store.refunds.unshift(refund);
+    io.to(`store:${o.storeId}`).emit('order:created', toOrder(o));
+    res.status(201).json({ order: toOrder(o), refund: toRefund(refund) });
+  });
+
+  // ---- 门店设置 / GST ----
+  r.get('/settings', (req, res) => res.json(getSettings()));
+  r.put('/settings', (req, res) => res.json(setSettings(req.body)));
+
+  // ---- 促销 Promotion ----
+  r.get('/promotions', (req, res) => res.json(store.promotions.map(toPromotion)));
+  r.post('/promotions', (req, res) => {
+    const b = req.body || {};
+    const p = { id: nid(), orgId: '1', storeId: '1', code: b.code || `PROMO${store.promotions.length + 1}`, name: b.name || '', type: b.type || 'percent', value: Number(b.value || 0), minSpend: Number(b.minSpend || 0), validFrom: b.validFrom || null, validUntil: b.validUntil || null, isActive: b.isActive !== false, createdAt: now() };
+    store.promotions.push(p); res.status(201).json(toPromotion(p));
+  });
+  r.put('/promotions/:id', (req, res) => {
+    const p = store.promotions.find((x) => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    Object.assign(p, { code: req.body.code ?? p.code, name: req.body.name ?? p.name, type: req.body.type ?? p.type, value: req.body.value !== undefined ? Number(req.body.value) : p.value, minSpend: req.body.minSpend !== undefined ? Number(req.body.minSpend) : p.minSpend, validFrom: req.body.validFrom ?? p.validFrom, validUntil: req.body.validUntil ?? p.validUntil, isActive: req.body.isActive ?? p.isActive });
+    res.json(toPromotion(p));
+  });
+  r.delete('/promotions/:id', (req, res) => { store.promotions = store.promotions.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
+  r.get('/promotions/apply', (req, res) => {
+    const code = String(req.query.code || '').toUpperCase();
+    const amount = Number(req.query.amount || 0);
+    const p = store.promotions.find((x) => x.code.toUpperCase() === code && x.isActive);
+    if (!p) return res.status(404).json({ error: 'promotion not found' });
+    if (amount < p.minSpend) return res.status(400).json({ error: `min spend ${p.minSpend}` });
+    const discount = p.type === 'percent' ? Math.round(amount * p.value) / 100 : Math.min(p.value, amount);
+    res.json({ promotion: toPromotion(p), discount: Math.round(discount * 100) / 100 });
+  });
+
+  // ---- 客户库存 Customer Stock ----
+  r.get('/customer-stock', (req, res) => res.json(store.customerStock.map(toCustomerStock)));
+  r.post('/customer-stock', (req, res) => {
+    const b = req.body || {};
+    const m = store.members.find((x) => x.id === String(b.memberId));
+    const c = { id: nid(), orgId: '1', storeId: '1', memberId: String(b.memberId || (m && m.id) || ''), memberNo: b.memberNo || (m && m.memberNo) || '', itemName: b.itemName || '', qty: Number(b.qty || 0), unit: b.unit || 'pcs', note: b.note || '', createdAt: now() };
+    store.customerStock.push(c); res.status(201).json(toCustomerStock(c));
+  });
+  r.post('/customer-stock/:id/adjust', (req, res) => {
+    const c = store.customerStock.find((x) => x.id === req.params.id);
+    if (!c) return res.status(404).json({ error: 'not found' });
+    c.qty = Math.max(0, Number(c.qty) + Number(req.body.delta || 0));
+    res.json(toCustomerStock(c));
+  });
+
+  // ---- 定期盘点 Periodical Stock Take ----
+  r.get('/stock-takes', (req, res) => res.json(store.stockTakes.map(toStockTake)));
+  r.post('/stock-takes', (req, res) => {
+    const lines = store.variants.map((v) => ({ itemId: v.id, code: v.code, name: v.name, systemQty: Number(v.stockQty || 0), countedQty: null, variance: 0 }));
+    const st = { id: nid(), orgId: '1', storeId: '1', takeNo: `ST${Date.now()}`, status: 'draft', lines, createdBy: req.user.id, createdAt: now(), postedAt: null };
+    store.stockTakes.unshift(st); res.status(201).json(toStockTake(st));
+  });
+  r.put('/stock-takes/:id', (req, res) => {
+    const st = store.stockTakes.find((x) => x.id === req.params.id);
+    if (!st) return res.status(404).json({ error: 'not found' });
+    if (st.status !== 'draft') return res.status(400).json({ error: 'already posted' });
+    for (const upd of req.body?.lines || []) {
+      const line = st.lines.find((l) => String(l.itemId) === String(upd.itemId));
+      if (line) { line.countedQty = Number(upd.countedQty || 0); line.variance = line.countedQty - line.systemQty; }
+    }
+    res.json(toStockTake(st));
+  });
+  r.post('/stock-takes/:id/post', (req, res) => {
+    const st = store.stockTakes.find((x) => x.id === req.params.id);
+    if (!st) return res.status(404).json({ error: 'not found' });
+    if (st.status !== 'draft') return res.status(400).json({ error: 'already posted' });
+    for (const line of st.lines) {
+      if (line.countedQty == null) continue;
+      const v = store.variants.find((x) => x.id === String(line.itemId));
+      if (v) v.stockQty = Number(line.countedQty);
+    }
+    st.status = 'posted'; st.postedAt = now();
+    res.json(toStockTake(st));
+  });
+
+  // ---- 报表设计器 Report Templates ----
+  r.get('/report-templates', (req, res) => res.json(store.reportTemplates.map(toReportTemplate)));
+  r.post('/report-templates', (req, res) => {
+    const b = req.body || {};
+    const t = { id: nid(), orgId: '1', storeId: '1', type: b.type || 'custom', name: b.name || 'Custom Report', columns: b.columns || [], isSystem: false, createdAt: now() };
+    store.reportTemplates.push(t); res.status(201).json(toReportTemplate(t));
+  });
+  r.delete('/report-templates/:id', (req, res) => { store.reportTemplates = store.reportTemplates.filter((x) => x.id !== req.params.id); res.json({ ok: true }); });
+
+  // ---- 硬件 Hardware ----
+  r.get('/hardware/printers', (req, res) => res.json(store.printers.map(toPrinter)));
+  r.post('/hardware/printers', (req, res) => {
+    const b = req.body || {};
+    const p = { id: nid(), orgId: '1', storeId: '1', name: b.name || 'Printer', target: b.target || 'receipt', connection: b.connection || 'usb', width: Number(b.width || 80), isDefault: !!b.isDefault, isActive: b.isActive !== false };
+    store.printers.push(p); res.status(201).json(toPrinter(p));
+  });
+  r.put('/hardware/printers/:id', (req, res) => {
+    const p = store.printers.find((x) => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    Object.assign(p, { name: req.body.name ?? p.name, target: req.body.target ?? p.target, connection: req.body.connection ?? p.connection, width: req.body.width !== undefined ? Number(req.body.width) : p.width, isDefault: req.body.isDefault ?? p.isDefault, isActive: req.body.isActive ?? p.isActive });
+    res.json(toPrinter(p));
+  });
+  r.post('/hardware/print', (req, res) => {
+    const b = req.body || {};
+    const target = b.target || 'receipt';
+    const printer = store.printers.find((x) => x.target === target && x.isActive) || store.printers.find((x) => x.isActive);
+    const o = b.orderId ? store.orders.find((x) => x.id === String(b.orderId)) : null;
+    const s = getSettings();
+    // 生成 ESC/POS 文本载荷（真实环境由本地打印代理发送到打印机）
+    const lines = [];
+    if (target === 'kitchen' || target === 'bar') {
+      lines.push(`== ${target.toUpperCase()} COPY ==`);
+      lines.push(o ? o.orderNo : '-');
+      if (o) for (const it of o.items) lines.push(`${it.qty} x ${it.code} ${it.name}`);
+    } else {
+      lines.push(s.companyName || 'Store');
+      if (o) { lines.push(o.orderNo); for (const it of o.items) lines.push(`${it.qty} x ${it.name}  ${(it.unitPrice * it.qty).toFixed(2)}`); lines.push(`TOTAL ${Number(o.total).toFixed(2)}`); }
+    }
+    const job = { id: nid(), orgId: '1', storeId: '1', target, printerId: printer ? printer.id : null, orderId: o ? o.id : null, payload: lines.join('\n'), status: 'queued', createdBy: req.user.id, createdAt: now() };
+    store.printJobs.unshift(job);
+    res.status(201).json({ job, printer: printer ? toPrinter(printer) : null, escpos: lines.join('\n') });
+  });
+  r.post('/hardware/drawer', (req, res) => {
+    const job = { id: nid(), orgId: '1', storeId: '1', target: 'drawer', payload: 'ESC/POS: 1B 70 00 19 FA', status: 'sent', createdBy: req.user.id, createdAt: now() };
+    store.printJobs.unshift(job);
+    res.json({ ok: true, job });
+  });
+
+  // ---- GST 汇总报表 ----
+  r.get('/reports/gst', (req, res) => {
+    const paid = store.orders.filter((o) => o.status === 'paid' || o.status === 'refunded');
+    const s = getSettings();
+    const outputTax = paid.reduce((sum, o) => sum + Number(o.tax || 0), 0);
+    const refundTax = store.refunds.reduce((sum, r) => sum + Number(r.amount || 0) * (Number(s.taxRate || 0) / (100 + Number(s.taxRate || 0))), 0);
+    res.json({ from: req.query.from || null, to: req.query.to || null, taxRate: s.taxRate, taxInclusive: s.taxInclusive, taxableSales: paid.reduce((sum, o) => sum + Number(o.total || 0), 0), outputTax: Math.round(outputTax * 100) / 100, refundTax: Math.round(refundTax * 100) / 100, netTax: Math.round((outputTax - refundTax) * 100) / 100, invoiceCount: store.invoices.length });
   });
 
   // ---- 库存（原料级） ----
@@ -534,13 +896,76 @@ export function createDevRouter(io) {
   // ---- 通用报表查询，供 ReportsPage / 后台使用 ----
   r.get('/reports/query', (req, res) => {
     const type = req.query.type || 'sales_by_date';
-    const paid = store.orders.filter((o) => o.status === 'paid');
-    const rows = type === 'sales_by_product'
-      ? Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const k = i.code || i.name; a[k] = a[k] || { code: k, name: i.name, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {}))
-      : type === 'sales_by_payment'
-        ? Object.entries(store.payments.reduce((a, p) => { a[p.method] = (a[p.method] || 0) + Number(p.amount); return a; }, {})).map(([method, amount]) => ({ method, amount }))
-        : paid.map((o) => ({ orderNo: o.orderNo, date: o.createdAt, subtotal: o.subtotal, discount: o.discount, tax: o.tax, total: o.total, status: o.status }));
-    res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, total: paid.reduce((s, o) => s + Number(o.total || 0), 0), count: paid.length });
+    const paid = store.orders.filter((o) => o.status === 'paid' || o.status === 'refunded');
+    const s = getSettings();
+    const userById = (id) => store.users.find((u) => u.id === String(id));
+    const tableById = (id) => store.tables.find((t) => t.id === String(id));
+    let rows = [];
+    switch (type) {
+      case 'sales_by_product':
+        rows = Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const k = i.code || i.name; a[k] = a[k] || { code: k, name: i.name, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {}));
+        break;
+      case 'sales_by_payment':
+        rows = Object.entries(store.payments.reduce((a, p) => { a[p.method] = (a[p.method] || 0) + Number(p.amount); return a; }, {})).map(([method, amount]) => ({ method, amount: Math.round(amount * 100) / 100 }));
+        break;
+      case 'sales_by_hour':
+        rows = Object.values(paid.reduce((a, o) => { const h = new Date(o.createdAt).getHours(); const k = `${String(h).padStart(2, '0')}:00`; a[k] = a[k] || { hour: k, orders: 0, total: 0 }; a[k].orders++; a[k].total += Number(o.total); return a; }, {})).sort((x, y) => x.hour.localeCompare(y.hour));
+        break;
+      case 'sales_by_cashier':
+        rows = Object.values(paid.reduce((a, o) => { const u = userById(o.createdBy); const k = u ? u.name : String(o.createdBy); a[k] = a[k] || { cashier: k, orders: 0, total: 0 }; a[k].orders++; a[k].total += Number(o.total); return a; }, {}));
+        break;
+      case 'sales_by_table':
+        rows = Object.values(paid.reduce((a, o) => { const t = tableById(o.tableId); const k = t ? t.number : (o.type === 'takeaway' ? 'Takeaway' : 'Walk-in'); a[k] = a[k] || { table: k, orders: 0, total: 0 }; a[k].orders++; a[k].total += Number(o.total); return a; }, {}));
+        break;
+      case 'sales_by_department':
+        rows = Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const v = store.variants.find((x) => x.id === String(i.variantId || i.itemId)); const b = v && store.bases.find((x) => x.id === String(v.baseId)); const c = b && store.categories.find((x) => x.id === String(b.categoryId)); const k = c ? c.name : 'Other'; a[k] = a[k] || { department: k, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {}));
+        break;
+      case 'void_report':
+        rows = store.orders.filter((o) => o.status === 'void' || o.status === 'void_pending').map((o) => ({ orderNo: o.orderNo, date: o.createdAt, reason: o.voidReason || '', status: o.status, total: Number(o.total || 0) }));
+        break;
+      case 'refund_report':
+        rows = store.refunds.map((r) => ({ refundNo: r.refundNo, orderNo: r.orderNo, date: r.createdAt, amount: Number(r.amount || 0), method: r.method, reason: r.reason }));
+        break;
+      case 'discount_report':
+        rows = paid.filter((o) => Number(o.discount || 0) > 0).map((o) => ({ orderNo: o.orderNo, date: o.createdAt, subtotal: Number(o.subtotal), discount: Number(o.discount), total: Number(o.total) }));
+        break;
+      case 'stock_report':
+        rows = store.variants.map((v) => ({ name: v.name, code: v.code, stockQty: Number(v.stockQty || 0), stockThreshold: Number(v.stockThreshold || 0) }));
+        break;
+      case 'customer_stock':
+        rows = store.customerStock.map((c) => ({ memberNo: c.memberNo, itemName: c.itemName, qty: Number(c.qty), unit: c.unit }));
+        break;
+      case 'member_points':
+        rows = store.members.map((m) => ({ memberNo: m.memberNo, name: m.name, points: Number(m.points), creditBalance: Number(m.creditBalance) }));
+        break;
+      case 'knock_off':
+        rows = store.memberTopups.map((t) => { const m = store.members.find((x) => x.id === String(t.memberId)); return { receiptNo: t.receiptNo, memberNo: m ? m.memberNo : '', amount: Number(t.amount), date: t.createdAt }; });
+        break;
+      case 'cash_bill':
+        rows = store.payments.map((p) => ({ orderNo: (store.orders.find((o) => o.id === String(p.orderId)) || {}).orderNo || '', method: p.method, amount: Number(p.amount), date: p.createdAt }));
+        break;
+      case 'payout':
+        rows = store.cashMovements.filter((m) => m.type === 'payout' || m.type === 'withdraw').map((m) => ({ voucherNo: m.voucherNo, payTo: m.payTo, amount: Number(m.amount), reason: m.reason, date: m.createdAt }));
+        break;
+      case 'credit_note':
+        rows = store.creditNotes.map((c) => ({ creditNo: c.creditNo, customerName: c.customerName, orderNo: c.orderNo, reason: c.reason, gst: !!c.gst }));
+        break;
+      case 'top_products':
+        rows = Object.values(paid.flatMap((o) => o.items).reduce((a, i) => { const k = i.code || i.name; a[k] = a[k] || { code: k, name: i.name, qty: 0, amount: 0 }; a[k].qty += Number(i.qty); a[k].amount += Number(i.qty) * Number(i.unitPrice); return a; }, {})).sort((x, y) => y.qty - x.qty).slice(0, 10);
+        break;
+      case 'close_shift':
+        rows = store.shifts.map((sh) => ({ shiftId: sh.id, openedAt: sh.openedAt, closedAt: sh.closedAt, openAmount: Number(sh.openAmount), expectedAmount: Number(sh.expectedAmount), closeAmount: Number(sh.closeAmount), difference: Number(sh.difference), status: sh.status }));
+        break;
+      case 'gst_summary': {
+        const outputTax = paid.reduce((sum, o) => sum + Number(o.tax || 0), 0);
+        rows = [{ taxableSales: Math.round(paid.reduce((sum, o) => sum + Number(o.total || 0), 0) * 100) / 100, taxRate: s.taxRate, outputTax: Math.round(outputTax * 100) / 100, invoices: store.invoices.length }];
+        break;
+      }
+      default:
+        rows = paid.map((o) => ({ orderNo: o.orderNo, date: o.createdAt, subtotal: Number(o.subtotal), discount: Number(o.discount), tax: Number(o.tax), total: Number(o.total), status: o.status }));
+    }
+    const total = type === 'refund_report' ? store.refunds.reduce((x, r) => x + Number(r.amount || 0), 0) : paid.reduce((x, o) => x + Number(o.total || 0), 0);
+    res.json({ type, from: req.query.from || null, to: req.query.to || null, rows, total: Math.round(total * 100) / 100, count: rows.length });
   });
 
   return r;

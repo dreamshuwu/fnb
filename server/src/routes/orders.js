@@ -13,6 +13,30 @@ function computeTotals(items, taxRate = 0) {
   return { subtotal, tax, total: subtotal + tax };
 }
 
+async function loadSettings(orgId, storeId) {
+  const rows = await query('SELECT setting_key,setting_value FROM app_settings WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const s = {};
+  for (const r of rows) { try { s[r.setting_key] = JSON.parse(r.setting_value); } catch { s[r.setting_key] = r.setting_value; } }
+  return s;
+}
+
+// GST 感知的总额计算（含税/未税 + 服务费 + 5 分取整）
+function computeGst(items, discount, s) {
+  const rate = Number(s.taxRate || 0) / 100;
+  const svcRate = Number(s.serviceChargeRate || 0) / 100;
+  const gross = items.reduce((x, i) => x + i.unitPrice * i.qty, 0);
+  const disc = Math.max(0, Math.min(Number(discount || 0), gross));
+  const net = gross - disc;
+  const serviceCharge = Math.round(net * svcRate * 100) / 100;
+  const base = net + serviceCharge;
+  let tax;
+  let total;
+  if (s.taxInclusive) { tax = Math.round((base - base / (1 + rate)) * 100) / 100; total = base; }
+  else { tax = Math.round(base * rate * 100) / 100; total = base + tax; }
+  if (s.roundTo5cent) total = Math.round(total * 20) / 20;
+  return { subtotal: gross, discount: disc, serviceCharge, tax, total: Math.round(total * 100) / 100 };
+}
+
 function orderNo() {
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
@@ -28,21 +52,18 @@ async function getOrder(id, orgId, storeId) {
 router.post('/', async (req, res) => {
   const p = createOrderSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
-  const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
-  const taxRate = Number(store?.tax_rate || 0);
+  const settings = await loadSettings(orgId, storeId);
   const items = p.items.map((i) => ({ ...i, status: 'pending' }));
-  const { subtotal, tax, total: grossTotal } = computeTotals(items, taxRate);
-  const discount = Math.min(Number(p.discount || 0), subtotal);
-  const total = Math.max(0, grossTotal - discount);
+  const { subtotal, discount, serviceCharge, tax, total } = computeGst(items, p.discount, settings);
   const openShift = await getRow('SELECT id FROM shifts WHERE org_id=? AND store_id=? AND cashier_id=? AND status=? ORDER BY id DESC LIMIT 1', [orgId, storeId, req.user.id, 'open']);
   const id = await insert(
     `INSERT INTO orders
-      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, tax, total, created_by, shift_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, created_by, shift_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       orgId, storeId, orderNo(), p.type, p.tableId ? Number(p.tableId) : null,
       p.customerName ?? null, p.phone ?? null, stringifyJSON(items),
-      subtotal, discount, tax, total, req.user.id, openShift?.id ?? null,
+      subtotal, discount, serviceCharge, tax, total, req.user.id, openShift?.id ?? null,
     ]
   );
   if (p.type === 'dine_in' && p.tableId) {
@@ -80,11 +101,11 @@ router.post('/:id/items', async (req, res) => {
   if (row.status !== 'open') return res.status(400).json({ error: 'order not open' });
   const items = parseJSON(row.items);
   items.push({ ...p, status: 'pending' });
-  const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
-  const totals = computeTotals(items, Number(store?.tax_rate || 0));
+  const settings = await loadSettings(orgId, storeId);
+  const totals = computeGst(items, row.discount, settings);
   await query(
-    'UPDATE orders SET items=?, subtotal=?, tax=?, total=? WHERE id=?',
-    [stringifyJSON(items), totals.subtotal, totals.tax, totals.total, row.id]
+    'UPDATE orders SET items=?, subtotal=?, discount=?, service_charge=?, tax=?, total=? WHERE id=?',
+    [stringifyJSON(items), totals.subtotal, totals.discount, totals.serviceCharge, totals.tax, totals.total, row.id]
   );
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
@@ -133,7 +154,7 @@ router.post('/:id/checkout', async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
-  if (row.status === 'paid' || row.status === 'void') return res.status(400).json({ error: 'already closed' });
+  if (['paid', 'void', 'refunded', 'split'].includes(row.status)) return res.status(400).json({ error: 'already closed' });
   const paidSum = p.payments.reduce((s, x) => s + x.amount, 0);
   if (paidSum + (p.tip || 0) < Number(row.total || 0)) return res.status(400).json({ error: 'amount not covered' });
   for (const pm of p.payments) {
@@ -143,7 +164,11 @@ router.post('/:id/checkout', async (req, res) => {
       [orgId, storeId, row.id, pm.method, pm.amount, 0, req.user.id]
     );
   }
-  await query('UPDATE orders SET status=? WHERE id=?', ['paid', row.id]);
+  const settings = await loadSettings(orgId, storeId);
+  const invCount = await getRow('SELECT COUNT(*) AS c FROM invoices WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const invoiceNo = `${settings.invoicePrefix || 'INV'}-${new Date().getFullYear()}-${String(Number(invCount?.c || 0) + 1).padStart(5, '0')}`;
+  await query('UPDATE orders SET status=?, invoice_no=? WHERE id=?', ['paid', invoiceNo, row.id]);
+  await insert('INSERT INTO invoices (org_id,store_id,order_id,invoice_no,amount,tax) VALUES (?,?,?,?,?,?)', [orgId, storeId, row.id, invoiceNo, Number(row.total || 0), Number(row.tax || 0)]);
   const io = req.app.get('io');
   const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
   await deductInventory(order, req.user, io);
@@ -154,19 +179,16 @@ router.post('/:id/checkout', async (req, res) => {
       ['needs_clean', null, Number(order.tableId), orgId, storeId]
     );
   }
-  const store = await getRow('SELECT * FROM stores WHERE id=?', [storeId]);
   const payments = await query('SELECT * FROM payments WHERE order_id=?', [row.id]);
   res.json({
     order,
     receipt: {
-      storeName: store?.name || 'Store',
-      orderNo: order.orderNo,
-      items: order.items,
-      subtotal: order.subtotal,
-      tax: order.tax,
-      total: order.total,
-      payments: payments.map(toPayment),
-      createdAt: order.createdAt,
+      storeName: settings.companyName || 'Store',
+      address: settings.address || '', phone: settings.phone || '', gstNo: settings.gstNo || '',
+      orderNo: order.orderNo, invoiceNo, items: order.items,
+      subtotal: order.subtotal, discount: order.discount, serviceCharge: order.serviceCharge,
+      tax: order.tax, taxRate: settings.taxRate, taxInclusive: settings.taxInclusive, total: order.total,
+      payments: payments.map(toPayment), footer: settings.receiptFooter || '', createdAt: order.createdAt,
     },
   });
 });
@@ -198,6 +220,17 @@ router.post('/:id/void/approve', rbac('admin', 'manager'), async (req, res) => {
     );
   }
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
+});
+
+router.post('/:id/void/reject', rbac('admin', 'manager'), async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  if (row.status !== 'void_pending') return res.status(400).json({ error: 'not pending' });
+  await query('UPDATE orders SET status=?, void_requested_by=NULL, void_reason=NULL WHERE id=?', ['open', row.id]);
+  const order = toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id]));
+  emitToStore(req.app.get('io'), storeId, 'order:created', order);
+  res.json(order);
 });
 
 export default router;

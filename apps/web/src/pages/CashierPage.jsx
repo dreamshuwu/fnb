@@ -22,6 +22,11 @@ export default function CashierPage() {
   const [paymentRows, setPaymentRows] = useState([{ method: 'cash', amount: '' }]);
   const [settlement, setSettlement] = useState(null);
   const [receipt, setReceipt] = useState(null);
+  const [splitOrder, setSplitOrder] = useState(null);
+  const [refundOrder, setRefundOrder] = useState(null);
+  const [refundList, setRefundList] = useState([]);
+  const [voidQueue, setVoidQueue] = useState([]);
+  const [promoCode, setPromoCode] = useState('');
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
@@ -36,11 +41,13 @@ export default function CashierPage() {
   };
   const loadTables = async () => { const r = await api.get('/tables'); setTables(r.data); };
   const loadActive = async () => { const r = await api.get('/orders?status=kitchen'); setActive(r.data); };
+  const loadVoids = async () => { const r = await api.get('/orders?status=void_pending'); setVoidQueue(r.data); };
 
   useEffect(() => {
     loadTree();
     loadTables();
     loadActive();
+    loadVoids();
     const socketUrl = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || undefined;
     const socket = io(socketUrl, { auth: { token: localStorage.getItem('token') } });
     const receiveOrder = (order) => setActive((prev) => [order, ...prev.filter((o) => o._id !== order._id)]);
@@ -133,7 +140,38 @@ export default function CashierPage() {
     loadActive();
     loadTables();
   };
-  const requestVoid = async (o) => { const reason = prompt('取消原因(需主管审批):'); if (!reason) return; await api.post(`/orders/${o._id}/void`, { reason }); loadActive(); };
+  const requestVoid = async (o) => { const reason = prompt('取消原因(需主管审批):'); if (!reason) return; await api.post(`/orders/${o._id}/void`, { reason }); loadActive(); loadVoids(); };
+  const approveVoid = async (o) => { if (!window.confirm(`批准取消 ${o.orderNo}?`)) return; await api.post(`/orders/${o._id}/void/approve`, {}); loadVoids(); loadActive(); loadTables(); };
+  const rejectVoid = async (o) => { const reason = prompt('拒绝原因:', 'supervisor rejected'); if (reason == null) return; await api.post(`/orders/${o._id}/void/reject`, { reason }); loadVoids(); loadActive(); };
+  const openDrawer = async () => { try { await api.post('/hardware/drawer', {}); alert('钱箱已弹出（ESC/POS 指令已发送）'); } catch { alert('钱箱指令发送失败'); } };
+  const printOrder = async (o, target = 'receipt') => { try { const r = await api.post('/hardware/print', { target, orderId: o._id }); alert(`${target} 打印已排队\n\n${r.data.escpos}`); } catch { alert('打印失败'); } };
+  const applyPromo = async () => {
+    if (!promoCode || !cart.length) return;
+    try {
+      const r = await api.get(`/promotions/apply?code=${encodeURIComponent(promoCode)}&amount=${grossTotal}`);
+      setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, discount: r.data.discount } : p));
+      setPromoCode('');
+      alert(`已应用 ${r.data.code}，折扣 ¥${r.data.discount.toFixed(2)}`);
+    } catch (e) { alert(e.response?.data?.error || '促销码无效'); }
+  };
+  const doSplit = async (payload) => {
+    if (!splitOrder) return;
+    await api.post(`/orders/${splitOrder._id}/split`, payload);
+    setSplitOrder(null);
+    loadActive(); loadTables();
+  };
+  const doRefund = async (payload) => {
+    if (!refundOrder) return;
+    const r = await api.post(`/orders/${refundOrder._id}/refund`, payload);
+    setRefundOrder(null);
+    alert(`退款完成 ¥${Number(r.data.refund.amount).toFixed(2)}`);
+    loadActive();
+  };
+  const openRefundPicker = async () => {
+    const r = await api.get('/orders?status=paid');
+    setRefundList(r.data);
+    setRefundOrder(r.data[0] || null);
+  };
 
   return (
     <div className="cashier-screen">
@@ -182,19 +220,61 @@ export default function CashierPage() {
             {cart.map((c, idx) => <div key={idx} className="cashier-order-row"><span>{idx + 1}</span><span title={c.name}><b>{c.code}</b><br />{c.name}</span><span>{c.qty}</span><span>¥{(c.unitPrice * c.qty).toFixed(2)}<br /><button onClick={() => changeQty(idx, 1)}>+</button><button onClick={() => changeQty(idx, -1)}>−</button></span></div>)}
             {!cart.length && <div className="text-center text-indigo-800 p-5 text-xs">{activePage.status === 'sent' ? '已发送到厨房' : '请选择菜单项目'}</div>}
           </div>
+          <div className="cashier-promo"><input placeholder="Promo code" value={promoCode} onChange={(e) => setPromoCode(e.target.value)} /><button onClick={applyPromo}>Apply</button></div>
           <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
           <div className="cashier-keypad">{['Enter', '7', '8', '9', 'Back', '4', '5', '6', 'Up', '1', '2', '3', 'Down', '0', '.', 'Clear'].map((n) => <button key={n}>{n}</button>)}</div>
         </div>
       </div>
 
       <div className="cashier-footer">
-        <button onClick={() => { const n = prompt('选择桌号', tableId); if (n) setTableId(n); }}>Table</button><button>Member</button><button>Request</button><button>Refund</button><button onClick={sendCurrentPage}>Send</button><button onClick={createPage}>Order</button><button onClick={() => updateActiveCart(() => [])}>Delete All</button><button>Discount</button><button>Open Item</button><button onClick={() => active.length ? openPayment(active[0]) : alert('请先 Send 一个订单')}>Payment</button><button onClick={() => window.print()}>PBill</button><button onClick={() => history.back()}>Exit</button>
+        <button onClick={() => { const n = prompt('选择桌号', tableId); if (n) setTableId(n); }}>Table</button>
+        <button onClick={() => { const code = prompt('Member / A/C No.', ''); if (code) alert(`会员 ${code} 已关联`); }}>Member</button>
+        <button onClick={() => printOrder(active[0] || { _id: '' }, 'receipt')}>Request</button>
+        <button onClick={openRefundPicker}>Refund</button>
+        <button onClick={sendCurrentPage}>Send</button>
+        <button onClick={createPage}>Order</button>
+        <button onClick={() => updateActiveCart(() => [])}>Delete All</button>
+        <button onClick={applyDiscount}>Discount</button>
+        <button onClick={() => { const n = prompt('Open item 名称'); const p = prompt('金额'); if (n && p) updateActiveCart((prev) => [...prev, { variantId: `open-${Date.now()}`, code: 'OPEN', name: n, unitPrice: Number(p), qty: 1 }]); }}>Open Item</button>
+        <button onClick={() => active.length ? openPayment(active[0]) : alert('请先 Send 一个订单')}>Payment</button>
+        <button onClick={() => active.length ? setSplitOrder(active[0]) : alert('请先 Send 一个订单')}>Split</button>
+        <button onClick={() => active.length ? printOrder(active[0]) : alert('请先 Send 一个订单')}>PBill</button>
+        <button onClick={openDrawer}>Drawer</button>
+        <button onClick={() => history.back()}>Exit</button>
       </div>
-      <div className="cashier-orders-strip"><h3>收银端待处理订单 / Kitchen 已收到</h3><div className="cashier-open-orders">{active.map((o) => <div key={o._id} className="cashier-open-card"><b>{o.orderNo}</b> · ¥{o.total}<br />{o.items.reduce((s, i) => s + i.qty, 0)} items <button onClick={() => openPayment(o)}>Payment</button> <button onClick={() => requestVoid(o)}>Void</button></div>)}{!active.length && <span className="text-slate-500 text-xs">Send 后订单会立即显示在这里</span>}</div></div>
+
+      <div className="cashier-orders-strip">
+        <h3>收银端待处理订单 / Kitchen 已收到</h3>
+        <div className="cashier-open-orders">
+          {active.map((o) => <div key={o._id} className="cashier-open-card"><b>{o.orderNo}</b> · ¥{o.total}<br />{o.items.reduce((s, i) => s + i.qty, 0)} items
+            <button onClick={() => openPayment(o)}>Payment</button>
+            <button onClick={() => setSplitOrder(o)}>Split</button>
+            <button onClick={() => printOrder(o)}>Print</button>
+            <button onClick={() => requestVoid(o)}>Void</button>
+          </div>)}
+          {!active.length && <span className="text-slate-500 text-xs">Send 后订单会立即显示在这里</span>}
+        </div>
+      </div>
+
+      {voidQueue.length > 0 && (
+        <div className="cashier-void-queue">
+          <h3>待审批取消 Void Approval ({voidQueue.length})</h3>
+          <div className="cashier-open-orders">
+            {voidQueue.map((o) => <div key={o._id} className="cashier-open-card void">
+              <b>{o.orderNo}</b> · ¥{o.total}<br />
+              <small>原因: {o.voidReason || '-'}</small>
+              <button onClick={() => approveVoid(o)}>Approve</button>
+              <button onClick={() => rejectVoid(o)}>Reject</button>
+            </div>)}
+          </div>
+        </div>
+      )}
 
       {paymentOrder && <PaymentModal order={paymentOrder} rows={paymentRows} setRows={setPaymentRows} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} />}
       {settlement && <SettlementModal settlement={settlement} onComplete={completeSettlement} onClose={() => setSettlement(null)} />}
       {receipt && <ReceiptModal receipt={receipt} onClose={() => setReceipt(null)} />}
+      {splitOrder && <SplitBillModal order={splitOrder} onConfirm={doSplit} onClose={() => setSplitOrder(null)} />}
+      {refundOrder && <RefundModal order={refundOrder} orders={refundList} onPick={setRefundOrder} onConfirm={doRefund} onClose={() => setRefundOrder(null)} />}
     </div>
   );
 }
@@ -211,6 +291,98 @@ function SettlementModal({ settlement, onComplete, onClose }) {
 }
 
 function ReceiptModal({ receipt, onClose }) {
-  const print = () => { const w = window.open('', '_blank'); const rows = receipt.items.map((i) => `<div>${i.qty} x ${i.name} ...... ¥${(i.unitPrice * i.qty).toFixed(2)}</div>`).join(''); w.document.write(`<html><body style="font-family:monospace;width:280px;padding:10px"><h3>${receipt.storeName}</h3><div>${receipt.orderNo}</div><hr/>${rows}<hr/><b>Total ¥${receipt.total.toFixed(2)}</b></body></html>`); w.document.close(); w.print(); };
-  return <div className="legacy-window-wrap"><section className="legacy-window" style={{ width: 330 }}><header><span>Receipt</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><h2>{receipt.storeName}</h2><div>Bill: {receipt.orderNo}</div>{receipt.items.map((i, idx) => <div key={idx} className="flex justify-between"><span>{i.qty}x{i.name}</span><span>¥{i.unitPrice * i.qty}</span></div>)}<hr /><div className="flex justify-between font-bold"><span>Total</span><span>¥{receipt.total}</span></div><div className="legacy-window-actions"><button className="legacy-btn green" onClick={print}>Print</button><button className="legacy-btn pink" onClick={onClose}>Exit</button></div></div></section></div>;
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const print = () => {
+    const w = window.open('', '_blank');
+    const rows = receipt.items.map((i) => `<div>${i.qty} x ${i.name} ...... ${money(i.unitPrice * i.qty)}</div>`).join('');
+    w.document.write(`<html><body style="font-family:monospace;width:300px;padding:10px"><h3>${receipt.storeName}</h3><div>${receipt.address || ''}</div><div>GST: ${receipt.gstNo || '-'}</div><div>Invoice: ${receipt.invoiceNo || receipt.orderNo}</div><hr/>${rows}<hr/>${receipt.discount ? `<div>Discount -${money(receipt.discount)}</div>` : ''}${receipt.serviceCharge ? `<div>Service ${money(receipt.serviceCharge)}</div>` : ''}<div>Subtotal ${money(receipt.subtotal)}</div><div>GST ${receipt.taxRate || 0}% ${money(receipt.tax)}</div><b>Total ${money(receipt.total)}</b><hr/><div>${receipt.footer || ''}</div></body></html>`);
+    w.document.close(); w.print();
+  };
+  return <div className="legacy-window-wrap"><section className="legacy-window receipt-window" style={{ width: 340 }}><header><span>Receipt / Tax Invoice</span><button onClick={onClose}>×</button></header><div className="legacy-window-body">
+    <h2>{receipt.storeName}</h2>
+    {receipt.address && <div className="receipt-sub">{receipt.address}</div>}
+    {receipt.gstNo && <div className="receipt-sub">GST No: {receipt.gstNo}</div>}
+    <div className="receipt-sub">Invoice: {receipt.invoiceNo || '-'} · Bill: {receipt.orderNo}</div>
+    <hr />
+    {receipt.items.map((i, idx) => <div key={idx} className="flex justify-between"><span>{i.qty}x{i.name}</span><span>{money(i.unitPrice * i.qty)}</span></div>)}
+    <hr />
+    {receipt.discount > 0 && <div className="flex justify-between"><span>Discount</span><span>-{money(receipt.discount)}</span></div>}
+    {receipt.serviceCharge > 0 && <div className="flex justify-between"><span>Service Charge</span><span>{money(receipt.serviceCharge)}</span></div>}
+    <div className="flex justify-between"><span>Subtotal</span><span>{money(receipt.subtotal)}</span></div>
+    <div className="flex justify-between"><span>GST {receipt.taxRate || 0}%{receipt.taxInclusive ? ' (incl.)' : ''}</span><span>{money(receipt.tax)}</span></div>
+    <div className="flex justify-between font-bold"><span>Total</span><span>{money(receipt.total)}</span></div>
+    <div className="legacy-window-actions"><button className="legacy-btn green" onClick={print}>Print</button><button className="legacy-btn pink" onClick={onClose}>Exit</button></div>
+  </div></section></div>;
+}
+
+function SplitBillModal({ order, onConfirm, onClose }) {
+  const [mode, setMode] = useState('item');
+  const [pax, setPax] = useState(2);
+  const [parts, setParts] = useState(2);
+  const [assign, setAssign] = useState(order.items.map(() => 0)); // 每个 item 属于第几组
+  const [groupCount, setGroupCount] = useState(2);
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const submit = () => {
+    if (mode === 'item') {
+      const groups = Array.from({ length: groupCount }, () => []);
+      order.items.forEach((it, i) => groups[assign[i] || 0].push(i));
+      const cleaned = groups.filter((g) => g.length);
+      if (cleaned.length < 2) { alert('至少需要分成 2 组'); return; }
+      onConfirm({ mode: 'item', groups: cleaned });
+    } else if (mode === 'pax') onConfirm({ mode: 'pax', pax: Number(pax) });
+    else onConfirm({ mode: 'equal', parts: Number(parts) });
+  };
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 520 }}>
+    <header><span>Split Bill · {order.orderNo} · {money(order.total)}</span><button onClick={onClose}>×</button></header>
+    <div className="legacy-window-body">
+      <div className="split-mode-tabs">
+        <button className={mode === 'item' ? 'active' : ''} onClick={() => setMode('item')}>By Item 按菜品</button>
+        <button className={mode === 'pax' ? 'active' : ''} onClick={() => setMode('pax')}>By Pax 按人数</button>
+        <button className={mode === 'equal' ? 'active' : ''} onClick={() => setMode('equal')}>Equal 均分</button>
+      </div>
+      {mode === 'item' && <div className="split-items">
+        <div className="split-group-count">分成 <input type="number" min="2" max="8" value={groupCount} onChange={(e) => setGroupCount(Math.max(2, Number(e.target.value)))} /> 组</div>
+        {order.items.map((it, i) => <div key={i} className="split-item-row"><span>{it.qty}x {it.name}</span><select value={assign[i] || 0} onChange={(e) => setAssign((prev) => prev.map((v, idx) => idx === i ? Number(e.target.value) : v))}>{Array.from({ length: groupCount }, (_, g) => <option key={g} value={g}>Group {g + 1}</option>)}</select></div>)}
+      </div>}
+      {mode === 'pax' && <div className="split-param"><label>人数 Pax<input type="number" min="2" max="20" value={pax} onChange={(e) => setPax(e.target.value)} /></label><p>系统会把菜品轮流分配到 {pax} 张子单。</p></div>}
+      {mode === 'equal' && <div className="split-param"><label>均分份数<input type="number" min="2" max="20" value={parts} onChange={(e) => setParts(e.target.value)} /></label><p>每份约 {money(Number(order.total) / (Number(parts) || 1))}</p></div>}
+      <div className="legacy-window-actions"><button className="legacy-btn green" onClick={submit}>Create Split Bills</button><button className="legacy-btn pink" onClick={onClose}>Cancel</button></div>
+    </div>
+  </section></div>;
+}
+
+function RefundModal({ order, orders, onPick, onConfirm, onClose }) {
+  const [mode, setMode] = useState('full');
+  const [reason, setReason] = useState('customer refund');
+  const [method, setMethod] = useState('cash');
+  const [restock, setRestock] = useState(true);
+  const [picked, setPicked] = useState(order.items.map(() => 0));
+  const [amount, setAmount] = useState('');
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
+  const partialTotal = order.items.reduce((s, it, i) => s + Number(it.unitPrice) * Number(picked[i] || 0), 0);
+  const submit = () => {
+    if (mode === 'full') onConfirm({ amount: Number(order.total) - Number(order.refundedAmount || 0), reason, method, restock });
+    else if (mode === 'items') {
+      const items = order.items.map((it, i) => ({ index: i, qty: Number(picked[i] || 0) })).filter((x) => x.qty > 0);
+      if (!items.length) { alert('请选择要退的菜品数量'); return; }
+      onConfirm({ items, reason, method, restock });
+    } else onConfirm({ amount: Number(amount), reason, method, restock });
+  };
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 540 }}>
+    <header><span>Refund · {order.orderNo}</span><button onClick={onClose}>×</button></header>
+    <div className="legacy-window-body">
+      {orders.length > 1 && <label className="ops-field"><span>选择已付款订单</span><select value={order._id} onChange={(e) => onPick(orders.find((o) => o._id === e.target.value))}>{orders.map((o) => <option key={o._id} value={o._id}>{o.orderNo} · {money(o.total)}</option>)}</select></label>}
+      <div className="split-mode-tabs">
+        <button className={mode === 'full' ? 'active' : ''} onClick={() => setMode('full')}>Full 全额</button>
+        <button className={mode === 'items' ? 'active' : ''} onClick={() => setMode('items')}>By Item 按菜品</button>
+        <button className={mode === 'amount' ? 'active' : ''} onClick={() => setMode('amount')}>Amount 指定金额</button>
+      </div>
+      {mode === 'full' && <div className="payment-amount-box"><small>REFUND AMOUNT</small><strong>{money(Number(order.total) - Number(order.refundedAmount || 0))}</strong></div>}
+      {mode === 'items' && <div className="split-items">{order.items.map((it, i) => <div key={i} className="split-item-row"><span>{it.name} · {money(it.unitPrice)}</span><input type="number" min="0" max={it.qty} value={picked[i] || 0} onChange={(e) => setPicked((prev) => prev.map((v, idx) => idx === i ? Math.min(it.qty, Math.max(0, Number(e.target.value))) : v))} /></div>)}<div className="split-param"><p>退款小计 {money(partialTotal)}</p></div></div>}
+      {mode === 'amount' && <div className="split-param"><label>退款金额<input type="number" min="0" value={amount} onChange={(e) => setAmount(e.target.value)} /></label></div>}
+      <div className="payment-field"><label>退款方式<select value={method} onChange={(e) => setMethod(e.target.value)}><option value="cash">Cash</option><option value="card">Card</option><option value="tab">Credit / Account</option><option value="cheque">Cheque</option></select></label><label>原因<input value={reason} onChange={(e) => setReason(e.target.value)} /></label></div>
+      <label className="ops-checkbox"><input type="checkbox" checked={restock} onChange={(e) => setRestock(e.target.checked)} /> 退回库存 Restock</label>
+      <div className="legacy-window-actions"><button className="legacy-btn green" onClick={submit}>Confirm Refund</button><button className="legacy-btn pink" onClick={onClose}>Cancel</button></div>
+    </div>
+  </section></div>;
 }

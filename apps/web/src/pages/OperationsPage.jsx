@@ -3,15 +3,25 @@ import { useSearchParams } from 'react-router-dom';
 import { api } from '../api/client.js';
 
 const TABS = [
-  ['members', 'Members'], ['finance', 'Cash / Vouchers'], ['attendance', 'Attendance'],
-  ['shifts', 'Close Shift'], ['suppliers', 'Suppliers'], ['purchases', 'Purchase / GRN'], ['reports', 'Reports'],
+  ['members', 'Members'], ['finance', 'Cash / Vouchers'], ['voids', 'Void Approval'], ['refunds', 'Refunds'],
+  ['attendance', 'Attendance'], ['shifts', 'Close Shift'], ['suppliers', 'Suppliers'], ['purchases', 'Purchase / GRN'], ['reports', 'Reports'],
+];
+
+const REPORT_TYPES = [
+  ['sales_by_date', 'Sales By Date'], ['sales_by_product', 'Sales By Product'], ['sales_by_payment', 'Sales By Payment Type'],
+  ['sales_by_hour', 'Sales By Hour'], ['sales_by_cashier', 'Sales By Cashier'], ['sales_by_table', 'Sales By Table'],
+  ['sales_by_department', 'Sales By Department'], ['top_products', 'Top Products'],
+  ['void_report', 'Void / Cancellation'], ['refund_report', 'Refund Report'], ['discount_report', 'Discount Report'],
+  ['stock_report', 'Stock Report'], ['customer_stock', 'Customer Stock'], ['member_points', 'Member Points'],
+  ['knock_off', 'Knock Off'], ['cash_bill', 'Cash Bill'], ['payout', 'Payout / Withdraw'],
+  ['credit_note', 'Credit Note'], ['close_shift', 'Close Shift'], ['gst_summary', 'GST Summary'],
 ];
 
 export default function OperationsPage() {
   const [params, setParams] = useSearchParams();
   const tab = params.get('tab') || 'members';
   const active = TABS.some(([key]) => key === tab) ? tab : 'members';
-  return <div className="operations-page"><div className="operations-heading"><div><div className="modern-eyebrow">SMPOS / BACK OFFICE</div><h1>Operations Center</h1><p>会员、财务、班结、采购和报表</p></div><div className="operations-date">{new Date().toLocaleDateString('en-GB')}</div></div><div className="operations-tabs">{TABS.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div><div className="operations-content">{active === 'members' && <MembersPanel />} {active === 'finance' && <FinancePanel />} {active === 'attendance' && <AttendancePanel />} {active === 'shifts' && <ShiftPanel />} {active === 'suppliers' && <SupplierPanel />} {active === 'purchases' && <PurchasePanel />} {active === 'reports' && <ReportPanel />}</div></div>;
+  return <div className="operations-page"><div className="operations-heading"><div><div className="modern-eyebrow">SMPOS / BACK OFFICE</div><h1>Operations Center</h1><p>会员、财务、取消审批、退款、班结、采购和报表</p></div><div className="operations-date">{new Date().toLocaleDateString('en-GB')}</div></div><div className="operations-tabs">{TABS.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div><div className="operations-content">{active === 'members' && <MembersPanel />} {active === 'finance' && <FinancePanel />} {active === 'voids' && <VoidPanel />} {active === 'refunds' && <RefundPanel />} {active === 'attendance' && <AttendancePanel />} {active === 'shifts' && <ShiftPanel />} {active === 'suppliers' && <SupplierPanel />} {active === 'purchases' && <PurchasePanel />} {active === 'reports' && <ReportPanel />}</div></div>;
 }
 
 function Panel({ title, subtitle, children }) { return <section className="ops-panel"><div className="ops-panel-heading"><div><h2>{title}</h2><p>{subtitle}</p></div></div>{children}</section>; }
@@ -57,7 +67,24 @@ function PurchasePanel() {
   return <Panel title="Purchase Order / GRN" subtitle="Create purchase order and receive goods into inventory"><div className="ops-form"><Input label="Supplier ID" value={form.supplierId} onChange={(v) => setForm({ ...form, supplierId: v })} /><Input label="Inventory Item ID" value={form.itemId} onChange={(v) => setForm({ ...form, itemId: v })} /><Input label="Quantity" type="number" value={form.qty} onChange={(v) => setForm({ ...form, qty: v })} /><Input label="Total" type="number" value={form.total} onChange={(v) => setForm({ ...form, total: v })} /><Action onClick={add}>Create PO</Action></div><div className="ops-table"><div className="ops-row ops-head"><span>PO No.</span><span>Supplier</span><span>Total</span><span>Status</span></div>{rows.map((r) => <div className="ops-row" key={r.id}><span>{r.poNo}</span><span>{r.supplierId || '-'}</span><span>¥{r.total.toFixed(2)}</span><span>{r.status} {r.status === 'open' && <button className="mini-action" onClick={async () => { await api.post(`/purchases/${r.id}/receive`); load(); }}>Receive GRN</button>}</span></div>)}{!rows.length && <Empty />}</div></Panel>;
 }
 
+function VoidPanel() {
+  const [rows, setRows] = useState([]);
+  const load = async () => { const r = await api.get('/orders?status=void_pending'); setRows(r.data); };
+  useEffect(() => { load(); }, []);
+  const approve = async (o) => { if (!window.confirm(`批准取消 ${o.orderNo}?`)) return; await api.post(`/orders/${o._id}/void/approve`, {}); load(); };
+  const reject = async (o) => { const reason = prompt('拒绝原因:', 'supervisor rejected'); if (reason == null) return; await api.post(`/orders/${o._id}/void/reject`, { reason }); load(); };
+  return <Panel title="Void Approval" subtitle="Cancellation requests awaiting supervisor approval"><div className="ops-table"><div className="ops-row ops-head"><span>Order</span><span>Amount</span><span>Reason</span><span>Action</span></div>{rows.map((o) => <div className="ops-row" key={o._id}><span>{o.orderNo}</span><span>¥{Number(o.total).toFixed(2)}</span><span>{o.voidReason || '-'}</span><span className="ops-inline-actions"><button className="mini-action" onClick={() => approve(o)}>Approve</button><button className="mini-action danger" onClick={() => reject(o)}>Reject</button></span></div>)}{!rows.length && <Empty text="No pending void requests" />}</div></Panel>;
+}
+
+function RefundPanel() {
+  const [rows, setRows] = useState([]);
+  const load = async () => setRows((await api.get('/refunds')).data);
+  useEffect(() => { load(); }, []);
+  const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  return <Panel title="Refund Records" subtitle="Partial / full refunds with stock restoration"><div className="report-kpis"><span>Refunds <b>{rows.length}</b></span><span>Total Refunded <b>¥{total.toFixed(2)}</b></span></div><div className="ops-table"><div className="ops-row ops-head"><span>Refund No.</span><span>Order</span><span>Amount</span><span>Method</span><span>Reason</span><span>Restock</span><span>Date</span></div>{rows.map((r) => <div className="ops-row" key={r._id}><span>{r.refundNo}</span><span>{r.orderNo}</span><span>¥{Number(r.amount).toFixed(2)}</span><span>{r.method}</span><span>{r.reason}</span><span>{r.restock ? 'Yes' : 'No'}</span><span>{new Date(r.createdAt).toLocaleString()}</span></div>)}{!rows.length && <Empty text="No refunds yet" />}</div></Panel>;
+}
+
 function ReportPanel() {
   const [type, setType] = useState('sales_by_date'); const [report, setReport] = useState(null); const run = async () => setReport((await api.get(`/reports/query?type=${type}`)).data); const columns = report?.rows?.length ? Object.keys(report.rows[0]) : [];
-  return <Panel title="Reports" subtitle="Sales By Date · Product · Payment Type · Export / Print"><div className="ops-form inline"><label className="ops-field"><span>Report Type</span><select value={type} onChange={(e) => setType(e.target.value)}><option value="sales_by_date">Sales By Date</option><option value="sales_by_product">Sales By Product</option><option value="sales_by_payment">Sales By Payment Type</option></select></label><Action onClick={run}>Run Report</Action><Action tone="secondary" onClick={() => window.print()}>Print</Action></div>{report && <div className="report-result"><div className="report-kpis"><span>Total <b>¥{Number(report.total).toFixed(2)}</b></span><span>Orders <b>{report.count}</b></span></div><div className="ops-table"><div className="ops-row ops-head">{columns.map((c) => <span key={c}>{c}</span>)}</div>{report.rows.map((row, i) => <div className="ops-row" key={i}>{columns.map((c) => <span key={c}>{typeof row[c] === 'number' ? Number(row[c]).toFixed(2) : String(row[c] ?? '-')}</span>)}</div>)}{!report.rows.length && <Empty text="No data for this report" />}</div></div>}</Panel>;
+  return <Panel title="Reports" subtitle="20+ report templates · Sales · Void · Refund · Stock · GST"><div className="ops-form inline"><label className="ops-field"><span>Report Type</span><select value={type} onChange={(e) => setType(e.target.value)}>{REPORT_TYPES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}</select></label><Action onClick={run}>Run Report</Action><Action tone="secondary" onClick={() => window.print()}>Print</Action></div>{report && <div className="report-result"><div className="report-kpis"><span>Total <b>¥{Number(report.total).toFixed(2)}</b></span><span>Rows <b>{report.count}</b></span></div><div className="ops-table"><div className="ops-row ops-head">{columns.map((c) => <span key={c}>{c}</span>)}</div>{report.rows.map((row, i) => <div className="ops-row" key={i}>{columns.map((c) => <span key={c}>{typeof row[c] === 'number' ? Number(row[c]).toFixed(2) : String(row[c] ?? '-')}</span>)}</div>)}{!report.rows.length && <Empty text="No data for this report" />}</div></div>}</Panel>;
 }

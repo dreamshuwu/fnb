@@ -1,5 +1,6 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext.jsx';
+import { api } from '../api/client.js';
 
 const NAV = [
   { feature: 'sales', label: 'Sales', icon: '⚑', roles: ['admin', 'manager', 'cashier', 'waiter'] },
@@ -7,14 +8,22 @@ const NAV = [
   { feature: 'withdraw', label: 'Withdraw', icon: '♢', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'payment', label: 'Payment', icon: '▱', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'credit-note', label: 'Credit Note', icon: '▰', roles: ['admin', 'manager'] },
+  { feature: 'refund', label: 'Refund', icon: '↩', roles: ['admin', 'manager', 'cashier'] },
+  { feature: 'void-approval', label: 'Void Approval', icon: '⊘', roles: ['admin', 'manager'] },
   { feature: 'received', label: 'Received', icon: '♨', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'drawer', label: 'Open Drawer', icon: '▣', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'close-shift', label: 'Close shift', icon: '◉', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'daily-sales', label: 'Daily sales', icon: '▱', roles: ['admin', 'manager', 'cashier'] },
   { feature: 'reports', label: 'Reports', icon: '◌', roles: ['admin', 'manager'] },
   { feature: 'attendance', label: 'Attendance', icon: '◍', roles: ['admin', 'manager', 'cashier'] },
+  { feature: 'back-office', label: 'Back Office', icon: '⚙', roles: ['admin', 'manager'] },
   { feature: 'password', label: 'Password', icon: '▣', roles: ['admin', 'manager', 'cashier', 'waiter', 'kitchen'] },
 ];
+
+const FEATURE_TABS = {
+  'cash-in': 'finance', withdraw: 'finance', payment: 'finance', 'credit-note': 'finance', received: 'finance',
+  refund: 'refunds', 'void-approval': 'voids', 'close-shift': 'shifts', attendance: 'attendance', reports: 'reports',
+};
 
 export default function Layout() {
   const { user, logout } = useAuth();
@@ -23,8 +32,9 @@ export default function Layout() {
 
   const go = (item) => {
     if (item.to) navigate(item.to);
-    else if (item.feature === 'drawer') alert('钱箱开启指令已发送（浏览器版会在硬件连接后执行）');
-    else if (['cash-in', 'withdraw', 'payment', 'credit-note', 'received', 'close-shift', 'attendance', 'reports'].includes(item.feature)) navigate(`/operations?tab=${item.feature === 'close-shift' ? 'shifts' : item.feature === 'reports' ? 'reports' : item.feature === 'cash-in' || item.feature === 'withdraw' || item.feature === 'payment' || item.feature === 'credit-note' || item.feature === 'received' ? 'finance' : item.feature}`);
+    else if (item.feature === 'drawer') { api.post('/hardware/drawer', {}).catch(() => {}); alert('钱箱开启指令已发送（ESC/POS）'); }
+    else if (item.feature === 'back-office') navigate('/backoffice');
+    else if (FEATURE_TABS[item.feature]) navigate(`/operations?tab=${FEATURE_TABS[item.feature]}`);
     else navigate(`/desktop?feature=${item.feature}`);
   };
 
