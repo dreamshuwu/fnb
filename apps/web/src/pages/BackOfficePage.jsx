@@ -221,7 +221,7 @@ function RebatePanel() {
     </Panel>
     {ledger && <Panel title={`Rebate Ledger · ${ledger.member.memberNo}`} subtitle={`${ledger.member.name} · 当前余额 ${money(ledger.member.rebateBalance)}`}>
       <div className="ops-actions"><Action tone="secondary" onClick={() => setLedger(null)}>Close</Action></div>
-      <div className="ops-table tall"><div className="ops-row ops-head"><span>When</span><span>Type</span><span>Amount</span><span>Balance After</span><span>Order</span><span>Rate</span><span>Reason</span><span>By</span></div>
+      <div className="ops-table rebate-ledger-table"><div className="ops-row ops-head"><span>When</span><span>Type</span><span>Amount</span><span>Balance After</span><span>Order</span><span>Rate</span><span>Reason</span><span>By</span></div>
         {ledger.rows.map((r) => <div className="ops-row" key={r.id}><span>{new Date(r.createdAt).toLocaleString('en-GB')}</span><span>{r.type}</span><span>{money(r.amount)}</span><span>{money(r.balanceAfter)}</span><span>{r.orderNo || '-'}</span><span>{r.percent ? `${r.percent}%` : '-'}</span><span>{r.reason || '-'}</span><span>{r.createdByName || '-'}</span></div>)}
         {!ledger.rows.length && <Empty text="No rebate entry" />}
       </div>
