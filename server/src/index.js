@@ -1,3 +1,8 @@
+// ⚠️ 必须是第一个 import:它会修补 express.Router,让 async handler 的抛错
+// 走 next(err) 而不是变成 unhandledRejection 杀掉进程。
+// ESM 按 import 顺序求值,放第一位才能早于下面所有 routes/*.js 生效。
+import { errorHandler } from './middleware/errors.js';
+
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
@@ -19,6 +24,7 @@ import inventoryRoutes from './routes/inventory.js';
 import reportRoutes from './routes/reports.js';
 import shiftRoutes from './routes/shifts.js';
 import businessRoutes from './routes/business.js';
+import purchasingRoutes from './routes/purchasing.js';
 
 const app = express();
 app.use(helmet());
@@ -65,6 +71,7 @@ if (process.env.DEV_NO_DB === '1') {
   app.use('/api/inventory', inventoryRoutes);
   app.use('/api/reports', reportRoutes);
   app.use('/api', businessRoutes);
+  app.use('/api', purchasingRoutes);
   app.use('/api/shifts', shiftRoutes);
   const { initSockets } = await import('./sockets.js');
   initSockets(io);
@@ -78,3 +85,7 @@ if (process.env.DEV_NO_DB === '1') {
       process.exit(1);
     });
 }
+
+// 兜底错误中间件:必须挂在所有路由之后。
+// 走到这里的通常是 next(err) 传下来的异常(含 zod 校验失败)。
+app.use(errorHandler);

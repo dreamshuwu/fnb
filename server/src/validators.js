@@ -99,14 +99,102 @@ export const checkoutSchema = z.object({
 export const voidSchema = z.object({ reason: z.string().min(1) });
 
 export const inventoryItemSchema = z.object({
+  code: z.string().optional().nullable(),
   name: z.string().min(1),
+  category: z.string().optional().nullable(),
+  barcode: z.string().optional().nullable(),
   unit: z.string().optional(),
   quantity: z.number().optional(),
   threshold: z.number().optional(),
-  costPrice: z.number().optional(),
+  costPrice: z.number().optional().nullable(),
+  avgCost: z.number().optional(),
+  lastCost: z.number().optional(),
+  location: z.string().optional().nullable(),
+  supplierId: z.union([z.string(), z.number()]).optional().nullable(),
+  note: z.string().optional().nullable(),
+  isActive: z.boolean().optional(),
 });
 
+// 库存变动类型:盘点用 count(绝对值),其余按增量;opening 用于期初建账
+export const STOCK_MOVE_TYPES = [
+  'opening', 'restock', 'purchase_receipt', 'receipt_void',
+  'adjustment', 'adjust', 'count', 'wastage', 'return',
+  'transfer_in', 'transfer_out', 'sale', 'credit_note', 'refund',
+];
 export const adjustSchema = z.object({
+  itemId: z.union([z.string(), z.number()]).optional(),
   delta: z.number(),
-  type: z.enum(['restock', 'adjust', 'count']).default('adjust'),
+  type: z.enum(STOCK_MOVE_TYPES).default('adjustment'),
+  unitCost: z.number().optional(),
+  note: z.string().optional(),
+  reason: z.string().optional(),
+  refNo: z.string().optional(),
+  location: z.string().optional(),
+});
+// 批量盘点/调整:一次提交多行,全部校验通过才落库
+export const stockMoveLineSchema = z.object({
+  itemId: z.union([z.string(), z.number()]),
+  delta: z.number().optional(),
+  qty: z.number().optional(),
+  unitCost: z.number().optional(),
+  note: z.string().optional(),
+});
+export const stockAdjustBatchSchema = z.object({
+  type: z.enum(STOCK_MOVE_TYPES).default('adjustment'),
+  reason: z.string().optional(),
+  location: z.string().optional(),
+  lines: z.array(stockMoveLineSchema).min(1),
+});
+
+export const supplierSchema = z.object({
+  code: z.string().optional().nullable(),
+  name: z.string().min(1),
+  phone: z.string().optional().nullable(),
+  contact: z.string().optional().nullable(),
+  contactPerson: z.string().optional().nullable(),
+  email: z.string().optional().nullable(),
+  address: z.string().optional().nullable(),
+  taxNo: z.string().optional().nullable(),
+  paymentTerms: z.string().optional().nullable(),
+  creditTermsDays: z.number().int().min(0).optional(),
+  note: z.string().optional().nullable(),
+  status: z.enum(['active', 'inactive']).optional(),
+});
+
+export const purchaseLineSchema = z.object({
+  itemId: z.union([z.string(), z.number()]),
+  qty: z.number().positive(),
+  unitCost: z.number().min(0).default(0),
+  taxRate: z.number().min(0).optional(),
+  note: z.string().optional().nullable(),
+});
+export const purchaseOrderSchema = z.object({
+  supplierId: z.union([z.string(), z.number()]).optional().nullable(),
+  expectedDate: z.string().optional().nullable(),
+  note: z.string().optional().nullable(),
+  taxRate: z.number().min(0).optional(),
+  lines: z.array(purchaseLineSchema).min(1),
+});
+
+export const goodsReceiptSchema = z.object({
+  note: z.string().optional().nullable(),
+  // 不传 lines = 按 PO 未收数量全额收货
+  lines: z.array(z.object({
+    poLineId: z.union([z.string(), z.number()]).optional(),
+    itemId: z.union([z.string(), z.number()]).optional(),
+    qty: z.number().positive(),
+    unitCost: z.number().min(0).optional(),
+    note: z.string().optional().nullable(),
+  })).optional(),
+});
+
+export const stockTransferSchema = z.object({
+  fromLocation: z.string().min(1),
+  toLocation: z.string().min(1),
+  note: z.string().optional().nullable(),
+  lines: z.array(z.object({
+    itemId: z.union([z.string(), z.number()]),
+    qty: z.number().positive(),
+    note: z.string().optional().nullable(),
+  })).min(1),
 });

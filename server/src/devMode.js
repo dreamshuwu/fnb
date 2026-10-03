@@ -7,6 +7,12 @@ import { signTokens, JWT_SECRET } from './middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from './reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from './reportEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from './exporters.js';
+import { applyMovements, applyMovement, valuationOf, makeDocNo, derivePoStatus } from './inventoryEngine.js';
+// 复用生产同一份 zod schema —— 否则「预览能过、生产报错」这类漂移会一直存在
+import {
+  supplierSchema, purchaseOrderSchema, goodsReceiptSchema, stockTransferSchema,
+  inventoryItemSchema, adjustSchema,
+} from './validators.js';
 import {
   ROLES, PERMISSION_GROUPS, ALL_PERMISSIONS, defaultPermissions, hasPermission, resolveRolePermissions,
 } from './permissions.js';
@@ -29,9 +35,16 @@ const store = {
   dayEnds: [],
   // 新增：角色权限矩阵覆盖值 { manager: [...], cashier: [...] }
   rolePermissions: {},
+  // 新增：采购与库存补全 —— 统一台账 / 采购行明细 / 收货单 / 库位调拨
+  stockMovements: [], purchaseOrderLines: [], goodsReceipts: [], goodsReceiptLines: [],
+  stockTransfers: [], stockTransferLines: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
+// 金额/数量取整:库存用 3 位小数,成本用 4 位(按克计价时 2 位不够)
+const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
+const round4 = (n) => Math.round(Number(n || 0) * 10000) / 10000;
 
 // ---- 种子数据（kopitiam 风格，演示用；后台可改） ----
 const CATS = [
@@ -124,14 +137,65 @@ function seedDev() {
   }
   for (const [name, cat, price] of SINGLE_BASES) addVar(baseIds[name], cat, name, name, price);
 
-  store.inventory.push({ id: nid(), orgId: '1', storeId: '1', name: '咖啡豆', unit: 'kg', quantity: 5, threshold: 2, costPrice: 80 });
-  store.inventory.push({ id: nid(), orgId: '1', storeId: '1', name: '杯子', unit: '个', quantity: 200, threshold: 50, costPrice: 0.5 });
+  // ---- 供应商主档(kopitiam 常见三类:干货饮品 / 生鲜乳品 / 烟草) ----
+  const SUPPLIERS = [
+    ['SUP-001', 'Demo Supplier', '03-1234 5678', 'Ah Hock', 'sales@demosupplier.com',
+      '12 Jalan Industri 3, 50000 Kuala Lumpur', 'GST-SUP-0001', 'Net 30', 30],
+    ['SUP-002', 'Kedai Borong Segar', '03-8765 4321', 'Siti', 'order@borongsegar.com',
+      '88 Jalan Pasar, 50000 Kuala Lumpur', 'GST-SUP-0002', 'Net 14', 14],
+    ['SUP-003', 'Tobacco Wholesale Sdn Bhd', '03-2222 3333', 'Ravi', 'sales@twb.com.my',
+      '5 Jalan Perdagangan, 50000 Kuala Lumpur', 'GST-SUP-0003', 'COD', 0],
+  ];
+  const supIds = [];
+  for (const [code, name, phone, person, email, address, taxNo, terms, days] of SUPPLIERS) {
+    const id = nid();
+    supIds.push(id);
+    store.suppliers.push({
+      id, orgId: '1', storeId: '1', code, name, phone, contact: person, contactPerson: person,
+      email, address, taxNo, paymentTerms: terms, creditTermsDays: days, note: null,
+      status: 'active', createdAt: now(), updatedAt: now(),
+    });
+  }
+
+  // ---- 库存主档:avgCost 用移动加权平均,lastCost 是最近一次入库价 ----
+  // [code, name, category, unit, qty, threshold, avgCost, lastCost, location, supplierIdx]
+  const ITEMS = [
+    ['RAW-001', '咖啡豆 Robusta', 'Coffee Bean', 'kg', 12.5, 5, 80.0, 82.0, 'Dry Store', 0],
+    ['RAW-002', '红茶粉', 'Tea', 'kg', 6.0, 3, 22.0, 22.0, 'Dry Store', 0],
+    ['RAW-003', 'Milo 粉', 'Malt', 'kg', 8.0, 3, 28.0, 27.5, 'Dry Store', 0],
+    ['RAW-004', '白糖', 'Sugar', 'kg', 30.0, 10, 2.8, 2.8, 'Dry Store', 0],
+    ['RAW-005', '淡奶 Evaporated', 'Dairy', '罐', 24.0, 8, 3.2, 3.3, 'Chiller', 1],
+    ['RAW-006', '炼乳 Condensed', 'Dairy', '罐', 18.0, 8, 3.6, 3.6, 'Chiller', 1],
+    ['PKG-001', '纸杯 8oz', 'Packaging', '个', 800.0, 200, 0.12, 0.12, 'Counter Store', 0],
+    ['PKG-002', '杯盖 8oz', 'Packaging', '个', 600.0, 200, 0.05, 0.05, 'Counter Store', 0],
+    ['RTD-001', '100plus 罐装', 'Can Drink', '罐', 120.0, 48, 1.9, 1.95, 'Chiller', 0],
+    ['TOB-001', 'Marlboro', 'Tobacco', '包', 40.0, 20, 12.5, 12.8, 'Counter Store', 2],
+  ];
+  const invIds = [];
+  for (const [code, name, category, unit, qty, threshold, avgCost, lastCost, location, si] of ITEMS) {
+    const id = nid();
+    invIds.push(id);
+    store.inventory.push({
+      id, orgId: '1', storeId: '1', code, name, category, barcode: null, unit,
+      quantity: qty, threshold, costPrice: avgCost, avgCost, lastCost,
+      location, supplierId: supIds[si], note: null, isActive: true, createdAt: now(), updatedAt: now(),
+    });
+  }
+  // 期初台账:让库存估值报表从第一天就有据可查
+  for (const it of store.inventory) {
+    store.stockMovements.push({
+      id: nid(), orgId: '1', storeId: '1', itemId: it.id, itemCode: it.code, itemName: it.name,
+      type: 'opening', delta: Number(it.quantity), before: 0, after: Number(it.quantity),
+      unitCost: Number(it.avgCost), amount: +(Number(it.quantity) * Number(it.avgCost)).toFixed(2),
+      avgCostAfter: Number(it.avgCost), refType: 'opening', refId: null, refNo: null,
+      location: it.location, note: '期初库存', createdBy: '1', createdByName: 'Admin', createdAt: now(),
+    });
+  }
 
   for (const n of ['A1', 'A2', 'B1']) {
     store.tables.push({ id: nid(), orgId: '1', storeId: '1', number: n, zone: '大厅', seats: 4, status: 'free', currentOrderId: null });
   }
   store.members.push({ id: nid(), orgId: '1', storeId: '1', memberNo: 'M0001', name: 'Demo Member', phone: '0123456789', creditBalance: 0, points: 120, status: 'active', createdAt: now() });
-  store.suppliers.push({ id: nid(), orgId: '1', storeId: '1', code: 'SUP-001', name: 'Demo Supplier', phone: '', contact: '', status: 'active', createdAt: now() });
   store.shifts.push({ id: nid(), orgId: '1', storeId: '1', cashierId: '3', openAmount: 0, expectedAmount: 0, closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null });
   store.settings.push({ id: nid(), orgId: '1', storeId: '1', key: 'taxRate', value: 0 });
 
@@ -257,9 +321,34 @@ const toTable = (t) => ({
   status: t.status, currentOrderId: t.currentOrderId == null ? null : String(t.currentOrderId), createdAt: now(), updatedAt: now(),
 });
 const toInventoryItem = (inv) => ({
-  _id: inv.id, id: inv.id, orgId: inv.orgId, storeId: inv.storeId, name: inv.name, unit: inv.unit,
-  quantity: Number(inv.quantity || 0), threshold: Number(inv.threshold || 0),
-  costPrice: inv.costPrice == null ? null : Number(inv.costPrice), createdAt: now(), updatedAt: now(),
+  _id: inv.id, id: inv.id, orgId: inv.orgId, storeId: inv.storeId, name: inv.name,
+  code: inv.code || null, category: inv.category || null, barcode: inv.barcode || null,
+  unit: inv.unit, quantity: Number(inv.quantity || 0), threshold: Number(inv.threshold || 0),
+  costPrice: inv.costPrice == null ? null : Number(inv.costPrice),
+  avgCost: Number(inv.avgCost || 0), lastCost: Number(inv.lastCost || 0),
+  stockValue: round2(Number(inv.quantity || 0) * Number(inv.avgCost || 0)),
+  location: inv.location || null,
+  supplierId: inv.supplierId == null ? null : String(inv.supplierId),
+  note: inv.note || null,
+  isActive: inv.isActive == null ? true : !!inv.isActive,
+  isLow: Number(inv.quantity || 0) < Number(inv.threshold || 0),
+  createdAt: inv.createdAt || now(), updatedAt: inv.updatedAt || inv.createdAt || now(),
+});
+const toStockMovement = (m) => ({
+  _id: m.id, id: m.id, orgId: m.orgId, storeId: m.storeId,
+  itemId: m.itemId == null ? null : String(m.itemId),
+  itemCode: m.itemCode || null, itemName: m.itemName || null, type: m.type,
+  delta: Number(m.delta || 0), before: Number(m.before || 0), after: Number(m.after || 0),
+  unitCost: Number(m.unitCost || 0), amount: Number(m.amount || 0),
+  avgCostAfter: Number(m.avgCostAfter || 0),
+  refOrderId: m.refOrderId == null ? null : String(m.refOrderId),
+  refType: m.refType || null,
+  refId: m.refId == null ? null : String(m.refId),
+  refNo: m.refNo || null,
+  location: m.location || null, note: m.note || null,
+  createdBy: m.createdBy == null ? null : String(m.createdBy),
+  createdByName: m.createdByName || null,
+  createdAt: m.createdAt || now(),
 });
 const toOrder = (o) => ({
   _id: o.id, id: o.id, orgId: o.orgId, storeId: o.storeId, orderNo: o.orderNo, type: o.type,
@@ -312,7 +401,81 @@ const toRebate = (r) => ({
 const toMovement = (m) => ({ _id: m.id, id: m.id, type: m.type, voucherNo: m.voucherNo, payTo: m.payTo, amount: Number(m.amount || 0), reason: m.reason, method: m.method, createdBy: m.createdBy, createdAt: m.createdAt });
 const toAttendance = (a) => ({ _id: a.id, id: a.id, userId: a.userId, userName: a.userName, action: a.action, code: a.code, time: a.time, note: a.note || '' });
 const toShift = (s) => ({ _id: s.id, id: s.id, cashierId: s.cashierId, openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0), closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0), status: s.status, openedAt: s.openedAt, closedAt: s.closedAt });
-const toSupplier = (s) => ({ _id: s.id, id: s.id, code: s.code, name: s.name, phone: s.phone, contact: s.contact, status: s.status, createdAt: s.createdAt });
+const toSupplier = (s) => ({
+  _id: s.id, id: s.id, orgId: s.orgId, storeId: s.storeId,
+  code: s.code || null, name: s.name, phone: s.phone || null, contact: s.contact || null,
+  contactPerson: s.contactPerson || s.contact || null,
+  email: s.email || null, address: s.address || null, taxNo: s.taxNo || null,
+  paymentTerms: s.paymentTerms || null, creditTermsDays: Number(s.creditTermsDays || 0),
+  note: s.note || null, status: s.status || 'active',
+  isActive: (s.status || 'active') === 'active',
+  createdAt: s.createdAt || now(), updatedAt: s.updatedAt || s.createdAt || now(),
+});
+const toPurchaseOrderLine = (l) => ({
+  _id: l.id, id: l.id, poId: l.poId == null ? null : String(l.poId), lineNo: Number(l.lineNo || 0),
+  itemId: l.itemId == null ? null : String(l.itemId),
+  itemCode: l.itemCode || null, itemName: l.itemName || null, unit: l.unit || null,
+  qty: Number(l.qty || 0), receivedQty: Number(l.receivedQty || 0),
+  outstandingQty: Math.max(0, round3(Number(l.qty || 0) - Number(l.receivedQty || 0))),
+  unitCost: Number(l.unitCost || 0), taxRate: Number(l.taxRate || 0),
+  amount: Number(l.amount || 0), note: l.note || null, createdAt: l.createdAt || now(),
+});
+const toPurchaseOrder = (p, lines = null) => ({
+  _id: p.id, id: p.id, orgId: p.orgId, storeId: p.storeId, poNo: p.poNo,
+  supplierId: p.supplierId == null ? null : String(p.supplierId),
+  supplierName: p.supplierName || null,
+  items: p.items || [],
+  ...(lines ? { lines: lines.map(toPurchaseOrderLine) } : {}),
+  subtotal: Number(p.subtotal || 0), taxAmount: Number(p.taxAmount || 0), total: Number(p.total || 0),
+  status: p.status || 'draft', expectedDate: p.expectedDate || null, note: p.note || null,
+  receivedAt: p.receivedAt || null, approvedAt: p.approvedAt || null,
+  approvedBy: p.approvedBy == null ? null : String(p.approvedBy),
+  approvedByName: p.approvedByName || null,
+  cancelledAt: p.cancelledAt || null, cancelReason: p.cancelReason || null,
+  createdBy: p.createdBy == null ? null : String(p.createdBy),
+  createdByName: p.createdByName || null,
+  createdAt: p.createdAt || now(), updatedAt: p.updatedAt || p.createdAt || now(),
+});
+const toGoodsReceiptLine = (l) => ({
+  _id: l.id, id: l.id, grnId: l.grnId == null ? null : String(l.grnId),
+  poLineId: l.poLineId == null ? null : String(l.poLineId),
+  itemId: l.itemId == null ? null : String(l.itemId),
+  itemCode: l.itemCode || null, itemName: l.itemName || null, unit: l.unit || null,
+  qty: Number(l.qty || 0), unitCost: Number(l.unitCost || 0), amount: Number(l.amount || 0),
+  beforeQty: Number(l.beforeQty || 0), afterQty: Number(l.afterQty || 0),
+  avgCostAfter: Number(l.avgCostAfter || 0), note: l.note || null, createdAt: l.createdAt || now(),
+});
+const toGoodsReceipt = (g, lines = null) => ({
+  _id: g.id, id: g.id, orgId: g.orgId, storeId: g.storeId, grnNo: g.grnNo,
+  poId: g.poId == null ? null : String(g.poId), poNo: g.poNo || null,
+  supplierId: g.supplierId == null ? null : String(g.supplierId),
+  supplierName: g.supplierName || null,
+  total: Number(g.total || 0), status: g.status || 'posted', note: g.note || null,
+  receivedAt: g.receivedAt || now(),
+  voidedAt: g.voidedAt || null, voidReason: g.voidReason || null,
+  ...(lines ? { lines: lines.map(toGoodsReceiptLine) } : {}),
+  createdBy: g.createdBy == null ? null : String(g.createdBy),
+  createdByName: g.createdByName || null, createdAt: g.createdAt || now(),
+});
+const toStockTransferLine = (l) => ({
+  _id: l.id, id: l.id, transferId: l.transferId == null ? null : String(l.transferId),
+  itemId: l.itemId == null ? null : String(l.itemId),
+  toItemId: l.toItemId == null ? null : String(l.toItemId),
+  itemCode: l.itemCode || null, itemName: l.itemName || null, unit: l.unit || null,
+  qty: Number(l.qty || 0), unitCost: Number(l.unitCost || 0), amount: Number(l.amount || 0),
+  beforeQty: Number(l.beforeQty || 0), afterQty: Number(l.afterQty || 0),
+  avgCostAfter: Number(l.avgCostAfter || 0),
+  note: l.note || null, createdAt: l.createdAt || now(),
+});
+const toStockTransfer = (t, lines = null) => ({
+  _id: t.id, id: t.id, orgId: t.orgId, storeId: t.storeId, transferNo: t.transferNo,
+  fromLocation: t.fromLocation || null, toLocation: t.toLocation || null,
+  status: t.status || 'posted', totalCost: Number(t.totalCost || 0), note: t.note || null,
+  voidedAt: t.voidedAt || null, voidReason: t.voidReason || null,
+  ...(lines ? { lines: lines.map(toStockTransferLine) } : {}),
+  createdBy: t.createdBy == null ? null : String(t.createdBy),
+  createdByName: t.createdByName || null, createdAt: t.createdAt || now(),
+});
 const toRefund = (r) => ({ _id: r.id, id: r.id, refundNo: r.refundNo, orderId: String(r.orderId), orderNo: r.orderNo, amount: Number(r.amount || 0), method: r.method || 'cash', reason: r.reason || '', items: r.items || [], restock: !!r.restock, createdBy: r.createdBy, createdAt: r.createdAt });
 const toPromotion = (p) => ({ _id: p.id, id: p.id, code: p.code, name: p.name, type: p.type, value: Number(p.value || 0), minSpend: Number(p.minSpend || 0), validFrom: p.validFrom || null, validUntil: p.validUntil || null, isActive: !!p.isActive, createdAt: p.createdAt });
 const toCustomerStock = (c) => ({ _id: c.id, id: c.id, memberId: String(c.memberId), memberNo: c.memberNo, itemName: c.itemName, qty: Number(c.qty || 0), unit: c.unit || 'pcs', note: c.note || '', createdAt: c.createdAt });
@@ -386,7 +549,6 @@ function computeOrderTotals(items, discount = 0) {
   return { subtotal: gross, discount: disc, serviceCharge, tax, total: Math.round(total * 100) / 100 };
 }
 
-const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
 const dayOf = (d) => String(d || '').slice(0, 10);
 
 // 进行中(可转台 / 可并台 / 可加菜)的订单状态
@@ -514,6 +676,109 @@ function devRequirePerm(...keys) {
   };
 }
 
+// ---- 库存引擎的内存适配器:与生产 inventoryStore.js 同一份契约 ----
+const devInventoryAdapter = {
+  async getItem(_orgId, _storeId, itemId) {
+    if (itemId == null || itemId === '') return null;
+    const inv = store.inventory.find((x) => x.id === String(itemId));
+    return inv ? toInventoryItem(inv) : null;
+  },
+  async saveItem(item, patch) {
+    const inv = store.inventory.find((x) => x.id === String(item.id));
+    if (!inv) return;
+    inv.quantity = Number(patch.quantity || 0);
+    inv.avgCost = Number(patch.avgCost || 0);
+    inv.lastCost = Number(patch.lastCost || 0);
+    inv.updatedAt = now();
+  },
+  async appendMovement(mv) {
+    const row = { id: nid(), ...mv, createdAt: now() };
+    store.stockMovements.push(row);
+    return toStockMovement(row);
+  },
+};
+/**
+ * 用与生产完全相同的 zod schema 校验请求体。
+ * 生产路由直接 schema.parse() 抛错给全局错误处理;预览里手动转成 400,
+ * 保证「同样的输入,两边给同样的结果」。
+ */
+function devParse(schema, body) {
+  const r = schema.safeParse(body || {});
+  if (r.success) return { ok: true, data: r.data };
+  const issue = r.error?.issues?.[0];
+  return {
+    ok: false,
+    message: issue ? `${issue.path.join('.') || 'body'}: ${issue.message}` : 'validation_failed',
+    issues: r.error?.issues || [],
+  };
+}
+
+/** 落库后检查是否跌破安全库存并广播。 */
+function devNotifyLow(io, itemIds) {
+  const low = [];
+  for (const id of itemIds) {
+    const inv = store.inventory.find((x) => x.id === String(id));
+    if (inv && Number(inv.quantity) < Number(inv.threshold)) {
+      low.push({ itemId: String(inv.id), name: inv.name, quantity: Number(inv.quantity) });
+    }
+  }
+  if (low.length && io) io.to('store:1').emit('inventory:low', low);
+}
+
+// ---- 采购单行明细(内存) ----
+// 注意:这里返回的是 store 里的**原始行对象**(便于直接改 receivedQty),
+// 所以字段是 camelCase 且**没有** outstandingQty —— 那是 mapper 算出来的。
+const devPoLines = (poId) => store.purchaseOrderLines
+  .filter((l) => String(l.poId) === String(poId))
+  .sort((a, b) => Number(a.lineNo) - Number(b.lineNo));
+
+/** 未收数量 = 订购 - 已收(不小于 0)。 */
+const devOutstanding = (l) => round3(Math.max(0, Number(l.qty || 0) - Number(l.receivedQty || 0)));
+
+/** 按行重算 小计 / 税额 / 合计,与生产 routes/purchasing.js 同一算法。 */
+function devComputeTotals(lines, defaultTaxRate = 0) {
+  let subtotal = 0, taxAmount = 0;
+  for (const l of lines) {
+    const amount = round2(Number(l.qty || 0) * Number(l.unitCost || 0));
+    subtotal += amount;
+    const rate = l.taxRate == null || l.taxRate === '' ? Number(defaultTaxRate || 0) : Number(l.taxRate);
+    taxAmount += (amount * rate) / 100;
+  }
+  subtotal = round2(subtotal);
+  taxAmount = round2(taxAmount);
+  return { subtotal, taxAmount, total: round2(subtotal + taxAmount) };
+}
+
+/** 覆盖式写入行明细(先删后插),行内快照物料编码/名称/单位。 */
+function devWritePoLines(poId, lines, defaultTaxRate) {
+  store.purchaseOrderLines = store.purchaseOrderLines.filter((l) => String(l.poId) !== String(poId));
+  let lineNo = 1;
+  const out = [];
+  for (const l of lines) {
+    const item = store.inventory.find((x) => x.id === String(l.itemId));
+    if (!item) { const e = new Error('item_not_found'); e.itemId = l.itemId; throw e; }
+    const amount = round2(Number(l.qty || 0) * Number(l.unitCost || 0));
+    const rate = l.taxRate == null || l.taxRate === '' ? Number(defaultTaxRate || 0) : Number(l.taxRate);
+    const row = {
+      id: nid(), poId: String(poId), lineNo: lineNo++,
+      itemId: String(l.itemId), itemCode: item.code || null, itemName: item.name, unit: item.unit || null,
+      qty: Number(l.qty || 0), receivedQty: 0,
+      unitCost: Number(l.unitCost || 0), taxRate: rate, amount,
+      note: l.note || null, createdAt: now(),
+    };
+    store.purchaseOrderLines.push(row);
+    out.push(row);
+  }
+  return out.map(toPurchaseOrderLine);
+}
+
+/** 重新推导 PO 状态(收货/作废后调用),返回状态字符串。 */
+function devRefreshPoStatus(po) {
+  po.status = derivePoStatus(devPoLines(po.id), po.status);
+  po.updatedAt = now();
+  return po.status;
+}
+
 // ---------------------------------------------------------------------------
 // 报表数据集:把内存 store 整理成 reportEngine 需要的统一结构。
 // 关键在 enrich —— 订单行项目补上 category / station,订单补上桌号、收银员、会员。
@@ -582,8 +847,25 @@ function buildReportDataset() {
     variants: store.variants.map((v) => ({ ...v, stockQty: Number(v.stockQty || 0), stockThreshold: Number(v.stockThreshold || 0), cost: Number(v.cost || 0) })),
     customerStock: store.customerStock,
     stockTakes: store.stockTakes,
-    suppliers: store.suppliers,
-    purchaseOrders: store.purchaseOrders.map((p) => ({ ...p, total: Number(p.total || 0) })),
+    suppliers: store.suppliers.map(toSupplier),
+    purchaseOrders: store.purchaseOrders.map((p) => toPurchaseOrder(p)),
+    // 采购行本身不带单头信息,报表要按日期/状态/供应商过滤,这里补上单头快照
+    purchaseOrderLines: store.purchaseOrderLines.map((l) => {
+      const po = store.purchaseOrders.find((p) => String(p.id) === String(l.poId)) || {};
+      return {
+        ...toPurchaseOrderLine(l),
+        poNo: po.poNo || null,
+        poDate: po.createdAt || null,
+        poStatus: po.status || 'draft',
+        supplierId: po.supplierId == null ? null : String(po.supplierId),
+      };
+    }),
+    stockMovements: store.stockMovements.map(toStockMovement),
+    inventoryItems: store.inventory.map(toInventoryItem),
+    goodsReceipts: store.goodsReceipts.map((g) => toGoodsReceipt(g)),
+    goodsReceiptLines: store.goodsReceiptLines.map(toGoodsReceiptLine),
+    stockTransfers: store.stockTransfers.map((t) => toStockTransfer(t)),
+    stockTransferLines: store.stockTransferLines.map(toStockTransferLine),
     attendance: store.attendance,
     reprintLogs: store.reprintLogs,
     orderTransfers: store.orderTransfers,
@@ -1822,17 +2104,128 @@ export function createDevRouter(io) {
   r.get('/reprints', (req, res) => res.json(store.reprintLogs));
 
   // ---- 库存（原料级） ----
-  r.get('/inventory/items', (req, res) => res.json(store.inventory.map(toInventoryItem)));
-  r.post('/inventory/items', devRequirePerm('stock.take'), (req, res) => {
-    const b = req.body;
-    const inv = { id: nid(), orgId: '1', storeId: '1', name: b.name, unit: b.unit, quantity: Number(b.quantity || 0), threshold: Number(b.threshold || 0), costPrice: b.costPrice == null ? null : Number(b.costPrice) };
-    store.inventory.push(inv); res.status(201).json(toInventoryItem(inv));
+  r.get('/inventory/items', devRequirePerm('stock.view'), (req, res) => {
+    let list = store.inventory;
+    if (req.query.category) list = list.filter((x) => x.category === req.query.category);
+    if (req.query.location) list = list.filter((x) => x.location === req.query.location);
+    if (req.query.supplierId) list = list.filter((x) => String(x.supplierId) === String(req.query.supplierId));
+    if (req.query.low === '1' || req.query.low === 'true') list = list.filter((x) => Number(x.quantity) < Number(x.threshold));
+    if (req.query.q) {
+      const q = String(req.query.q).toLowerCase();
+      list = list.filter((x) => String(x.name || '').toLowerCase().includes(q)
+        || String(x.code || '').toLowerCase().includes(q)
+        || String(x.barcode || '').toLowerCase().includes(q));
+    }
+    res.json(list.map(toInventoryItem));
   });
-  r.post('/inventory/adjust', devRequirePerm('stock.take'), (req, res) => {
-    const inv = store.inventory.find((x) => x.id === String(req.body.itemId));
+  r.post('/inventory/items', devRequirePerm('stock.take'), async (req, res) => {
+    const b = req.body || {};
+    const avgCost = Number(b.avgCost != null ? b.avgCost : (b.costPrice || 0));
+    const inv = {
+      id: nid(), orgId: '1', storeId: '1',
+      code: b.code || null, name: b.name, category: b.category || null, barcode: b.barcode || null,
+      unit: b.unit || null,
+      quantity: 0, threshold: Number(b.threshold || 0),
+      costPrice: b.costPrice == null ? null : Number(b.costPrice),
+      avgCost, lastCost: Number(b.lastCost != null ? b.lastCost : avgCost),
+      location: b.location || null,
+      supplierId: b.supplierId || null, note: b.note || null, isActive: true,
+      createdAt: now(), updatedAt: now(),
+    };
+    store.inventory.push(inv);
+    // 期初数量走引擎,保证 quantity / avgCost / 台账三者一致
+    const qty = Number(b.quantity || 0);
+    if (qty !== 0) {
+      const r = await applyMovements(devInventoryAdapter, [{
+        itemId: inv.id, type: 'opening', qty, unitCost: avgCost, note: '新建物料期初',
+      }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name });
+      if (!r.ok) return res.status(400).json({ error: r.errors[0].error, detail: r.errors[0] });
+    }
+    res.status(201).json(toInventoryItem(inv));
+  });
+  r.get('/inventory/items/:id', devRequirePerm('stock.view'), (req, res) => {
+    const inv = store.inventory.find((x) => x.id === req.params.id);
     if (!inv) return res.status(404).json({ error: 'not found' });
-    inv.quantity = Math.max(0, Number(inv.quantity) + Number(req.body.delta || 0));
+    const movements = store.stockMovements
+      .filter((m) => String(m.itemId) === inv.id)
+      .sort((a, b) => {
+        const t = String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+        if (t !== 0) return -t;
+        return Number(b.id) - Number(a.id);
+      })
+      .slice(0, 50)
+      .map(toStockMovement);
+    res.json({ ...toInventoryItem(inv), movements });
+  });
+  r.put('/inventory/items/:id', devRequirePerm('stock.take'), (req, res) => {
+    const inv = store.inventory.find((x) => x.id === req.params.id);
+    if (!inv) return res.status(404).json({ error: 'not found' });
+    const b = req.body || {};
+    // quantity 不允许在这里改(必须走 adjust 以便留台账)
+    for (const k of ['code', 'name', 'category', 'barcode', 'unit', 'location', 'note']) {
+      if (b[k] !== undefined) inv[k] = b[k];
+    }
+    if (b.threshold !== undefined) inv.threshold = Number(b.threshold);
+    if (b.costPrice !== undefined) inv.costPrice = b.costPrice == null ? null : Number(b.costPrice);
+    if (b.avgCost !== undefined) inv.avgCost = Number(b.avgCost || 0);
+    if (b.lastCost !== undefined) inv.lastCost = Number(b.lastCost || 0);
+    if (b.supplierId !== undefined) inv.supplierId = b.supplierId || null;
+    if (b.isActive !== undefined) inv.isActive = !!b.isActive;
+    inv.updatedAt = now();
     res.json(toInventoryItem(inv));
+  });
+  r.post('/inventory/adjust', devRequirePerm('stock.take'), async (req, res) => {
+    const b = req.body || {};
+    if (b.itemId == null) return res.status(400).json({ error: 'itemId required' });
+    const type = b.type || 'adjustment';
+    const r = await applyMovements(devInventoryAdapter, [{
+      itemId: b.itemId, type, qty: b.delta, unitCost: b.unitCost,
+      note: b.note || b.reason, location: b.location, refType: type, refNo: b.refNo,
+    }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name });
+    if (!r.ok) {
+      const e = r.errors[0];
+      return res.status(e.error === 'item_not_found' ? 404 : 400).json({ error: e.error, detail: e });
+    }
+    devNotifyLow(req.app.get('io'), [b.itemId]);
+    const inv = store.inventory.find((x) => x.id === String(b.itemId));
+    res.json({ ...toInventoryItem(inv), movement: r.movements[0] });
+  });
+  // 批量盘点/调整:全通过才落库
+  r.post('/inventory/adjust/batch', devRequirePerm('stock.take'), async (req, res) => {
+    const b = req.body || {};
+    const type = b.type || 'adjustment';
+    const lines = (b.lines || []).map((l) => ({
+      itemId: l.itemId, type,
+      qty: l.qty != null ? l.qty : l.delta,
+      unitCost: l.unitCost, note: l.note || b.reason, location: b.location, refType: type,
+    }));
+    if (!lines.length) return res.status(400).json({ error: 'no_lines' });
+    const r = await applyMovements(devInventoryAdapter, lines, {
+      orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name,
+    });
+    if (!r.ok) return res.status(400).json({ error: 'batch_failed', errors: r.errors });
+    devNotifyLow(req.app.get('io'), lines.map((l) => l.itemId));
+    res.json({ ok: true, count: r.movements.length, movements: r.movements });
+  });
+  r.get('/inventory/valuation', devRequirePerm('stock.view'), (req, res) => {
+    res.json(valuationOf(store.inventory.map(toInventoryItem)));
+  });
+  r.get('/inventory/movements', devRequirePerm('stock.view'), (req, res) => {
+    // 与生产同一口径:created_at DESC, 再按 id DESC 兜底 ——
+    // 同一毫秒内写入的多笔必须有确定顺序,否则台账顺序会随机。
+    let list = [...store.stockMovements].sort((a, b) => {
+      const t = String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+      if (t !== 0) return -t;
+      return Number(b.id) - Number(a.id);
+    });
+    if (req.query.itemId) list = list.filter((m) => String(m.itemId) === String(req.query.itemId));
+    if (req.query.type) list = list.filter((m) => m.type === req.query.type);
+    if (req.query.refType) list = list.filter((m) => m.refType === req.query.refType);
+    if (req.query.refId) list = list.filter((m) => String(m.refId) === String(req.query.refId));
+    if (req.query.from) list = list.filter((m) => String(m.createdAt || '').slice(0, 10) >= String(req.query.from));
+    if (req.query.to) list = list.filter((m) => String(m.createdAt || '').slice(0, 10) <= String(req.query.to));
+    const limit = Number(req.query.limit || 200);
+    res.json(list.slice(0, limit).map(toStockMovement));
   });
 
   // ---- 报表 ----
@@ -1988,11 +2381,543 @@ export function createDevRouter(io) {
   });
 
   // ---- Suppliers / Purchase Order / GRN ----
-  r.get('/suppliers', (req, res) => res.json(store.suppliers.map(toSupplier)));
-  r.post('/suppliers', devRequirePerm('stock.purchase'), (req, res) => { const b = req.body || {}; const s = { id: nid(), orgId: '1', storeId: '1', code: b.code || `SUP-${store.suppliers.length + 1}`, name: b.name || '', phone: b.phone || '', contact: b.contact || '', status: 'active', createdAt: now() }; store.suppliers.push(s); res.status(201).json(toSupplier(s)); });
-  r.get('/purchases', (req, res) => res.json(store.purchaseOrders));
-  r.post('/purchases', devRequirePerm('stock.purchase'), (req, res) => { const b = req.body || {}; const p = { id: nid(), poNo: b.poNo || `PO${Date.now()}`, supplierId: b.supplierId || null, items: b.items || [], total: Number(b.total || 0), status: 'open', createdAt: now() }; store.purchaseOrders.unshift(p); res.status(201).json(p); });
-  r.post('/purchases/:id/receive', devRequirePerm('stock.purchase'), (req, res) => { const p = store.purchaseOrders.find((x) => x.id === req.params.id); if (!p) return res.status(404).json({ error: 'not found' }); p.status = 'received'; p.receivedAt = now(); for (const item of p.items || []) { const inv = store.inventory.find((x) => x.id === String(item.itemId)); if (inv) inv.quantity += Number(item.qty || 0); } res.json(p); });
+  // ---- 供应商主档(带对账单 / 软删除) ----
+  r.get('/suppliers', devRequirePerm('stock.view'), (req, res) => {
+    let list = store.suppliers;
+    if (req.query.status) list = list.filter((x) => (x.status || 'active') === req.query.status);
+    if (req.query.q) {
+      const q = String(req.query.q).toLowerCase();
+      list = list.filter((x) => [x.name, x.code, x.phone, x.contactPerson, x.contact]
+        .some((v) => String(v || '').toLowerCase().includes(q)));
+    }
+    list = [...list].sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
+    res.json(list.map(toSupplier));
+  });
+  const devNextSupplierCode = () => {
+    let max = 0;
+    for (const s of store.suppliers) {
+      const n = parseInt(String(s.code || '').replace(/^SUP-/, ''), 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+    return `SUP-${String(max + 1).padStart(3, '0')}`;
+  };
+  r.get('/suppliers/next-code', devRequirePerm('stock.purchase'), (req, res) => res.json({ code: devNextSupplierCode() }));
+  r.post('/suppliers', devRequirePerm('stock.purchase'), (req, res) => {
+    const v = devParse(supplierSchema, req.body);
+    if (!v.ok) return res.status(400).json({ error: 'validation_failed', message: v.message });
+    const b = v.data;
+    const s = {
+      id: nid(), orgId: '1', storeId: '1',
+      code: b.code || devNextSupplierCode(), name: b.name,
+      phone: b.phone || null, contact: b.contactPerson || b.contact || null,
+      contactPerson: b.contactPerson || null,
+      email: b.email || null, address: b.address || null, taxNo: b.taxNo || null,
+      paymentTerms: b.paymentTerms || null, creditTermsDays: Number(b.creditTermsDays || 0),
+      note: b.note || null, status: b.status === 'inactive' ? 'inactive' : 'active',
+      createdAt: now(), updatedAt: now(),
+    };
+    store.suppliers.push(s);
+    res.status(201).json(toSupplier(s));
+  });
+  r.get('/suppliers/:id', devRequirePerm('stock.view'), (req, res) => {
+    const s = store.suppliers.find((x) => x.id === req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    res.json({
+      ...toSupplier(s),
+      purchaseOrders: store.purchaseOrders.filter((p) => String(p.supplierId) === s.id).map((p) => toPurchaseOrder(p)),
+      items: store.inventory.filter((i) => String(i.supplierId) === s.id).map(toInventoryItem),
+    });
+  });
+  r.put('/suppliers/:id', devRequirePerm('stock.purchase'), (req, res) => {
+    const s = store.suppliers.find((x) => x.id === req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const v = devParse(supplierSchema.partial(), req.body);
+    if (!v.ok) return res.status(400).json({ error: 'validation_failed', message: v.message });
+    const b = v.data;
+    for (const k of ['code', 'name', 'phone', 'email', 'address', 'taxNo', 'paymentTerms', 'note', 'status']) {
+      if (b[k] !== undefined) s[k] = b[k];
+    }
+    if (b.contactPerson !== undefined) { s.contactPerson = b.contactPerson; s.contact = b.contactPerson; }
+    else if (b.contact !== undefined) s.contact = b.contact;
+    if (b.creditTermsDays !== undefined) s.creditTermsDays = Number(b.creditTermsDays || 0);
+    s.updatedAt = now();
+    res.json(toSupplier(s));
+  });
+  r.put('/suppliers/:id/status', devRequirePerm('stock.purchase'), (req, res) => {
+    const s = store.suppliers.find((x) => x.id === req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    s.status = req.body?.status === 'inactive' ? 'inactive' : 'active';
+    s.updatedAt = now();
+    res.json(toSupplier(s));
+  });
+  r.delete('/suppliers/:id', devRequirePerm('stock.purchase'), (req, res) => {
+    const idx = store.suppliers.findIndex((x) => x.id === req.params.id);
+    if (idx < 0) return res.status(404).json({ error: 'not found' });
+    // 有采购单往来就软删除,避免历史单据断链
+    const used = store.purchaseOrders.some((p) => String(p.supplierId) === req.params.id);
+    if (used) {
+      store.suppliers[idx].status = 'inactive';
+      store.suppliers[idx].updatedAt = now();
+      return res.json({ ok: true, softDeleted: true, reason: 'has_purchase_orders' });
+    }
+    store.suppliers.splice(idx, 1);
+    res.json({ ok: true, softDeleted: false });
+  });
+  // ---- 供应商对账单 ----
+  r.get('/suppliers/:id/statement', devRequirePerm('stock.view'), (req, res) => {
+    const s = store.suppliers.find((x) => x.id === req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const from = req.query.from || null, to = req.query.to || null;
+    const inRange = (d) => {
+      const day = String(d || '').slice(0, 10);
+      if (from && day < from) return false;
+      if (to && day > to) return false;
+      return true;
+    };
+    const pos = store.purchaseOrders.filter((p) => String(p.supplierId) === s.id && inRange(p.createdAt));
+    const grns = store.goodsReceipts.filter((g) => String(g.supplierId) === s.id && inRange(g.createdAt));
+    const activePos = pos.filter((p) => p.status !== 'cancelled');
+    const postedGrns = grns.filter((g) => g.status !== 'void');
+    const entries = [];
+    for (const p of activePos) {
+      entries.push({ date: p.createdAt, type: 'po', refNo: p.poNo, poNo: p.poNo, status: p.status, ordered: Number(p.total || 0), received: 0, running: 0 });
+    }
+    for (const g of postedGrns) {
+      entries.push({ date: g.createdAt, type: 'grn', refNo: g.grnNo, poNo: g.poNo, status: g.status, ordered: 0, received: Number(g.total || 0), running: 0 });
+    }
+    entries.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    let running = 0;
+    for (const e of entries) { running = round2(running + e.received); e.running = running; }
+    const poTotal = round2(activePos.reduce((x, p) => x + Number(p.total || 0), 0));
+    const receivedTotal = round2(postedGrns.reduce((x, g) => x + Number(g.total || 0), 0));
+    res.json({
+      supplier: toSupplier(s), from, to,
+      summary: {
+        poCount: activePos.length, poTotal,
+        grnCount: postedGrns.length, receivedTotal,
+        outstanding: round2(poTotal - receivedTotal),
+        cancelledCount: pos.length - activePos.length,
+        voidedGrnCount: grns.length - postedGrns.length,
+        lastOrderAt: activePos.length ? activePos[activePos.length - 1].createdAt : null,
+      },
+      entries,
+      purchaseOrders: activePos.map((p) => toPurchaseOrder(p)),
+      goodsReceipts: postedGrns.map((g) => toGoodsReceipt(g)),
+    });
+  });
+  // ---- 采购订单 PO 全生命周期 ----
+  r.get('/purchases', devRequirePerm('stock.view'), (req, res) => {
+    let list = store.purchaseOrders;
+    if (req.query.status) list = list.filter((p) => (p.status || 'draft') === req.query.status);
+    if (req.query.supplierId) list = list.filter((p) => String(p.supplierId) === String(req.query.supplierId));
+    if (req.query.q) list = list.filter((p) => String(p.poNo || '').toLowerCase().includes(String(req.query.q).toLowerCase()));
+    if (req.query.from) list = list.filter((p) => String(p.createdAt || '').slice(0, 10) >= req.query.from);
+    if (req.query.to) list = list.filter((p) => String(p.createdAt || '').slice(0, 10) <= req.query.to);
+    res.json([...list].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map((p) => {
+      const lines = devPoLines(p.id);
+      return {
+        ...toPurchaseOrder(p),
+        lineCount: lines.length,
+        totalQty: round3(lines.reduce((s, l) => s + Number(l.qty || 0), 0)),
+        receivedQty: round3(lines.reduce((s, l) => s + Number(l.receivedQty || 0), 0)),
+      };
+    }));
+  });
+  r.post('/purchases', devRequirePerm('stock.purchase'), (req, res) => {
+    const v = devParse(purchaseOrderSchema, req.body);
+    if (!v.ok) return res.status(400).json({ error: 'validation_failed', message: v.message });
+    const b = v.data;
+    const lines = b.lines || [];
+    if (!lines.length) return res.status(400).json({ error: 'no_lines' });
+    let supplierName = null;
+    if (b.supplierId) {
+      const sup = store.suppliers.find((x) => x.id === String(b.supplierId));
+      if (!sup) return res.status(400).json({ error: 'supplier_not_found' });
+      supplierName = sup.name;
+    }
+    const totals = devComputeTotals(lines, b.taxRate);
+    const po = {
+      id: nid(), orgId: '1', storeId: '1',
+      poNo: makeDocNo('PO', store.purchaseOrders.map((p) => p.poNo)),
+      supplierId: b.supplierId ? String(b.supplierId) : null, supplierName,
+      subtotal: totals.subtotal, taxAmount: totals.taxAmount, total: totals.total,
+      status: 'draft', expectedDate: b.expectedDate || null, note: b.note || null,
+      receivedAt: null, approvedAt: null, approvedBy: null, approvedByName: null,
+      cancelledAt: null, cancelReason: null,
+      createdBy: req.user.id, createdByName: req.user.name,
+      createdAt: now(), updatedAt: now(),
+    };
+    store.purchaseOrders.unshift(po);
+    let rows;
+    try { rows = devWritePoLines(po.id, lines, b.taxRate); }
+    catch (e) {
+      store.purchaseOrders = store.purchaseOrders.filter((x) => x.id !== po.id);
+      store.purchaseOrderLines = store.purchaseOrderLines.filter((l) => String(l.poId) !== po.id);
+      if (e.message === 'item_not_found') return res.status(400).json({ error: 'item_not_found', itemId: e.itemId });
+      throw e;
+    }
+    res.status(201).json(toPurchaseOrder(po, rows));
+  });
+  r.get('/purchases/:id', devRequirePerm('stock.view'), (req, res) => {
+    const po = store.purchaseOrders.find((x) => x.id === req.params.id);
+    if (!po) return res.status(404).json({ error: 'not found' });
+    const lines = devPoLines(po.id);
+    res.json({
+      ...toPurchaseOrder(po, lines),
+      receipts: store.goodsReceipts.filter((g) => String(g.poId) === po.id).map((g) => toGoodsReceipt(g)),
+      outstandingQty: round3(lines.reduce((s, l) => s + Math.max(0, Number(l.qty || 0) - Number(l.receivedQty || 0)), 0)),
+    });
+  });
+  r.put('/purchases/:id', devRequirePerm('stock.purchase'), (req, res) => {
+    const po = store.purchaseOrders.find((x) => x.id === req.params.id);
+    if (!po) return res.status(404).json({ error: 'not found' });
+    if ((po.status || 'draft') !== 'draft') return res.status(409).json({ error: 'not_editable', status: po.status });
+    const b = req.body || {};
+    if (b.supplierId !== undefined) {
+      if (b.supplierId) {
+        const sup = store.suppliers.find((x) => x.id === String(b.supplierId));
+        if (!sup) return res.status(400).json({ error: 'supplier_not_found' });
+        po.supplierId = String(b.supplierId); po.supplierName = sup.name;
+      } else { po.supplierId = null; po.supplierName = null; }
+    }
+    if (b.expectedDate !== undefined) po.expectedDate = b.expectedDate || null;
+    if (b.note !== undefined) po.note = b.note;
+    if (Array.isArray(b.lines)) {
+      const v = devParse(purchaseOrderSchema, { ...b, lines: b.lines });
+      if (!v.ok) return res.status(400).json({ error: 'validation_failed', message: v.message });
+      if (!v.data.lines.length) return res.status(400).json({ error: 'no_lines' });
+      const totals = devComputeTotals(v.data.lines, v.data.taxRate);
+      po.subtotal = totals.subtotal; po.taxAmount = totals.taxAmount; po.total = totals.total;
+      try { devWritePoLines(po.id, v.data.lines, v.data.taxRate); }
+      catch (e) {
+        if (e.message === 'item_not_found') return res.status(400).json({ error: 'item_not_found', itemId: e.itemId });
+        throw e;
+      }
+    }
+    po.updatedAt = now();
+    res.json(toPurchaseOrder(po, devPoLines(po.id)));
+  });
+  r.post('/purchases/:id/approve', devRequirePerm('stock.purchase'), (req, res) => {
+    const po = store.purchaseOrders.find((x) => x.id === req.params.id);
+    if (!po) return res.status(404).json({ error: 'not found' });
+    if ((po.status || 'draft') !== 'draft') return res.status(409).json({ error: 'not_approvable', status: po.status });
+    const lines = devPoLines(po.id);
+    if (!lines.length) return res.status(400).json({ error: 'no_lines' });
+    po.status = 'approved'; po.approvedAt = now();
+    po.approvedBy = req.user.id; po.approvedByName = req.user.name; po.updatedAt = now();
+    res.json(toPurchaseOrder(po, lines));
+  });
+  r.post('/purchases/:id/cancel', devRequirePerm('stock.purchase'), (req, res) => {
+    const po = store.purchaseOrders.find((x) => x.id === req.params.id);
+    if (!po) return res.status(404).json({ error: 'not found' });
+    if (po.status === 'cancelled') return res.status(409).json({ error: 'already_cancelled' });
+    if (po.status === 'received' || po.status === 'partial') {
+      return res.status(409).json({ error: 'has_receipts', status: po.status });
+    }
+    po.status = 'cancelled'; po.cancelledAt = now(); po.cancelReason = req.body?.reason || null;
+    po.updatedAt = now();
+    res.json(toPurchaseOrder(po, devPoLines(po.id)));
+  });
+  r.delete('/purchases/:id', devRequirePerm('stock.purchase'), (req, res) => {
+    const po = store.purchaseOrders.find((x) => x.id === req.params.id);
+    if (!po) return res.status(404).json({ error: 'not found' });
+    if ((po.status || 'draft') !== 'draft') return res.status(409).json({ error: 'only_draft_deletable', status: po.status });
+    store.purchaseOrderLines = store.purchaseOrderLines.filter((l) => String(l.poId) !== po.id);
+    store.purchaseOrders = store.purchaseOrders.filter((x) => x.id !== po.id);
+    res.json({ ok: true });
+  });
+
+  // ---- 库位调拨(按库位拆行:源行出、目标行入) ----
+  r.post('/stock-transfers', devRequirePerm('stock.take'), async (req, res) => {
+    const v = devParse(stockTransferSchema, req.body);
+    if (!v.ok) return res.status(400).json({ error: 'validation_failed', message: v.message });
+    const p = v.data;
+    if (p.fromLocation === p.toLocation) return res.status(400).json({ error: 'same_location' });
+
+    // ---- pass 1:校验源行与可用量 ----
+    const plan = [];
+    const errors = [];
+    const used = new Map();
+    for (let i = 0; i < p.lines.length; i++) {
+      const l = p.lines[i];
+      const srcRow = store.inventory.find((x) => x.id === String(l.itemId));
+      if (!srcRow) { errors.push({ index: i, error: 'item_not_found', itemId: l.itemId }); continue; }
+      const source = toInventoryItem(srcRow);
+      if ((source.location || '') !== p.fromLocation) {
+        errors.push({
+          index: i, error: 'location_mismatch', itemId: source.id, itemName: source.name,
+          expected: p.fromLocation, actual: source.location,
+        });
+        continue;
+      }
+      const qty = round3(l.qty);
+      if (!(qty > 0)) { errors.push({ index: i, error: 'invalid_qty', itemId: source.id }); continue; }
+      const already = used.get(String(source.id)) || 0;
+      if (already + qty > source.quantity + 1e-9) {
+        errors.push({
+          index: i, error: 'insufficient', itemId: source.id, itemName: source.name,
+          requested: qty, available: round3(source.quantity - already),
+        });
+        continue;
+      }
+      used.set(String(source.id), round3(already + qty));
+      plan.push({ source, qty, note: l.note ?? null, dest: null });
+    }
+    if (errors.length) return res.status(400).json({ error: 'transfer_failed', errors });
+
+    // ---- 目标行:先确保存在 ----
+    const createdIds = [];
+    for (const x of plan) {
+      let dest = store.inventory.find((d) => (d.location || '') === p.toLocation
+        && (x.source.code ? d.code === x.source.code : (d.name === x.source.name && (d.unit || null) === (x.source.unit || null))));
+      if (!dest) {
+        dest = {
+          id: nid(), orgId: '1', storeId: '1',
+          code: x.source.code, name: x.source.name, category: x.source.category, barcode: x.source.barcode,
+          unit: x.source.unit, quantity: 0, threshold: Number(x.source.threshold || 0),
+          costPrice: x.source.costPrice, avgCost: Number(x.source.avgCost || 0),
+          lastCost: Number(x.source.lastCost || 0), location: p.toLocation,
+          supplierId: x.source.supplierId || null,
+          note: `库位调拨自动创建(来自 ${x.source.location || '-'})`, isActive: true,
+          createdAt: now(), updatedAt: now(),
+        };
+        store.inventory.push(dest);
+        createdIds.push(dest.id);
+      }
+      x.dest = { ...toInventoryItem(dest) };
+    }
+
+    const trNo = makeDocNo('TR', store.stockTransfers.map((t) => t.transferNo));
+    const totalCost = round2(plan.reduce((s, x) => s + x.qty * Number(x.source.avgCost || 0), 0));
+    const tr = {
+      id: nid(), orgId: '1', storeId: '1', transferNo: trNo,
+      fromLocation: p.fromLocation, toLocation: p.toLocation,
+      status: 'posted', totalCost, note: p.note ?? null,
+      voidedAt: null, voidReason: null,
+      createdBy: req.user.id, createdByName: req.user.name, createdAt: now(),
+    };
+    store.stockTransfers.unshift(tr);
+
+    // 每行两条台账,同一单价 → 总金额守恒
+    const mvLines = [];
+    for (const x of plan) {
+      mvLines.push({ itemId: x.source.id, type: 'transfer_out', qty: x.qty, refType: 'stock_transfer', refId: tr.id, refNo: trNo, note: x.note });
+      mvLines.push({ itemId: x.dest.id, type: 'transfer_in', qty: x.qty, unitCost: Number(x.source.avgCost || 0), refType: 'stock_transfer', refId: tr.id, refNo: trNo, note: x.note });
+    }
+    const mv = await applyMovements(devInventoryAdapter, mvLines,
+      { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name });
+
+    if (!mv.ok) {
+      store.stockTransfers = store.stockTransfers.filter((t) => t.id !== tr.id);
+      store.inventory = store.inventory.filter((i) => !createdIds.includes(i.id));
+      return res.status(400).json({ error: 'transfer_failed', errors: mv.errors });
+    }
+
+    for (let i = 0; i < plan.length; i++) {
+      const x = plan[i];
+      const out = mv.movements[i * 2];
+      const inn = mv.movements[i * 2 + 1];
+      store.stockTransferLines.push({
+        id: nid(), transferId: tr.id,
+        itemId: x.source.id, toItemId: x.dest.id,
+        itemCode: x.source.code, itemName: x.source.name, unit: x.source.unit,
+        qty: x.qty, unitCost: Number(x.source.avgCost || 0), amount: round2(x.qty * Number(x.source.avgCost || 0)),
+        beforeQty: out.before, afterQty: out.after, avgCostAfter: inn.avgCostAfter,
+        note: x.note, createdAt: now(),
+      });
+    }
+
+    devNotifyLow(req.app.get('io'), plan.map((x) => x.source.id));
+    res.status(201).json({
+      ...toStockTransfer(tr, store.stockTransferLines.filter((l) => l.transferId === tr.id)),
+      createdItems: createdIds.length
+        ? store.inventory.filter((i) => createdIds.includes(i.id)).map(toInventoryItem)
+        : [],
+      movements: mv.movements,
+    });
+  });
+  r.get('/stock-transfers', devRequirePerm('stock.view'), (req, res) => {
+    let list = store.stockTransfers;
+    if (req.query.status) list = list.filter((t) => (t.status || 'posted') === req.query.status);
+    if (req.query.fromLocation) list = list.filter((t) => t.fromLocation === req.query.fromLocation);
+    if (req.query.toLocation) list = list.filter((t) => t.toLocation === req.query.toLocation);
+    if (req.query.q) list = list.filter((t) => String(t.transferNo || '').toLowerCase().includes(String(req.query.q).toLowerCase()));
+    if (req.query.from) list = list.filter((t) => String(t.createdAt || '').slice(0, 10) >= req.query.from);
+    if (req.query.to) list = list.filter((t) => String(t.createdAt || '').slice(0, 10) <= req.query.to);
+    res.json([...list].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map((t) => toStockTransfer(t)));
+  });
+  r.get('/stock-transfers/:id', devRequirePerm('stock.view'), (req, res) => {
+    const t = store.stockTransfers.find((x) => x.id === req.params.id);
+    if (!t) return res.status(404).json({ error: 'not found' });
+    res.json(toStockTransfer(t, store.stockTransferLines.filter((l) => l.transferId === t.id)));
+  });
+  r.post('/stock-transfers/:id/void', devRequirePerm('stock.take'), async (req, res) => {
+    const t = store.stockTransfers.find((x) => x.id === req.params.id);
+    if (!t) return res.status(404).json({ error: 'not found' });
+    if (t.status === 'void') return res.status(409).json({ error: 'already_void' });
+    const lines = store.stockTransferLines.filter((l) => l.transferId === t.id);
+    if (!lines.length) return res.status(400).json({ error: 'no_lines' });
+
+    const mvLines = [];
+    for (const l of lines) {
+      const dest = store.inventory.find((d) => d.id === String(l.toItemId));
+      if (!dest) return res.status(400).json({ error: 'dest_item_missing', itemId: l.toItemId });
+      const reason = req.body?.reason || `作废调拨 ${t.transferNo}`;
+      mvLines.push({ itemId: l.toItemId, type: 'transfer_out', qty: Number(l.qty), refType: 'stock_transfer_void', refId: t.id, refNo: t.transferNo, note: reason });
+      mvLines.push({ itemId: l.itemId, type: 'transfer_in', qty: Number(l.qty), unitCost: Number(dest.avgCost || 0), refType: 'stock_transfer_void', refId: t.id, refNo: t.transferNo, note: reason });
+    }
+    const mv = await applyMovements(devInventoryAdapter, mvLines,
+      { orgId: '1', storeId: '1', allowNegative: true, createdBy: req.user.id, createdByName: req.user.name });
+    if (!mv.ok) return res.status(400).json({ error: 'void_failed', errors: mv.errors });
+
+    t.status = 'void'; t.voidedAt = now(); t.voidReason = req.body?.reason || null;
+    devNotifyLow(req.app.get('io'), lines.map((l) => l.itemId));
+    res.json({ ...toStockTransfer(t, lines), movements: mv.movements });
+  });
+  r.post('/purchases/:id/receive', devRequirePerm('stock.purchase'), async (req, res) => {
+    const v = devParse(goodsReceiptSchema, req.body || {});
+    if (!v.ok) return res.status(400).json({ error: 'validation_failed', message: v.message });
+    const p = v.data;
+    const po = store.purchaseOrders.find((x) => x.id === req.params.id);
+    if (!po) return res.status(404).json({ error: 'not found' });
+    if (!['approved', 'partial'].includes(po.status)) {
+      return res.status(409).json({ error: 'not_receivable', status: po.status });
+    }
+    const poLines = devPoLines(po.id);
+    if (!poLines.length) return res.status(400).json({ error: 'no_lines' });
+
+    // ---- pass 1:全部校验,不落库 ----
+    const reqLines = (Array.isArray(p.lines) && p.lines.length)
+      ? p.lines
+      : poLines.filter((l) => devOutstanding(l) > 0)
+        .map((l) => ({ poLineId: l.id, itemId: l.itemId, qty: devOutstanding(l) }));
+    if (!reqLines.length) return res.status(400).json({ error: 'nothing_to_receive' });
+
+    const plan = [];
+    const errors = [];
+    const used = new Map();
+    for (let i = 0; i < reqLines.length; i++) {
+      const rl = reqLines[i];
+      const line = rl.poLineId
+        ? poLines.find((l) => String(l.id) === String(rl.poLineId))
+        : poLines.find((l) => String(l.itemId) === String(rl.itemId) && devOutstanding(l) > 0);
+      if (!line) { errors.push({ index: i, error: 'po_line_not_found', itemId: rl.itemId ?? null }); continue; }
+      const qty = round3(rl.qty);
+      if (!(qty > 0)) { errors.push({ index: i, error: 'invalid_qty', poLineId: line.id }); continue; }
+      const already = used.get(String(line.id)) || 0;
+      if (already + qty > devOutstanding(line) + 1e-9) {
+        errors.push({
+          index: i, error: 'over_receipt', poLineId: line.id, itemName: line.itemName,
+          requested: qty, outstanding: round3(devOutstanding(line) - already),
+        });
+        continue;
+      }
+      used.set(String(line.id), round3(already + qty));
+      plan.push({
+        line, qty,
+        unitCost: rl.unitCost != null ? round4(rl.unitCost) : Number(line.unitCost || 0),
+        note: rl.note ?? null,
+      });
+    }
+    if (errors.length) return res.status(400).json({ error: 'receive_failed', errors });
+
+    const total = round2(plan.reduce((s, x) => s + x.qty * x.unitCost, 0));
+    const grnNo = makeDocNo('GRN', store.goodsReceipts.map((g) => g.grnNo));
+    const grn = {
+      id: nid(), orgId: '1', storeId: '1', grnNo,
+      poId: po.id, poNo: po.poNo,
+      supplierId: po.supplierId || null, supplierName: po.supplierName || null,
+      total, status: 'posted', note: p.note ?? null,
+      receivedAt: now(), voidedAt: null, voidReason: null,
+      createdBy: req.user.id, createdByName: req.user.name, createdAt: now(),
+    };
+    store.goodsReceipts.unshift(grn);
+
+    const mv = await applyMovements(devInventoryAdapter, plan.map((x) => ({
+      itemId: x.line.itemId, type: 'purchase_receipt', qty: x.qty, unitCost: x.unitCost,
+      refType: 'goods_receipt', refId: grn.id, refNo: grnNo,
+      note: x.note || `收货 ${po.poNo}`,
+    })), { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name });
+
+    if (!mv.ok) {
+      store.goodsReceipts = store.goodsReceipts.filter((g) => g.id !== grn.id);
+      return res.status(400).json({ error: 'receive_failed', errors: mv.errors });
+    }
+
+    for (let i = 0; i < plan.length; i++) {
+      const x = plan[i];
+      const m = mv.movements[i];
+      store.goodsReceiptLines.push({
+        id: nid(), grnId: grn.id, poLineId: x.line.id,
+        itemId: x.line.itemId, itemCode: x.line.itemCode, itemName: x.line.itemName, unit: x.line.unit,
+        qty: x.qty, unitCost: x.unitCost, amount: round2(x.qty * x.unitCost),
+        beforeQty: m.before, afterQty: m.after, avgCostAfter: m.avgCostAfter,
+        note: x.note, createdAt: now(),
+      });
+      x.line.receivedQty = round3(Number(x.line.receivedQty || 0) + x.qty);
+    }
+
+    const newStatus = devRefreshPoStatus(po);
+    if (newStatus === 'received') po.receivedAt = now();
+    devNotifyLow(req.app.get('io'), plan.map((x) => x.line.itemId));
+    res.status(201).json({
+      ...toGoodsReceipt(grn, store.goodsReceiptLines.filter((l) => l.grnId === grn.id)),
+      poStatus: newStatus,
+      movements: mv.movements,
+    });
+  });
+  r.get('/goods-receipts', devRequirePerm('stock.view'), (req, res) => {
+    let list = store.goodsReceipts;
+    if (req.query.status) list = list.filter((g) => (g.status || 'posted') === req.query.status);
+    if (req.query.poId) list = list.filter((g) => String(g.poId) === String(req.query.poId));
+    if (req.query.supplierId) list = list.filter((g) => String(g.supplierId) === String(req.query.supplierId));
+    if (req.query.q) {
+      const q = String(req.query.q).toLowerCase();
+      list = list.filter((g) => String(g.grnNo || '').toLowerCase().includes(q) || String(g.poNo || '').toLowerCase().includes(q));
+    }
+    if (req.query.from) list = list.filter((g) => String(g.createdAt || '').slice(0, 10) >= req.query.from);
+    if (req.query.to) list = list.filter((g) => String(g.createdAt || '').slice(0, 10) <= req.query.to);
+    res.json([...list].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map((g) => toGoodsReceipt(g)));
+  });
+  r.get('/goods-receipts/:id', devRequirePerm('stock.view'), (req, res) => {
+    const g = store.goodsReceipts.find((x) => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'not found' });
+    res.json(toGoodsReceipt(g, store.goodsReceiptLines.filter((l) => l.grnId === g.id)));
+  });
+  r.post('/goods-receipts/:id/void', devRequirePerm('stock.purchase'), async (req, res) => {
+    const g = store.goodsReceipts.find((x) => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'not found' });
+    if (g.status === 'void') return res.status(409).json({ error: 'already_void' });
+    const lines = store.goodsReceiptLines.filter((l) => l.grnId === g.id);
+    if (!lines.length) return res.status(400).json({ error: 'no_lines' });
+
+    const mv = await applyMovements(devInventoryAdapter, lines.map((l) => ({
+      itemId: l.itemId, type: 'receipt_void', qty: Number(l.qty),
+      refType: 'goods_receipt_void', refId: g.id, refNo: g.grnNo,
+      note: req.body?.reason || `作废收货 ${g.grnNo}`,
+    })), {
+      orgId: '1', storeId: '1', allowNegative: true,
+      createdBy: req.user.id, createdByName: req.user.name,
+    });
+    if (!mv.ok) return res.status(400).json({ error: 'void_failed', errors: mv.errors });
+
+    for (const l of lines) {
+      const poLine = store.purchaseOrderLines.find((x) => String(x.id) === String(l.poLineId));
+      if (poLine) poLine.receivedQty = round3(Math.max(0, Number(poLine.receivedQty || 0) - Number(l.qty)));
+    }
+    g.status = 'void'; g.voidedAt = now(); g.voidReason = req.body?.reason || null;
+
+    let poStatus = null;
+    const po = store.purchaseOrders.find((x) => String(x.id) === String(g.poId));
+    if (po) {
+      po.status = derivePoStatus(devPoLines(po.id), po.status === 'received' ? 'approved' : po.status);
+      poStatus = po.status;
+      if (poStatus !== 'received') po.receivedAt = null;
+      po.updatedAt = now();
+    }
+    devNotifyLow(req.app.get('io'), lines.map((l) => l.itemId));
+    res.json({ ...toGoodsReceipt(g, lines), poStatus, movements: mv.movements });
+  });
 
   // ---- 报表目录:前端据此渲染分组下拉与列定义 ----
   r.get('/reports/catalog', devRequirePerm('report.view'), (req, res) => res.json({ categories: REPORT_CATEGORIES, reports: REPORT_CATALOG }));

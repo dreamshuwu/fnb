@@ -1,5 +1,9 @@
 import { Router } from 'express';
-import { query, getRow, insert, stringifyJSON, parseJSON } from '../db.js';
+import {
+  query, getRow, insert, stringifyJSON, parseJSON,
+  toInventoryItem, toStockMovement, toGoodsReceipt, toGoodsReceiptLine,
+  toStockTransfer, toStockTransferLine, toPurchaseOrderLine,
+} from '../db.js';
 import { authenticate, tenant, requirePermission } from '../middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from '../reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from '../reportEngine.js';
@@ -361,11 +365,7 @@ router.get('/shifts/current', async (req, res) => { const { orgId, storeId } = t
 router.post('/shifts/open', requirePermission('shift.manage'), async (req, res) => { const { orgId, storeId } = tenant(req); const id = await insert('INSERT INTO shifts (org_id,store_id,cashier_id,open_amount,status) VALUES (?,?,?,?,?)', [orgId, storeId, req.user.id, Number(req.body.openAmount || 0), 'open']); res.status(201).json(shift(await getRow('SELECT * FROM shifts WHERE id=?', [id]))); });
 router.post('/shifts/:id/close', requirePermission('shift.manage'), async (req, res) => { const { orgId, storeId } = tenant(req); const s = await getRow('SELECT * FROM shifts WHERE id=? AND org_id=? AND store_id=? AND status="open"', [req.params.id, orgId, storeId]); if (!s) return res.status(404).json({ error: 'open shift not found' }); const paid = await query('SELECT total FROM orders WHERE shift_id=? AND status="paid"', [s.id]); const expected = Number(s.open_amount || 0) + paid.reduce((a, o) => a + Number(o.total || 0), 0); const counted = Number(req.body.closeAmount || 0); await query('UPDATE shifts SET expected_amount=?,close_amount=?,difference_amount=?,status="closed" WHERE id=?', [expected, counted, counted - expected, s.id]); res.json(shift(await getRow('SELECT * FROM shifts WHERE id=?', [s.id]))); });
 
-router.get('/suppliers', async (req, res) => { const { orgId, storeId } = tenant(req); res.json((await query('SELECT * FROM suppliers WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map(supplier)); });
-router.post('/suppliers', requirePermission('stock.purchase'), async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO suppliers (org_id,store_id,code,name,phone,contact) VALUES (?,?,?,?,?,?)', [orgId, storeId, b.code || `SUP-${Date.now()}`, b.name || '', b.phone || '', b.contact || '']); res.status(201).json(supplier(await getRow('SELECT * FROM suppliers WHERE id=?', [id]))); });
-router.get('/purchases', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT * FROM purchase_orders WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId]); res.json(rows.map((r) => ({ _id: r.id, id: r.id, poNo: r.po_no, supplierId: r.supplier_id, items: parseJSON(r.items), total: Number(r.total || 0), status: r.status, createdAt: dt(r.created_at) }))); });
-router.post('/purchases', requirePermission('stock.purchase'), async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO purchase_orders (org_id,store_id,po_no,supplier_id,items,total) VALUES (?,?,?,?,?,?)', [orgId, storeId, b.poNo || `PO${Date.now()}`, b.supplierId || null, stringifyJSON(b.items || []), Number(b.total || 0)]); res.status(201).json(await getRow('SELECT * FROM purchase_orders WHERE id=?', [id])); });
-router.post('/purchases/:id/receive', requirePermission('stock.purchase'), async (req, res) => { const { orgId, storeId } = tenant(req); const p = await getRow('SELECT * FROM purchase_orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!p) return res.status(404).json({ error: 'not found' }); const items = parseJSON(p.items); for (const item of items) await query('UPDATE inventory_items SET quantity=quantity+? WHERE id=? AND org_id=? AND store_id=?', [Number(item.qty || 0), Number(item.itemId), orgId, storeId]); await query('UPDATE purchase_orders SET status="received",received_at=NOW() WHERE id=?', [p.id]); res.json(await getRow('SELECT * FROM purchase_orders WHERE id=?', [p.id])); });
+// 供应商主档 / 采购订单 / 收货单 / 调拨 均已迁到 routes/purchasing.js
 
 // ===========================================================================
 // 报表中心:目录 / 查询 / 导出
@@ -377,7 +377,9 @@ async function buildReportDataset(orgId, storeId) {
   const safe = async (sql, params) => { try { return await query(sql, params); } catch { return []; } };
   const [orders, payments, refunds, unsettles, cashMovements, shifts, members, memberTopups, pointsLedger,
     invoices, creditNotes, variants, categories, customerStock, stockTakes, suppliers, purchaseOrders,
-    attendanceRows, reprintLogs, dayEnds, orderTransfers, vouchers, voucherTxns, rebates, settings] = await Promise.all([
+    attendanceRows, reprintLogs, dayEnds, orderTransfers, vouchers, voucherTxns, rebates, settings,
+    inventoryItems, stockMovements, purchaseOrderLines, goodsReceipts, goodsReceiptLines,
+    stockTransfers, stockTransferLines] = await Promise.all([
     query('SELECT o.*, t.number AS table_no, u.name AS cashier_name, sp.name AS sales_person_name, m.member_no, m.name AS member_name FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by LEFT JOIN users sp ON sp.id=o.sales_person_id LEFT JOIN members m ON m.id=o.member_id WHERE o.org_id=? AND o.store_id=?', [orgId, storeId]),
     query('SELECT * FROM payments WHERE org_id=? AND store_id=?', [orgId, storeId]),
     query('SELECT * FROM refunds WHERE org_id=? AND store_id=?', [orgId, storeId]),
@@ -403,6 +405,17 @@ async function buildReportDataset(orgId, storeId) {
     safe('SELECT * FROM voucher_txns WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM rebates WHERE org_id=? AND store_id=?', [orgId, storeId]),
     loadSettings(orgId, storeId),
+    // ---- 物料库存 / 采购(块⑦)----
+    safe('SELECT * FROM inventory_items WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM stock_movements WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe(`SELECT l.*, p.po_no, p.status AS po_status, p.supplier_id, p.created_at AS po_created_at
+          FROM purchase_order_lines l
+          JOIN purchase_orders p ON p.id = l.po_id
+          WHERE l.org_id=? AND l.store_id=?`, [orgId, storeId]),
+    safe('SELECT * FROM goods_receipts WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM goods_receipt_lines WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM stock_transfers WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM stock_transfer_lines WHERE org_id=? AND store_id=?', [orgId, storeId]),
   ]);
 
   const variantById = new Map(variants.map((v) => [String(v.id), v]));
@@ -452,6 +465,21 @@ async function buildReportDataset(orgId, storeId) {
     vouchers: vouchers.map((v) => ({ ...v, voucherNo: v.voucher_no, faceValue: Number(v.face_value || 0), balance: Number(v.balance || 0), usedAmount: round2(Number(v.face_value || 0) - Number(v.balance || 0)), issuedToName: v.issued_to_name, issuedToPhone: v.issued_to_phone, soldAmount: Number(v.sold_amount || 0), issuedAt: dt(v.issued_at), expiresAt: v.expires_at ? dt(v.expires_at) : null, createdByName: v.created_by_name })),
     voucherTxns: voucherTxns.map((t) => ({ ...t, voucherId: t.voucher_id, voucherNo: t.voucher_no, memberId: t.member_id, orderNo: t.order_no, amount: Number(t.amount || 0), balanceAfter: Number(t.balance_after || 0), createdByName: t.created_by_name, createdAt: dt(t.created_at) })),
     rebates: rebates.map((r) => ({ ...r, memberId: r.member_id, memberNo: r.member_no, memberName: r.member_name, orderNo: r.order_no, amount: Number(r.amount || 0), balanceAfter: Number(r.balance_after || 0), orderTotal: Number(r.order_total || 0), percent: Number(r.percent || 0), createdByName: r.created_by_name, createdAt: dt(r.created_at) })),
+    // ---- 物料库存 / 采购(块⑦)----
+    inventoryItems: inventoryItems.map(toInventoryItem),
+    stockMovements: stockMovements.map(toStockMovement),
+    // 采购行补上单头快照:报表要按 PO 日期 / 状态 / 供应商过滤
+    purchaseOrderLines: purchaseOrderLines.map((l) => ({
+      ...toPurchaseOrderLine(l),
+      poNo: l.po_no || null,
+      poDate: dt(l.po_created_at),
+      poStatus: l.po_status || 'draft',
+      supplierId: l.supplier_id == null ? null : String(l.supplier_id),
+    })),
+    goodsReceipts: goodsReceipts.map((g) => toGoodsReceipt(g)),
+    goodsReceiptLines: goodsReceiptLines.map(toGoodsReceiptLine),
+    stockTransfers: stockTransfers.map((t) => toStockTransfer(t)),
+    stockTransferLines: stockTransferLines.map(toStockTransferLine),
     settings,
   };
 }

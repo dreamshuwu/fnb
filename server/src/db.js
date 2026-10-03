@@ -41,6 +41,15 @@ function dt(v) {
   if (v instanceof Date) return v.toISOString();
   return String(v);
 }
+// DATE 列统一成 YYYY-MM-DD(MySQL 可能回传 Date 对象)
+function dtDate(v) {
+  if (v == null) return null;
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  return String(v).slice(0, 10);
+}
+const r2 = (v) => Math.round(Number(v || 0) * 100) / 100;
+const r3 = (v) => Math.round(Number(v || 0) * 1000) / 1000;
+const r4 = (v) => Math.round(Number(v || 0) * 10000) / 10000;
 
 // ---- Schema bootstrap ----
 export async function initSchema() {
@@ -229,32 +238,57 @@ export async function initSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (order_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 库存主档：avg_cost 是移动加权平均成本(库存估值的唯一依据) ----
     `CREATE TABLE IF NOT EXISTS inventory_items (
       id INT AUTO_INCREMENT PRIMARY KEY,
       org_id INT NOT NULL,
       store_id INT NOT NULL,
+      code VARCHAR(64),
       name VARCHAR(255) NOT NULL,
+      category VARCHAR(64),
+      barcode VARCHAR(64),
       unit VARCHAR(32),
       quantity DECIMAL(12,3) DEFAULT 0,
       threshold DECIMAL(12,3) DEFAULT 0,
-      cost_price DECIMAL(12,2),
+      cost_price DECIMAL(12,4),
+      avg_cost DECIMAL(12,4) DEFAULT 0,
+      last_cost DECIMAL(12,4) DEFAULT 0,
+      location VARCHAR(64),
+      supplier_id INT,
+      note TEXT,
+      is_active TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX (org_id, store_id)
+      INDEX (org_id, store_id), INDEX (barcode)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 库存台账：一切库存变动都必须经 inventoryEngine.applyMovement 落一行 ----
+    // type 放宽为 VARCHAR(32)，新增 opening/adjustment/wastage/return/transfer_in/transfer_out/
+    // purchase_receipt/receipt_void/sale/credit_note 等，不再受 ENUM 限制。
     `CREATE TABLE IF NOT EXISTS stock_movements (
       id INT AUTO_INCREMENT PRIMARY KEY,
       org_id INT NOT NULL,
       store_id INT NOT NULL,
       item_id INT,
-      type ENUM('sale','restock','adjust','count'),
+      item_code VARCHAR(64),
+      item_name VARCHAR(255),
+      type VARCHAR(32),
       delta DECIMAL(12,3) DEFAULT 0,
       before DECIMAL(12,3) DEFAULT 0,
       after DECIMAL(12,3) DEFAULT 0,
+      unit_cost DECIMAL(12,4) DEFAULT 0,
+      amount DECIMAL(14,2) DEFAULT 0,
+      avg_cost_after DECIMAL(12,4) DEFAULT 0,
       ref_order_id INT,
+      ref_type VARCHAR(32),
+      ref_id INT,
+      ref_no VARCHAR(64),
+      location VARCHAR(64),
+      note VARCHAR(255),
       created_by INT,
+      created_by_name VARCHAR(255),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX (org_id, store_id), INDEX (item_id)
+      INDEX (org_id, store_id), INDEX (item_id), INDEX (type),
+      INDEX (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS shifts (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -310,17 +344,85 @@ export async function initSchema() {
       user_id INT, user_name VARCHAR(255), action VARCHAR(32), code VARCHAR(64), note TEXT,
       event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (org_id, store_id), INDEX (user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 供应商主档 ----
     `CREATE TABLE IF NOT EXISTS suppliers (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
       code VARCHAR(64), name VARCHAR(255) NOT NULL, phone VARCHAR(64), contact VARCHAR(255),
-      status VARCHAR(32) DEFAULT 'active', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX (org_id, store_id), INDEX (code)
+      contact_person VARCHAR(255), email VARCHAR(255), address VARCHAR(255), tax_no VARCHAR(64),
+      payment_terms VARCHAR(64), credit_terms_days INT DEFAULT 0, note TEXT,
+      status VARCHAR(32) DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code), INDEX (name)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 采购订单：items TEXT 仅作历史兼容，行明细以 purchase_order_lines 为准 ----
+    // status: draft -> approved -> partial -> received / cancelled
     `CREATE TABLE IF NOT EXISTS purchase_orders (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
-      po_no VARCHAR(64), supplier_id INT, items TEXT, total DECIMAL(12,2) DEFAULT 0,
-      status VARCHAR(32) DEFAULT 'open', received_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX (org_id, store_id), INDEX (supplier_id)
+      po_no VARCHAR(64), supplier_id INT, supplier_name VARCHAR(255),
+      items TEXT, subtotal DECIMAL(12,2) DEFAULT 0, tax_amount DECIMAL(12,2) DEFAULT 0,
+      total DECIMAL(12,2) DEFAULT 0, status VARCHAR(32) DEFAULT 'draft',
+      expected_date DATE, note TEXT, received_at TIMESTAMP NULL,
+      approved_at TIMESTAMP NULL, approved_by INT, approved_by_name VARCHAR(255),
+      cancelled_at TIMESTAMP NULL, cancel_reason VARCHAR(255),
+      created_by INT, created_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (supplier_id), INDEX (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS purchase_order_lines (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      po_id INT NOT NULL, line_no INT DEFAULT 1,
+      item_id INT, item_code VARCHAR(64), item_name VARCHAR(255), unit VARCHAR(32),
+      qty DECIMAL(12,3) DEFAULT 0, received_qty DECIMAL(12,3) DEFAULT 0,
+      unit_cost DECIMAL(12,4) DEFAULT 0, tax_rate DECIMAL(6,2) DEFAULT 0,
+      amount DECIMAL(14,2) DEFAULT 0, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (po_id), INDEX (item_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 收货单 GRN：支持部分收货，可作废(反向冲销库存) ----
+    `CREATE TABLE IF NOT EXISTS goods_receipts (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      grn_no VARCHAR(64), po_id INT, po_no VARCHAR(64),
+      supplier_id INT, supplier_name VARCHAR(255),
+      total DECIMAL(14,2) DEFAULT 0, status VARCHAR(24) DEFAULT 'posted',
+      note VARCHAR(255), received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      voided_at TIMESTAMP NULL, void_reason VARCHAR(255),
+      created_by INT, created_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (po_id), INDEX (supplier_id), INDEX (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS goods_receipt_lines (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      grn_id INT NOT NULL, po_line_id INT,
+      item_id INT, item_code VARCHAR(64), item_name VARCHAR(255), unit VARCHAR(32),
+      qty DECIMAL(12,3) DEFAULT 0, unit_cost DECIMAL(12,4) DEFAULT 0, amount DECIMAL(14,2) DEFAULT 0,
+      before_qty DECIMAL(12,3) DEFAULT 0, after_qty DECIMAL(12,3) DEFAULT 0,
+      avg_cost_after DECIMAL(12,4) DEFAULT 0, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (grn_id), INDEX (item_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- 库位调拨:按库位拆行,一行生成 transfer_out + transfer_in 两条台账 ----
+    // stock_transfer_lines.item_id = 源物料行,to_item_id = 目标物料行(可能自动新建)
+    `CREATE TABLE IF NOT EXISTS stock_transfers (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      transfer_no VARCHAR(64), from_location VARCHAR(64), to_location VARCHAR(64),
+      status VARCHAR(24) DEFAULT 'posted', total_cost DECIMAL(14,2) DEFAULT 0,
+      note VARCHAR(255), voided_at TIMESTAMP NULL, void_reason VARCHAR(255),
+      created_by INT, created_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS stock_transfer_lines (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      transfer_id INT NOT NULL,
+      item_id INT, to_item_id INT,
+      item_code VARCHAR(64), item_name VARCHAR(255), unit VARCHAR(32),
+      qty DECIMAL(12,3) DEFAULT 0, unit_cost DECIMAL(12,4) DEFAULT 0, amount DECIMAL(14,2) DEFAULT 0,
+      before_qty DECIMAL(12,3) DEFAULT 0, after_qty DECIMAL(12,3) DEFAULT 0,
+      avg_cost_after DECIMAL(12,4) DEFAULT 0,
+      note VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (transfer_id), INDEX (item_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS order_splits (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
@@ -491,6 +593,63 @@ export async function initSchema() {
     "ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL",
     // pin 从 VARCHAR(32) 扩到 VARCHAR(255):要存 bcrypt 哈希(60 字符),不能明文。
     "ALTER TABLE users MODIFY COLUMN pin VARCHAR(255)",
+    // ---- 采购与库存补全 ----
+    // 库存主档:编码/分类/条码/移动加权成本/库位/启用状态
+    "ALTER TABLE inventory_items ADD COLUMN code VARCHAR(64)",
+    "ALTER TABLE inventory_items ADD COLUMN category VARCHAR(64)",
+    "ALTER TABLE inventory_items ADD COLUMN barcode VARCHAR(64)",
+    "ALTER TABLE inventory_items ADD COLUMN avg_cost DECIMAL(12,4) DEFAULT 0",
+    "ALTER TABLE inventory_items ADD COLUMN last_cost DECIMAL(12,4) DEFAULT 0",
+    "ALTER TABLE inventory_items ADD COLUMN location VARCHAR(64)",
+    "ALTER TABLE inventory_items ADD COLUMN supplier_id INT",
+    "ALTER TABLE inventory_items ADD COLUMN note TEXT",
+    "ALTER TABLE inventory_items ADD COLUMN is_active TINYINT(1) DEFAULT 1",
+    // 成本精度从 2 位扩到 4 位(咖啡豆按克计价时 2 位不够)
+    "ALTER TABLE inventory_items MODIFY COLUMN cost_price DECIMAL(12,4)",
+    "ALTER TABLE inventory_items ADD INDEX idx_inv_code (code)",
+    // 台账:type 放宽 + 金额/单位成本/来源单据/经手人
+    "ALTER TABLE stock_movements MODIFY COLUMN type VARCHAR(32)",
+    "ALTER TABLE stock_movements ADD COLUMN item_code VARCHAR(64)",
+    "ALTER TABLE stock_movements ADD COLUMN item_name VARCHAR(255)",
+    "ALTER TABLE stock_movements ADD COLUMN unit_cost DECIMAL(12,4) DEFAULT 0",
+    "ALTER TABLE stock_movements ADD COLUMN amount DECIMAL(14,2) DEFAULT 0",
+    "ALTER TABLE stock_movements ADD COLUMN avg_cost_after DECIMAL(12,4) DEFAULT 0",
+    "ALTER TABLE stock_movements ADD COLUMN ref_type VARCHAR(32)",
+    "ALTER TABLE stock_movements ADD COLUMN ref_id INT",
+    "ALTER TABLE stock_movements ADD COLUMN ref_no VARCHAR(64)",
+    "ALTER TABLE stock_movements ADD COLUMN location VARCHAR(64)",
+    "ALTER TABLE stock_movements ADD COLUMN note VARCHAR(255)",
+    "ALTER TABLE stock_movements ADD COLUMN created_by_name VARCHAR(255)",
+    "ALTER TABLE stock_movements ADD INDEX idx_mv_ref (ref_type, ref_id)",
+    // 供应商主档补全
+    "ALTER TABLE suppliers ADD COLUMN contact_person VARCHAR(255)",
+    "ALTER TABLE suppliers ADD COLUMN email VARCHAR(255)",
+    "ALTER TABLE suppliers ADD COLUMN address VARCHAR(255)",
+    "ALTER TABLE suppliers ADD COLUMN tax_no VARCHAR(64)",
+    "ALTER TABLE suppliers ADD COLUMN payment_terms VARCHAR(64)",
+    "ALTER TABLE suppliers ADD COLUMN credit_terms_days INT DEFAULT 0",
+    "ALTER TABLE suppliers ADD COLUMN note TEXT",
+    "ALTER TABLE suppliers ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    // 采购单:金额拆分 / 期望到货 / 审批 / 制单
+    "ALTER TABLE purchase_orders ADD COLUMN supplier_name VARCHAR(255)",
+    "ALTER TABLE purchase_orders ADD COLUMN subtotal DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE purchase_orders ADD COLUMN tax_amount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE purchase_orders ADD COLUMN expected_date DATE",
+    "ALTER TABLE purchase_orders ADD COLUMN note TEXT",
+    "ALTER TABLE purchase_orders ADD COLUMN approved_at TIMESTAMP NULL",
+    "ALTER TABLE purchase_orders ADD COLUMN approved_by INT",
+    "ALTER TABLE purchase_orders ADD COLUMN approved_by_name VARCHAR(255)",
+    "ALTER TABLE purchase_orders ADD COLUMN cancelled_at TIMESTAMP NULL",
+    "ALTER TABLE purchase_orders ADD COLUMN cancel_reason VARCHAR(255)",
+    "ALTER TABLE purchase_orders ADD COLUMN created_by INT",
+    "ALTER TABLE purchase_orders ADD COLUMN created_by_name VARCHAR(255)",
+    "ALTER TABLE purchase_orders ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "ALTER TABLE purchase_orders MODIFY COLUMN status VARCHAR(32) DEFAULT 'draft'",
+    // 库位调拨:目标物料行 + 行上的前后数量/成本快照
+    "ALTER TABLE stock_transfer_lines ADD COLUMN to_item_id INT",
+    "ALTER TABLE stock_transfer_lines ADD COLUMN before_qty DECIMAL(12,3) DEFAULT 0",
+    "ALTER TABLE stock_transfer_lines ADD COLUMN after_qty DECIMAL(12,3) DEFAULT 0",
+    "ALTER TABLE stock_transfer_lines ADD COLUMN avg_cost_after DECIMAL(12,4) DEFAULT 0",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -601,16 +760,130 @@ export const toPayment = (r) => ({
 });
 export const toInventoryItem = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id, name: r.name,
+  code: r.code || null, category: r.category || null, barcode: r.barcode || null,
   unit: r.unit, quantity: Number(r.quantity || 0), threshold: Number(r.threshold || 0),
   costPrice: r.cost_price == null ? null : Number(r.cost_price),
+  // avgCost = 移动加权平均成本(估值依据); lastCost = 最近一次入库单价(下单参考)
+  avgCost: r4(r.avg_cost), lastCost: r4(r.last_cost),
+  stockValue: r2(Number(r.quantity || 0) * r4(r.avg_cost)),
+  location: r.location || null,
+  supplierId: r.supplier_id == null ? null : String(r.supplier_id),
+  note: r.note || null,
+  isActive: r.is_active == null ? true : !!r.is_active,
+  isLow: Number(r.quantity || 0) < Number(r.threshold || 0),
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
 });
 export const toStockMovement = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
-  itemId: r.item_id == null ? null : String(r.item_id), type: r.type,
+  itemId: r.item_id == null ? null : String(r.item_id),
+  itemCode: r.item_code || null, itemName: r.item_name || null,
+  type: r.type,
   delta: Number(r.delta || 0), before: Number(r.before || 0), after: Number(r.after || 0),
+  unitCost: r4(r.unit_cost), amount: r2(r.amount), avgCostAfter: r4(r.avg_cost_after),
   refOrderId: r.ref_order_id == null ? null : String(r.ref_order_id),
+  refType: r.ref_type || null,
+  refId: r.ref_id == null ? null : String(r.ref_id),
+  refNo: r.ref_no || null,
+  location: r.location || null, note: r.note || null,
   createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at),
+});
+
+// ---- 供应商 ----
+export const toSupplier = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  code: r.code || null, name: r.name, phone: r.phone || null,
+  contact: r.contact || null,
+  contactPerson: r.contact_person || r.contact || null,
+  email: r.email || null, address: r.address || null, taxNo: r.tax_no || null,
+  paymentTerms: r.payment_terms || null,
+  creditTermsDays: Number(r.credit_terms_days || 0),
+  note: r.note || null,
+  status: r.status || 'active',
+  isActive: (r.status || 'active') === 'active',
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+
+// ---- 采购订单 ----
+export const toPurchaseOrderLine = (r) => ({
+  _id: r.id, id: r.id, poId: r.po_id == null ? null : String(r.po_id),
+  lineNo: Number(r.line_no || 0),
+  itemId: r.item_id == null ? null : String(r.item_id),
+  itemCode: r.item_code || null, itemName: r.item_name || null, unit: r.unit || null,
+  qty: r3(r.qty), receivedQty: r3(r.received_qty),
+  outstandingQty: r3(Math.max(0, Number(r.qty || 0) - Number(r.received_qty || 0))),
+  unitCost: r4(r.unit_cost), taxRate: Number(r.tax_rate || 0),
+  amount: r2(r.amount), note: r.note || null,
+  createdAt: dt(r.created_at),
+});
+export const toPurchaseOrder = (r, lines = null) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  poNo: r.po_no,
+  supplierId: r.supplier_id == null ? null : String(r.supplier_id),
+  supplierName: r.supplier_name || null,
+  // items 为历史字段(仅兼容旧数据);新数据以 lines 为准
+  items: parseJSON(r.items),
+  ...(lines ? { lines: lines.map(toPurchaseOrderLine) } : {}),
+  subtotal: r2(r.subtotal), taxAmount: r2(r.tax_amount), total: r2(r.total),
+  status: r.status || 'draft',
+  expectedDate: dtDate(r.expected_date),
+  note: r.note || null,
+  receivedAt: dt(r.received_at),
+  approvedAt: dt(r.approved_at),
+  approvedBy: r.approved_by == null ? null : String(r.approved_by),
+  approvedByName: r.approved_by_name || null,
+  cancelledAt: dt(r.cancelled_at), cancelReason: r.cancel_reason || null,
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+
+// ---- 收货单 GRN ----
+export const toGoodsReceiptLine = (r) => ({
+  _id: r.id, id: r.id, grnId: r.grn_id == null ? null : String(r.grn_id),
+  poLineId: r.po_line_id == null ? null : String(r.po_line_id),
+  itemId: r.item_id == null ? null : String(r.item_id),
+  itemCode: r.item_code || null, itemName: r.item_name || null, unit: r.unit || null,
+  qty: r3(r.qty), unitCost: r4(r.unit_cost), amount: r2(r.amount),
+  beforeQty: r3(r.before_qty), afterQty: r3(r.after_qty), avgCostAfter: r4(r.avg_cost_after),
+  note: r.note || null, createdAt: dt(r.created_at),
+});
+export const toGoodsReceipt = (r, lines = null) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  grnNo: r.grn_no,
+  poId: r.po_id == null ? null : String(r.po_id), poNo: r.po_no || null,
+  supplierId: r.supplier_id == null ? null : String(r.supplier_id),
+  supplierName: r.supplier_name || null,
+  total: r2(r.total), status: r.status || 'posted',
+  note: r.note || null, receivedAt: dt(r.received_at),
+  voidedAt: dt(r.voided_at), voidReason: r.void_reason || null,
+  ...(lines ? { lines: lines.map(toGoodsReceiptLine) } : {}),
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at),
+});
+
+// ---- 库位调拨 ----
+export const toStockTransferLine = (r) => ({
+  _id: r.id, id: r.id, transferId: r.transfer_id == null ? null : String(r.transfer_id),
+  itemId: r.item_id == null ? null : String(r.item_id),
+  toItemId: r.to_item_id == null ? null : String(r.to_item_id),
+  itemCode: r.item_code || null, itemName: r.item_name || null, unit: r.unit || null,
+  qty: r3(r.qty), unitCost: r4(r.unit_cost), amount: r2(r.amount),
+  beforeQty: r3(r.before_qty), afterQty: r3(r.after_qty), avgCostAfter: r4(r.avg_cost_after),
+  note: r.note || null, createdAt: dt(r.created_at),
+});
+export const toStockTransfer = (r, lines = null) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  transferNo: r.transfer_no,
+  fromLocation: r.from_location || null, toLocation: r.to_location || null,
+  status: r.status || 'posted', totalCost: r2(r.total_cost),
+  note: r.note || null,
+  voidedAt: dt(r.voided_at), voidReason: r.void_reason || null,
+  ...(lines ? { lines: lines.map(toStockTransferLine) } : {}),
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
   createdAt: dt(r.created_at),
 });
 export const toShift = (r) => ({

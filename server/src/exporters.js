@@ -9,12 +9,22 @@ const XML_ESCAPE = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'":
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => XML_ESCAPE[c]);
 const htmlEsc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-/** 单元格取值:金额保留两位,其余原样。 */
+/**
+ * 单元格取值。
+ *   money → 两位小数
+ *   qty   → 三位小数(库存数量:kg/L 这类计量单位不是整数,用 int 会被四舍五入)
+ *   int   → 整数
+ *   其余  → 原样
+ */
 export function cellValue(raw, kind) {
   if (raw == null || raw === '') return '';
-  if (kind === 'money' || kind === 'int') {
+  if (kind === 'money' || kind === 'int' || kind === 'qty') {
     const n = Number(raw);
-    if (Number.isFinite(n)) return kind === 'money' ? Math.round(n * 100) / 100 : Math.round(n);
+    if (Number.isFinite(n)) {
+      if (kind === 'money') return Math.round(n * 100) / 100;
+      if (kind === 'qty') return Math.round(n * 1000) / 1000;
+      return Math.round(n);
+    }
   }
   return raw;
 }
@@ -24,6 +34,8 @@ export function displayValue(raw, kind) {
   const v = cellValue(raw, kind);
   if (v === '') return '';
   if (kind === 'money') return Number(v).toFixed(2);
+  // 数量去掉无意义的尾随零:12.5 而不是 12.500,3 而不是 3.000
+  if (kind === 'qty') return String(Number(v));
   if (kind === 'date') {
     const d = new Date(raw);
     return Number.isNaN(d.getTime()) ? String(raw) : d.toLocaleString('en-GB', { hour12: false });
@@ -172,9 +184,9 @@ const RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 const WB_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
 
-// 样式:0=默认 1=标题(粗体16) 2=表头(粗体+底纹) 3=金额(两位小数) 4=整数
+// 样式:0=默认 1=标题(粗体16) 2=表头(粗体+底纹) 3=金额(两位小数) 4=整数 5=数量(三位小数)
 const STYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts><fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="16"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E5F"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="5"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0.00"/><numFmt numFmtId="165" formatCode="#,##0.###"/></numFmts><fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="16"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E5F"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
 
 function inlineStrCell(ref, styleIdx, text) {
   return `<c r="${ref}" s="${styleIdx}" t="inlineStr"><is><t xml:space="preserve">${esc(text)}</t></is></c>`;
@@ -217,6 +229,7 @@ export function buildXlsx(sheetName, columns, rows, meta = {}) {
       if (val === '') return inlineStrCell(ref, 0, '');
       if (kind === 'money') return numberCell(ref, 3, Number(val));
       if (kind === 'int') return numberCell(ref, 4, Number(val));
+      if (kind === 'qty') return numberCell(ref, 5, Number(val));
       if (kind === 'date') return inlineStrCell(ref, 0, displayValue(row[c.key], kind));
       return inlineStrCell(ref, 0, String(val));
     });
@@ -257,12 +270,12 @@ export function buildPrintHtml({ title, subtitle, columns, rows, meta = [], tota
   const head = columns.map((c) => `<th>${htmlEsc(c.label)}</th>`).join('');
   const body = rows.map((r) => `<tr>${columns.map((c) => {
     const kind = c.kind;
-    const cls = kind === 'money' || kind === 'int' ? 'num' : '';
+    const cls = kind === 'money' || kind === 'int' || kind === 'qty' ? 'num' : '';
     return `<td class="${cls}">${htmlEsc(displayValue(r[c.key], kind))}</td>`;
   }).join('')}</tr>`).join('');
   const metaHtml = meta.map(([k, v]) => `<div><span>${htmlEsc(k)}</span><b>${htmlEsc(v)}</b></div>`).join('');
   const totalHtml = totals
-    ? `<tfoot><tr>${columns.map((c, i) => `<td class="${c.kind === 'money' || c.kind === 'int' ? 'num' : ''}">${i === 0 ? htmlEsc(totals.label || 'TOTAL') : htmlEsc(totals.values?.[c.key] ?? '')}</td>`).join('')}</tr></tfoot>`
+    ? `<tfoot><tr>${columns.map((c, i) => `<td class="${c.kind === 'money' || c.kind === 'int' || c.kind === 'qty' ? 'num' : ''}">${i === 0 ? htmlEsc(totals.label || 'TOTAL') : htmlEsc(totals.values?.[c.key] ?? '')}</td>`).join('')}</tr></tfoot>`
     : '';
 
   return `<!DOCTYPE html>

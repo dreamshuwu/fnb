@@ -2,8 +2,12 @@
 // 两个后端只负责把各自的数据源(内存 store / MySQL)整理成统一 dataset,
 // 具体的分组、汇总、日期过滤全部在这里完成 —— 保证开发预览与生产环境报表口径一致。
 import { getReport } from './reportCatalog.js';
+// 台账类型的中文标签复用库存引擎的同一张表,避免两处维护漂移。
+import { movementLabel } from './inventoryEngine.js';
 
 const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
+const round4 = (n) => Math.round(Number(n || 0) * 10000) / 10000;
 const dayKey = (d) => String(d || '').slice(0, 10);
 const monthKey = (d) => String(d || '').slice(0, 7);
 
@@ -63,6 +67,8 @@ const TOTAL_COLUMN = {
   rebate_ledger: 'amount', rebate_liability: 'rebateBalance',
   voucher_issued: 'faceValue', voucher_redemption: 'amount', voucher_liability: 'balance',
   stock_valuation: 'value', purchase_summary: 'total', purchase_by_supplier: 'total',
+  inventory_valuation: 'value', stock_movement_ledger: 'amount', stock_transfer_log: 'amount',
+  purchase_by_item: 'amount', goods_received: 'amount', cost_variance: 'varianceAmount',
   cashier_performance: 'total', day_end_history: 'countedCash',
 };
 
@@ -376,6 +382,55 @@ function computeRows(type, ds, inRange, range) {
       return (ds.stockTakes || []).filter((s) => inRange(s.createdAt))
         .map((s) => ({ ref: s.takeNo || s.id, date: s.createdAt, lines: (s.lines || []).length, status: s.status }));
 
+    // -------------------------------------------- Stock(物料库存,按库位)
+    // 与上面 stock_report/stock_valuation 是两套口径:那几张读菜单成品的 stock_qty,
+    // 这几张读 inventory_items(原料/包材),以移动加权成本估值。
+    case 'inventory_valuation':
+      return (ds.inventoryItems || [])
+        .filter((i) => i.isActive !== false)
+        .map((i) => ({
+          code: i.code || '-', name: i.name, category: i.category || '-', unit: i.unit || '-',
+          location: i.location || '-',
+          qty: round3(i.quantity),
+          avgCost: round4(i.avgCost),
+          value: round2(Number(i.quantity || 0) * Number(i.avgCost || 0)),
+        }))
+        .sort((a, b) => b.value - a.value);
+
+    case 'stock_movement_ledger':
+      return (ds.stockMovements || [])
+        .filter((m) => inRange(m.createdAt))
+        .map((m) => ({
+          date: m.createdAt,
+          itemCode: m.itemCode || '-', itemName: m.itemName || '-',
+          type: movementLabel(m.type), location: m.location || '-',
+          // 台账的 qty 是有符号增量(出库为负),用 delta 而不是原始 qty
+          qty: round3(m.delta != null ? m.delta : m.qty),
+          unitCost: round4(m.unitCost), amount: round2(m.amount),
+          // 台账行用 before / after 命名(不是 beforeQty / afterQty)
+          beforeQty: round3(m.before), afterQty: round3(m.after),
+          avgCostAfter: round4(m.avgCostAfter),
+          refNo: m.refNo || '-', user: m.createdByName || '-',
+        }))
+        .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+    case 'stock_transfer_log': {
+      const trById = new Map((ds.stockTransfers || []).map((t) => [String(t.id), t]));
+      const rows = [];
+      for (const l of (ds.stockTransferLines || [])) {
+        const t = trById.get(String(l.transferId)) || {};
+        if (!inRange(t.createdAt)) continue;
+        rows.push({
+          date: t.createdAt, transferNo: t.transferNo || '-',
+          fromLocation: t.fromLocation || '-', toLocation: t.toLocation || '-',
+          itemCode: l.itemCode || '-', itemName: l.itemName || '-',
+          qty: round3(l.qty), unitCost: round4(l.unitCost), amount: round2(l.amount),
+          status: t.status || 'posted', user: t.createdByName || '-',
+        });
+      }
+      return rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    }
+
     // ---------------------------------------------------------- Purchase
     case 'purchase_summary': {
       const sup = new Map((ds.suppliers || []).map((s) => [String(s.id), s]));
@@ -385,9 +440,98 @@ function computeRows(type, ds, inRange, range) {
     case 'purchase_by_supplier': {
       const sup = new Map((ds.suppliers || []).map((s) => [String(s.id), s]));
       const list = (ds.purchaseOrders || []).filter((p) => inRange(p.createdAt));
-      return groupSum(list, (p) => (sup.get(String(p.supplierId)) || {}).name || 'Unknown', ['total'])
-        .map((g) => ({ supplier: g._key, orders: list.filter((p) => ((sup.get(String(p.supplierId)) || {}).name || 'Unknown') === g._key).length, total: round2(g.total) }))
+      // 已收金额按 GRN 汇总(作废的 GRN 不计),未收 = 下单金额 - 已收金额。
+      const receivedByPo = new Map();
+      for (const g of (ds.goodsReceipts || [])) {
+        if (g.status === 'void') continue;
+        const k = String(g.poId);
+        receivedByPo.set(k, round2((receivedByPo.get(k) || 0) + Number(g.total || 0)));
+      }
+      const nameOf = (p) => (sup.get(String(p.supplierId)) || {}).name || 'Unknown';
+      return groupSum(list, nameOf, ['total'])
+        .map((g) => {
+          const mine = list.filter((p) => nameOf(p) === g._key);
+          const received = round2(mine.reduce((s, p) => s + (receivedByPo.get(String(p.id)) || 0), 0));
+          return {
+            supplier: g._key, orders: mine.length,
+            total: round2(g.total), received,
+            outstanding: round2(g.total - received),
+          };
+        })
         .sort((a, b) => b.total - a.total);
+    }
+    case 'purchase_by_item': {
+      // 作废的 PO 不算采购量;草稿/已审批/部分收货/已收货都算(都是真实的采购意图)。
+      const list = (ds.purchaseOrderLines || []).filter((l) => inRange(l.poDate) && l.poStatus !== 'cancelled');
+      const map = new Map();
+      for (const l of list) {
+        const k = l.itemCode || l.itemName || `#${l.itemId}`;
+        let a = map.get(k);
+        if (!a) {
+          a = { code: l.itemCode || '-', name: l.itemName || '-', unit: l.unit || '-', qty: 0, amount: 0, orders: new Set() };
+          map.set(k, a);
+        }
+        a.qty += Number(l.qty || 0);
+        a.amount += Number(l.amount != null ? l.amount : Number(l.qty || 0) * Number(l.unitCost || 0));
+        if (l.poId != null) a.orders.add(String(l.poId));
+      }
+      return [...map.values()]
+        .map((a) => ({
+          code: a.code, name: a.name, unit: a.unit,
+          qty: round3(a.qty), amount: round2(a.amount), orders: a.orders.size,
+          avgPrice: a.qty ? round4(a.amount / a.qty) : 0,
+        }))
+        .sort((a, b) => b.amount - a.amount);
+    }
+    case 'goods_received': {
+      const sup = new Map((ds.suppliers || []).map((s) => [String(s.id), s]));
+      const grnById = new Map((ds.goodsReceipts || []).map((g) => [String(g.id), g]));
+      const rows = [];
+      for (const l of (ds.goodsReceiptLines || [])) {
+        const g = grnById.get(String(l.grnId));
+        if (!g || !inRange(g.createdAt)) continue;
+        rows.push({
+          grnNo: g.grnNo || '-', date: g.createdAt, poNo: g.poNo || '-',
+          supplier: (sup.get(String(g.supplierId)) || {}).name || g.supplierName || '-',
+          itemCode: l.itemCode || '-', itemName: l.itemName || '-',
+          qty: round3(l.qty), unitCost: round4(l.unitCost), amount: round2(l.amount),
+          status: g.status || 'posted',
+        });
+      }
+      return rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    }
+    case 'cost_variance': {
+      // 价差 = 实收加权单价 - 下单价。金额差 = 价差 × 实收数量。
+      const sup = new Map((ds.suppliers || []).map((s) => [String(s.id), s]));
+      const grnById = new Map((ds.goodsReceipts || []).map((g) => [String(g.id), g]));
+      // 按 PO 行汇总实收数量与实收金额(排除作废 GRN)
+      const recByLine = new Map();
+      for (const l of (ds.goodsReceiptLines || [])) {
+        const g = grnById.get(String(l.grnId));
+        if (!g || g.status === 'void') continue;
+        const k = String(l.poLineId);
+        const a = recByLine.get(k) || { qty: 0, amount: 0 };
+        a.qty += Number(l.qty || 0);
+        a.amount += Number(l.amount != null ? l.amount : Number(l.qty || 0) * Number(l.unitCost || 0));
+        recByLine.set(k, a);
+      }
+      const rows = [];
+      for (const l of (ds.purchaseOrderLines || [])) {
+        if (!inRange(l.poDate) || l.poStatus === 'cancelled') continue;
+        const rec = recByLine.get(String(l.id));
+        if (!rec || rec.qty <= 0) continue;   // 只列实际收过货的行
+        const orderedPrice = round4(l.unitCost);
+        const receivedPrice = round4(rec.amount / rec.qty);
+        rows.push({
+          poNo: l.poNo || '-', supplier: (sup.get(String(l.supplierId)) || {}).name || '-',
+          itemCode: l.itemCode || '-', itemName: l.itemName || '-',
+          orderedQty: round3(l.qty), orderedPrice,
+          receivedQty: round3(rec.qty), receivedPrice,
+          variance: round4(receivedPrice - orderedPrice),
+          varianceAmount: round2((receivedPrice - orderedPrice) * rec.qty),
+        });
+      }
+      return rows.sort((a, b) => Math.abs(b.varianceAmount) - Math.abs(a.varianceAmount));
     }
 
     // ---------------------------------------------------------- Staff

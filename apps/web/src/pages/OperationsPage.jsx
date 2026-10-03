@@ -262,13 +262,46 @@ function ShiftPanel() {
 }
 
 function SupplierPanel() {
-  const [rows, setRows] = useState([]); const [name, setName] = useState(''); const load = async () => setRows((await api.get('/suppliers')).data); useEffect(() => { load(); }, []); const add = async () => { if (!name) return; await api.post('/suppliers', { name }); setName(''); load(); };
-  return <Panel title="Suppliers" subtitle="Supplier master file for Smcin back-office"><div className="ops-form inline"><Input label="Supplier Name" value={name} onChange={setName} /><Action onClick={add}>Add Supplier</Action></div><div className="ops-table"><div className="ops-row ops-head"><span>Code</span><span>Name</span><span>Phone</span><span>Status</span></div>{rows.map((r) => <div className="ops-row" key={r.id}><span>{r.code}</span><span>{r.name}</span><span>{r.phone || '-'}</span><span>{r.status}</span></div>)}</div></Panel>;
+  const [rows, setRows] = useState([]);
+  const [showForm, setShowForm] = useState(false);
+  const [f, setF] = useState({ name: '', phone: '', contactPerson: '', address: '' });
+  const load = async () => setRows((await api.get('/suppliers')).data);
+  useEffect(() => { load(); }, []);
+  const add = async () => { if (!f.name) return; await api.post('/suppliers', f); setF({ name: '', phone: '', contactPerson: '', address: '' }); setShowForm(false); load(); };
+  const toggle = async (id) => { await api.put(`/suppliers/${id}/status`); load(); };
+  const del = async (id) => { if (!window.confirm('删除此供应商?')) return; await api.delete(`/suppliers/${id}`); load(); };
+  return <Panel title="Suppliers" subtitle="Supplier master file for Smcin back-office"><div className="ops-actions" style={{ marginBottom: '10px' }}><Action onClick={() => setShowForm((s) => !s)}>{showForm ? 'Hide Form' : '+ New Supplier'}</Action></div>{showForm && <div className="ops-form inline" style={{ flexWrap: 'wrap' }}><Input label="Name" value={f.name} onChange={(v) => setF({ ...f, name: v })} /><Input label="Phone" value={f.phone} onChange={(v) => setF({ ...f, phone: v })} /><Input label="Contact" value={f.contactPerson} onChange={(v) => setF({ ...f, contactPerson: v })} /><Input label="Address" value={f.address} onChange={(v) => setF({ ...f, address: v })} /><Action onClick={add}>Create</Action></div>}<div className="ops-table tall"><div className="ops-row ops-head cols-6"><span>Code</span><span>Name</span><span>Phone</span><span>Contact</span><span>Status</span><span>Action</span></div>{rows.map((r) => <div className="ops-row cols-6" key={r.id}><span>{r.code || '-'}</span><span>{r.name}</span><span>{r.phone || '-'}</span><span>{r.contactPerson || '-'}</span><span>{r.status}</span><span className="ops-inline-actions"><button className="mini-action" onClick={() => toggle(r.id)}>{r.status === 'active' ? 'Deactivate' : 'Activate'}</button><button className="mini-action danger" onClick={() => del(r.id)}>Delete</button></span></div>)}{!rows.length && <Empty />}</div></Panel>;
 }
 
 function PurchasePanel() {
-  const [rows, setRows] = useState([]); const [form, setForm] = useState({ supplierId: '', itemId: '', qty: '', total: '' }); const load = async () => setRows((await api.get('/purchases')).data); useEffect(() => { load(); }, []); const add = async () => { await api.post('/purchases', { supplierId: form.supplierId, total: Number(form.total || 0), items: [{ itemId: form.itemId, qty: Number(form.qty || 0) }] }); setForm({ supplierId: '', itemId: '', qty: '', total: '' }); load(); };
-  return <Panel title="Purchase Order / GRN" subtitle="Create purchase order and receive goods into inventory"><div className="ops-form"><Input label="Supplier ID" value={form.supplierId} onChange={(v) => setForm({ ...form, supplierId: v })} /><Input label="Inventory Item ID" value={form.itemId} onChange={(v) => setForm({ ...form, itemId: v })} /><Input label="Quantity" type="number" value={form.qty} onChange={(v) => setForm({ ...form, qty: v })} /><Input label="Total" type="number" value={form.total} onChange={(v) => setForm({ ...form, total: v })} /><Action onClick={add}>Create PO</Action></div><div className="ops-table"><div className="ops-row ops-head"><span>PO No.</span><span>Supplier</span><span>Total</span><span>Status</span></div>{rows.map((r) => <div className="ops-row" key={r.id}><span>{r.poNo}</span><span>{r.supplierId || '-'}</span><span>¥{r.total.toFixed(2)}</span><span>{r.status} {r.status === 'open' && <button className="mini-action" onClick={async () => { await api.post(`/purchases/${r.id}/receive`); load(); }}>Receive GRN</button>}</span></div>)}{!rows.length && <Empty />}</div></Panel>;
+  const [rows, setRows] = useState([]);
+  const [suppliers, setSuppliers] = useState([]);
+  const [items, setItems] = useState([]);
+  const [showForm, setShowForm] = useState(false);
+  const [supId, setSupId] = useState('');
+  const [lines, setLines] = useState([{ itemId: '', qty: '', unitCost: '' }]);
+  const [grns, setGrns] = useState([]);
+  const load = async () => { setRows((await api.get('/purchases')).data); setSuppliers((await api.get('/suppliers')).data); setItems((await api.get('/inventory/items')).data); setGrns((await api.get('/goods-receipts')).data); };
+  useEffect(() => { load(); }, []);
+  const setL = (i, k, v) => setLines((ls) => ls.map((l, idx) => idx === i ? { ...l, [k]: v } : l));
+  const add = async () => {
+    const clean = lines.filter((l) => l.itemId && Number(l.qty) > 0).map((l) => ({ itemId: l.itemId, qty: Number(l.qty), unitCost: Number(l.unitCost || 0) }));
+    if (!supId || !clean.length) return;
+    await api.post('/purchases', { supplierId: supId, lines: clean });
+    setSupId(''); setLines([{ itemId: '', qty: '', unitCost: '' }]); setShowForm(false); load();
+  };
+  const approve = async (id) => { await api.post(`/purchases/${id}/approve`); load(); };
+  const cancel = async (id) => { const reason = window.prompt('Cancel reason?'); if (reason == null) return; await api.post(`/purchases/${id}/cancel`, { reason }); load(); };
+  const del = async (id) => { if (!window.confirm('Delete this PO?')) return; await api.delete(`/purchases/${id}`); load(); };
+  const receive = async (id) => {
+    const po = rows.find((r) => r.id === id);
+    if (!po || !po.lines) return;
+    const plan = po.lines.filter((l) => l.outstandingQty > 0).map((l) => ({ poLineId: l.id, qty: Number(window.prompt(`Receive for ${l.itemName || l.itemCode || 'item'}\nOutstanding: ${l.outstandingQty}\nEnter qty to receive:`, String(l.outstandingQty)) || 0) }));
+    if (!plan.some((p) => p.qty > 0)) return;
+    await api.post(`/purchases/${id}/receive`, { lines: plan.filter((p) => p.qty > 0) });
+    load();
+  };
+  return <Panel title="Purchase Order / GRN" subtitle="Create PO · Approve · Receive · Cancel"><div className="ops-actions" style={{ marginBottom: '10px' }}><Action onClick={() => setShowForm((s) => !s)}>{showForm ? 'Hide Form' : '+ New PO'}</Action></div>{showForm && <div style={{ marginBottom: '14px' }}><label className="ops-field"><span>Supplier</span><select value={supId} onChange={(e) => setSupId(e.target.value)}><option value="">-- choose --</option>{suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label><div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '10px' }}>{lines.map((l, i) => (<div key={i} className="ops-form inline" style={{ gap: '8px' }}><label className="ops-field" style={{ flex: 1 }}><span>Item</span><select value={l.itemId} onChange={(e) => setL(i, 'itemId', e.target.value)}><option value="">-- choose --</option>{items.map((it) => <option key={it.id} value={it.id}>{it.code || it.name} ({it.location || '-'})</option>)}</select></label><Input label="Qty" type="number" step="0.001" value={l.qty} onChange={(v) => setL(i, 'qty', v)} /><Input label="Unit Cost" type="number" step="0.01" value={l.unitCost} onChange={(v) => setL(i, 'unitCost', v)} />{lines.length > 1 && <button className="mini-action danger" onClick={() => setLines((ls) => ls.filter((_, idx) => idx !== i))}>−</button>}</div>))}</div><div className="ops-actions"><Action tone="secondary" onClick={() => setLines((ls) => [...ls, { itemId: '', qty: '', unitCost: '' }])}>+ Line</Action><Action onClick={add}>Create PO</Action></div></div>}<div className="ops-table tall"><div className="ops-row ops-head cols-7"><span>PO No.</span><span>Supplier</span><span>Lines</span><span>Total</span><span>Status</span><span>Created</span><span>Action</span></div>{rows.map((r) => <div className="ops-row cols-7" key={r.id}><span>{r.poNo}</span><span>{r.supplierName || r.supplierId || '-'}</span><span>{(r.lines || []).length}</span><span>¥{Number(r.total || 0).toFixed(2)}</span><span>{r.status}</span><span>{r.createdAt ? new Date(r.createdAt).toLocaleDateString('en-GB') : '-'}</span><span className="ops-inline-actions">{r.status === 'draft' && <><button className="mini-action" onClick={() => approve(r.id)}>Approve</button><button className="mini-action" onClick={() => cancel(r.id)}>Cancel</button><button className="mini-action danger" onClick={() => del(r.id)}>Delete</button></>}{(r.status === 'approved' || r.status === 'partial') && <button className="mini-action" onClick={() => receive(r.id)}>Receive</button>}</span></div>)}{!rows.length && <Empty />}</div><div style={{ marginTop: '18px' }}><Panel title="Goods Receipts (GRN)" subtitle="Received records · Click to void"><div className="ops-table"><div className="ops-row ops-head cols-6"><span>GRN No.</span><span>PO No.</span><span>Supplier</span><span>Total</span><span>Status</span><span>Action</span></div>{grns.map((g) => <div className="ops-row cols-6" key={g.id}><span>{g.grnNo}</span><span>{g.poNo || '-'}</span><span>{g.supplierName || '-'}</span><span>¥{Number(g.total || 0).toFixed(2)}</span><span>{g.status}</span><span className="ops-inline-actions">{g.status !== 'void' && <button className="mini-action danger" onClick={async () => { const reason = window.prompt('Void reason?'); if (reason == null) return; await api.post(`/goods-receipts/${g.id}/void`, { reason }); load(); }}>Void</button>}</span></div>)}{!grns.length && <Empty text="No GRNs yet" />}</div></Panel></div></Panel>;
 }
 
 function VoidPanel() {
@@ -463,6 +496,8 @@ function ReportPanel() {
   const fmtCell = (v, kind) => {
     if (v == null || v === '') return '-';
     if (kind === 'money') return `¥${Number(v).toFixed(2)}`;
+    // qty / int 归一化成普通数字,避免 12.500000000000002 这类浮点尾巴
+    if (kind === 'qty' || kind === 'int') return String(Number(v));
     if (kind === 'date') { const d = new Date(v); return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString('en-GB', { hour12: false }); }
     return String(v);
   };
