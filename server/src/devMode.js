@@ -14,14 +14,25 @@ import {
   computeTierDiscount, computePointsEarn, computePointsValue, checkPointsRedeem, checkCreditLimit,
   statementEvents, runStatement, sliceStatement, nextMemberNo, makeTierCode,
 } from './memberEngine.js';
-// 默认会员等级 / 会员设置:与生产 db.js / seed.js 共用同一份常量
-import { DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS } from './db.js';
+// 默认会员等级 / 会员设置 / Smcin 主数据:与生产 db.js / seed.js 共用同一份常量
+import {
+  DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS,
+  DEFAULT_MAIN_GROUPS, DEFAULT_PRINT_GROUPS, DEFAULT_DEPARTMENTS, DEFAULT_UOMS,
+  CATEGORY_MASTER_MAP, CATEGORY_UOM_MAP,
+} from './db.js';
+// 主数据共享规则:编码生成 / 删除保护 / 基准单位唯一 —— 与生产 routes/menu.js 同一份
+import { MASTER_TYPES, MASTER_PATHS, makeMasterCode, isDuplicateCode, countRefs, baseUnitRule } from './masterData.js';
+// 产品主档拼装/过滤/批量修改规则 —— 同样与生产共用
+import { buildProducts, matchProduct, summarizeProducts, buildBulkPatch } from './productMaster.js';
 // 复用生产同一份 zod schema —— 否则「预览能过、生产报错」这类漂移会一直存在
 import {
   supplierSchema, purchaseOrderSchema, goodsReceiptSchema, stockTransferSchema,
   inventoryItemSchema, adjustSchema, checkoutSchema,
   memberSchema, memberUpdateSchema, memberTierSchema, memberTierUpdateSchema,
   memberTopupSchema, memberKnockoffSchema, memberPointsSchema, memberStatusSchema,
+  mainGroupSchema, mainGroupUpdateSchema, printGroupSchema, printGroupUpdateSchema,
+  departmentSchema, departmentUpdateSchema, uomSchema, uomUpdateSchema,
+  variantSchema, variantUpdateSchema,
 } from './validators.js';
 import {
   ROLES, PERMISSION_GROUPS, ALL_PERMISSIONS, defaultPermissions, hasPermission, resolveRolePermissions,
@@ -50,6 +61,8 @@ const store = {
   stockTransfers: [], stockTransferLines: [],
   // 新增：会员体系补全 —— 会员等级
   memberTiers: [],
+  // 新增：Smcin 主数据 —— 商品大类 / 打印分组 / 部门 / 计量单位
+  mainGroups: [], printGroups: [], departments: [], uoms: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -102,10 +115,36 @@ function seedDev() {
       lastLoginAt: null, isActive: true,
     });
   }
+  // ---- Smcin 主数据:商品大类 / 打印分组 / 部门 / 计量单位 ----
+  const seedMaster = (bucket, rows) => {
+    const ids = {};
+    for (const [code, name, sort] of rows) {
+      const id = nid();
+      bucket.push({ id, orgId: '1', storeId: '1', code, name, sortOrder: sort, isActive: true, note: null });
+      ids[code] = id;
+    }
+    return ids;
+  };
+  const mainGroupIds = seedMaster(store.mainGroups, DEFAULT_MAIN_GROUPS);
+  const printGroupIds = seedMaster(store.printGroups, DEFAULT_PRINT_GROUPS);
+  const deptIds = seedMaster(store.departments, DEFAULT_DEPARTMENTS);
+  const uomIds = {};
+  for (const [code, name, dimension, factor, isBase, sort] of DEFAULT_UOMS) {
+    const id = nid();
+    store.uoms.push({ id, orgId: '1', storeId: '1', code, name, dimension, factor, isBase, sortOrder: sort, isActive: true, note: null });
+    uomIds[code] = id;
+  }
+
   const catIds = {};
   for (const [name, color, sort] of CATS) {
     const id = nid();
-    store.categories.push({ id, orgId: '1', storeId: '1', name, color, sortOrder: sort, isActive: true, station: STATION_BY_CAT[name] || 'Kitchen' });
+    const map = CATEGORY_MASTER_MAP[name] || {};
+    store.categories.push({
+      id, orgId: '1', storeId: '1', name, color, sortOrder: sort, isActive: true,
+      station: STATION_BY_CAT[name] || 'Kitchen',
+      mainGroupId: map.mainGroup ? mainGroupIds[map.mainGroup] ?? null : null,
+      departmentId: map.department ? deptIds[map.department] ?? null : null,
+    });
     catIds[name] = id;
   }
   const baseIds = {};
@@ -132,9 +171,16 @@ function seedDev() {
   }
   let vsort = 1;
   const addVar = (baseId, cat, code, name, price) => {
+    const map = CATEGORY_MASTER_MAP[cat] || {};
     store.variants.push({
       id: nid(), orgId: '1', storeId: '1', baseId, categoryId: catIds[cat], code, name,
       modifierIds: [], price, cost: +(price * 0.4).toFixed(2), stockQty: 50, stockThreshold: 10, barcode: null, sortOrder: vsort++, isActive: true,
+      // 分组/部门/打印组/单位按分类继承(与生产 seed.js 同一套映射)
+      mainGroupId: map.mainGroup ? mainGroupIds[map.mainGroup] ?? null : null,
+      printGroupId: map.printGroup ? printGroupIds[map.printGroup] ?? null : null,
+      departmentId: map.department ? deptIds[map.department] ?? null : null,
+      supplierId: null,
+      uom: CATEGORY_UOM_MAP[cat] || null, packUom: null, packFactor: 1,
     });
   };
   for (const [name, cat, price] of DRINK_BASES) {
@@ -398,7 +444,29 @@ const toStaff = (u) => ({
   joinDate: u.joinDate || null, lastLoginAt: u.lastLoginAt || null,
   hasPin: !!u.pin, isActive: u.isActive !== false, createdAt: u.createdAt || null,
 });
-const toMenuCategory = (c) => ({ _id: c.id, id: c.id, orgId: c.orgId, storeId: c.storeId, name: c.name, color: c.color || null, sortOrder: c.sortOrder, isActive: !!c.isActive, createdAt: now(), updatedAt: now() });
+const toMenuCategory = (c) => ({
+  _id: c.id, id: c.id, orgId: c.orgId, storeId: c.storeId, name: c.name, color: c.color || null,
+  station: c.station || 'Kitchen',
+  mainGroupId: c.mainGroupId == null ? null : String(c.mainGroupId),
+  departmentId: c.departmentId == null ? null : String(c.departmentId),
+  sortOrder: c.sortOrder, isActive: !!c.isActive, createdAt: now(), updatedAt: now(),
+});
+// Smcin 主数据:前三类结构一致共用一个映射,与生产 db.js 的 masterRow 字段逐一对应。
+const masterRow = (r) => ({
+  _id: r.id, id: r.id, orgId: r.orgId || '1', storeId: r.storeId || '1',
+  code: r.code || null, name: r.name,
+  sortOrder: Number(r.sortOrder || 0), isActive: r.isActive == null ? true : !!r.isActive,
+  note: r.note || null, createdAt: r.createdAt || now(), updatedAt: r.updatedAt || now(),
+});
+const toMainGroup = masterRow;
+const toPrintGroup = masterRow;
+const toDepartment = masterRow;
+const toUom = (r) => ({
+  ...masterRow(r),
+  dimension: r.dimension || 'count',
+  factor: Number(r.factor == null ? 1 : r.factor),
+  isBase: !!r.isBase,
+});
 const toMenuBase = (b) => ({ _id: b.id, id: b.id, orgId: b.orgId, storeId: b.storeId, categoryId: b.categoryId == null ? null : String(b.categoryId), name: b.name, basePrice: Number(b.basePrice || 0), sortOrder: b.sortOrder, isActive: !!b.isActive, createdAt: now(), updatedAt: now() });
 const toModifier = (m) => ({ _id: m.id, id: m.id, orgId: m.orgId, storeId: m.storeId, code: m.code, label: m.label, defaultDelta: Number(m.defaultDelta || 0), sortOrder: m.sortOrder, isActive: !!m.isActive, createdAt: now(), updatedAt: now() });
 const toBaseModifier = (bm) => ({ _id: bm.id, id: bm.id, orgId: bm.orgId, storeId: bm.storeId, baseId: String(bm.baseId), modifierId: String(bm.modifierId), delta: bm.delta == null ? null : Number(bm.delta), createdAt: now(), updatedAt: now() });
@@ -408,6 +476,13 @@ const toVariant = (v) => ({
   modifierIds: v.modifierIds || [], price: Number(v.price || 0), cost: Number(v.cost || 0),
   stockQty: Number(v.stockQty || 0), stockThreshold: Number(v.stockThreshold || 0),
   barcode: v.barcode || null, sortOrder: v.sortOrder, isActive: !!v.isActive, createdAt: now(), updatedAt: now(),
+  // Smcin 产品主档:SKU 级的分组/部门/供应商与计量单位
+  mainGroupId: v.mainGroupId == null ? null : String(v.mainGroupId),
+  printGroupId: v.printGroupId == null ? null : String(v.printGroupId),
+  departmentId: v.departmentId == null ? null : String(v.departmentId),
+  supplierId: v.supplierId == null ? null : String(v.supplierId),
+  uom: v.uom || null, packUom: v.packUom || null,
+  packFactor: Number(v.packFactor == null ? 1 : v.packFactor),
 });
 const toTable = (t) => ({
   _id: t.id, id: t.id, orgId: t.orgId, storeId: t.storeId, number: t.number, zone: t.zone, seats: t.seats,
@@ -1000,10 +1075,24 @@ function buildReportDataset() {
   const baseById = new Map(store.bases.map((b) => [String(b.id), b]));
   const catById = new Map(store.categories.map((c) => [String(c.id), c]));
 
+  // 商品主档:复用 /menu/products 的同一套拼装(含继承回落),报表分组口径才不会与后台清单分叉
+  const products = buildProducts({
+    variants: store.variants.map(toVariant),
+    categories: store.categories.map(toMenuCategory),
+    bases: store.bases.map(toMenuBase),
+    mainGroups: store.mainGroups.map(toMainGroup),
+    printGroups: store.printGroups.map(toPrintGroup),
+    departments: store.departments.map(toDepartment),
+    suppliers: store.suppliers.map(toSupplier),
+    uoms: store.uoms.map(toUom),
+  });
+  const productById = new Map(products.map((p) => [String(p.id), p]));
+
   const decorateItem = (it) => {
     const v = variantById.get(String(it.variantId || it.itemId));
     const b = v ? baseById.get(String(v.baseId)) : null;
     const c = b ? catById.get(String(b.categoryId)) : null;
+    const p = productById.get(String(it.variantId || it.itemId));
     return {
       ...it,
       code: it.code || (v ? v.code : ''),
@@ -1013,6 +1102,11 @@ function buildReportDataset() {
       amount: Number(it.qty || 0) * Number(it.unitPrice || 0),
       category: c ? c.name : 'Uncategorised',
       station: c ? (c.station || 'Kitchen') : 'Kitchen',
+      // Smcin 主数据口径:主分组 / 打印分组 / 部门 / 供应商(部门已含「回落到分类默认」)
+      mainGroup: p ? (p.mainGroupName || 'Unassigned') : 'Unassigned',
+      printGroup: p ? (p.printGroupName || 'No Print') : 'No Print',
+      department: p ? (p.departmentName || 'Unassigned') : 'Unassigned',
+      supplier: p ? (p.supplierName || '') : '',
     };
   };
 
@@ -1038,6 +1132,8 @@ function buildReportDataset() {
 
   return {
     orders,
+    // 产品主档(供 Product Listing 报表使用),与后台 /menu/products 同源
+    products,
     payments: store.payments.map((p) => ({ ...p, amount: Number(p.amount || 0) })),
     refunds: store.refunds.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
     unsettles: store.unsettles.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
@@ -1311,7 +1407,12 @@ export function createDevRouter(io) {
   // ---- 菜单 CRUD ----
   r.get('/menu/categories', (req, res) => res.json(store.categories.map(toMenuCategory)));
   r.post('/menu/categories', devRequirePerm('menu.edit'), (req, res) => {
-    const c = { id: nid(), orgId: '1', storeId: '1', name: req.body.name, color: req.body.color ?? null, sortOrder: req.body.sortOrder || store.categories.length + 1, isActive: true };
+    const c = {
+      id: nid(), orgId: '1', storeId: '1', name: req.body.name, color: req.body.color ?? null,
+      sortOrder: req.body.sortOrder || store.categories.length + 1, isActive: true,
+      mainGroupId: req.body.mainGroupId ? String(req.body.mainGroupId) : null,
+      departmentId: req.body.departmentId ? String(req.body.departmentId) : null,
+    };
     store.categories.push(c); res.status(201).json(toMenuCategory(c));
   });
   r.put('/menu/categories/:id', devRequirePerm('menu.edit'), (req, res) => {
@@ -1321,6 +1422,8 @@ export function createDevRouter(io) {
     if (req.body.color !== undefined) c.color = req.body.color;
     if (req.body.sortOrder !== undefined) c.sortOrder = req.body.sortOrder;
     if (req.body.isActive !== undefined) c.isActive = req.body.isActive;
+    if (req.body.mainGroupId !== undefined) c.mainGroupId = req.body.mainGroupId ? String(req.body.mainGroupId) : null;
+    if (req.body.departmentId !== undefined) c.departmentId = req.body.departmentId ? String(req.body.departmentId) : null;
     res.json(toMenuCategory(c));
   });
   r.delete('/menu/categories/:id', devRequirePerm('menu.edit'), (req, res) => {
@@ -1402,32 +1505,181 @@ export function createDevRouter(io) {
     res.json(toVariant(v));
   });
   r.post('/menu/variants', devRequirePerm('menu.edit'), (req, res) => {
-    const b = req.body;
+    // 与生产同一份 schema —— 否则「预览能建、生产 400」这类漂移会一直存在
+    let b; try { b = variantSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const sid = (x) => (x === undefined || x === null || x === '' ? null : String(x));
     const v = {
       id: nid(), orgId: '1', storeId: '1', baseId: String(b.baseId), categoryId: b.categoryId || null,
       code: b.code, name: b.name, modifierIds: b.modifierIds || [],
       price: b.price ?? 0, cost: b.cost ?? 0, stockQty: b.stockQty ?? 0, stockThreshold: b.stockThreshold ?? 0,
-      barcode: b.barcode || null, sortOrder: b.sortOrder || store.variants.length + 1, isActive: true,
+      barcode: b.barcode || null, sortOrder: b.sortOrder ?? store.variants.length + 1,
+      isActive: b.isActive === false ? false : true,
+      mainGroupId: sid(b.mainGroupId), printGroupId: sid(b.printGroupId), departmentId: sid(b.departmentId),
+      supplierId: sid(b.supplierId), uom: b.uom || null, packUom: b.packUom || null,
+      packFactor: b.packFactor ?? 1,
     };
     store.variants.push(v); res.status(201).json(toVariant(v));
   });
   r.put('/menu/variants/:id', devRequirePerm('menu.edit'), (req, res) => {
     const v = store.variants.find((x) => x.id === req.params.id);
     if (!v) return res.status(404).json({ error: 'not found' });
+    let b; try { b = variantUpdateSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const sid = (x) => (x === undefined || x === null || x === '' ? null : String(x));
     Object.assign(v, {
-      categoryId: req.body.categoryId !== undefined ? req.body.categoryId : v.categoryId,
-      code: req.body.code ?? v.code, name: req.body.name ?? v.name,
-      modifierIds: req.body.modifierIds ?? v.modifierIds,
-      price: req.body.price ?? v.price, cost: req.body.cost ?? v.cost,
-      stockQty: req.body.stockQty ?? v.stockQty, stockThreshold: req.body.stockThreshold ?? v.stockThreshold,
-      barcode: req.body.barcode ?? v.barcode, sortOrder: req.body.sortOrder ?? v.sortOrder,
-      isActive: req.body.isActive ?? v.isActive,
+      categoryId: b.categoryId !== undefined ? (b.categoryId || null) : v.categoryId,
+      code: b.code ?? v.code, name: b.name ?? v.name,
+      modifierIds: b.modifierIds ?? v.modifierIds,
+      price: b.price ?? v.price, cost: b.cost ?? v.cost,
+      stockQty: b.stockQty ?? v.stockQty, stockThreshold: b.stockThreshold ?? v.stockThreshold,
+      barcode: b.barcode ?? v.barcode, sortOrder: b.sortOrder ?? v.sortOrder,
+      isActive: b.isActive ?? v.isActive,
+      // Smcin 产品主档字段:显式传空字符串表示「清空该引用」
+      mainGroupId: b.mainGroupId !== undefined ? sid(b.mainGroupId) : v.mainGroupId,
+      printGroupId: b.printGroupId !== undefined ? sid(b.printGroupId) : v.printGroupId,
+      departmentId: b.departmentId !== undefined ? sid(b.departmentId) : v.departmentId,
+      supplierId: b.supplierId !== undefined ? sid(b.supplierId) : v.supplierId,
+      uom: b.uom !== undefined ? (b.uom || null) : v.uom,
+      packUom: b.packUom !== undefined ? (b.packUom || null) : v.packUom,
+      packFactor: b.packFactor !== undefined ? b.packFactor : v.packFactor,
     });
     res.json(toVariant(v));
   });
   r.delete('/menu/variants/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.variants = store.variants.filter((x) => x.id !== req.params.id);
     res.json({ ok: true });
+  });
+
+  // ---- Smcin 主数据:商品大类 / 打印分组 / 部门 / 计量单位 ----
+  // 规则(编码生成 / 删除保护 / 基准单位唯一)来自 masterData.js,与生产同一份;
+  // 这里只提供内存存储。四类共用同一套路由生成逻辑。
+  const devMasterBucket = {
+    'main-groups': () => store.mainGroups,
+    'print-groups': () => store.printGroups,
+    departments: () => store.departments,
+    uoms: () => store.uoms,
+  };
+  const devMasterMapper = { 'main-groups': toMainGroup, 'print-groups': toPrintGroup, departments: toDepartment, uoms: toUom };
+  const devMasterSchema = { 'main-groups': mainGroupSchema, 'print-groups': printGroupSchema, departments: departmentSchema, uoms: uomSchema };
+  const devMasterUpdate = { 'main-groups': mainGroupUpdateSchema, 'print-groups': printGroupUpdateSchema, departments: departmentUpdateSchema, uoms: uomUpdateSchema };
+  const devRefCollections = () => ({ categories: store.categories, variants: store.variants });
+
+  for (const path of MASTER_PATHS) {
+    const bucket = devMasterBucket[path];
+    const mapper = devMasterMapper[path];
+    const schema = devMasterSchema[path];
+    const updateSchema = devMasterUpdate[path];
+    const isUom = path === 'uoms';
+
+    r.get(`/${path}`, (req, res) => {
+      let list = [...bucket()].sort((a, b) => (Number(a.sortOrder) - Number(b.sortOrder)) || (Number(a.id) - Number(b.id)));
+      if (req.query.active === '1') list = list.filter((x) => x.isActive);
+      res.json(list.map(mapper));
+    });
+    r.get(`/${path}/:id`, (req, res) => {
+      const row = bucket().find((x) => String(x.id) === String(req.params.id));
+      if (!row) return res.status(404).json({ error: 'not_found' });
+      res.json(mapper(row));
+    });
+    r.post(`/${path}`, devRequirePerm('settings.edit'), (req, res) => {
+      let b; try { b = schema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+      const rows = bucket();
+      const code = String(b.code || '').trim() || makeMasterCode(b.name, rows.map((x) => x.code).filter(Boolean));
+      if (isDuplicateCode(rows, code)) return res.status(400).json({ error: 'duplicate_code', code });
+      if (isUom) {
+        const { clearOthers } = baseUnitRule(b, null);
+        if (clearOthers) for (const x of rows) if (x.dimension === clearOthers) x.isBase = false;
+      }
+      const row = {
+        id: nid(), orgId: '1', storeId: '1', code, name: b.name,
+        sortOrder: Number(b.sortOrder || 0), isActive: b.isActive === false ? false : true,
+        note: b.note ?? null, createdAt: now(), updatedAt: now(),
+      };
+      if (isUom) {
+        const { forceFactorOne } = baseUnitRule(b, null);
+        row.dimension = b.dimension || 'count';
+        row.factor = forceFactorOne ? 1 : Number(b.factor ?? 1);
+        row.isBase = !!b.isBase;
+      }
+      rows.push(row);
+      res.status(201).json(mapper(row));
+    });
+    r.put(`/${path}/:id`, devRequirePerm('settings.edit'), (req, res) => {
+      let b; try { b = updateSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+      const row = bucket().find((x) => String(x.id) === String(req.params.id));
+      if (!row) return res.status(404).json({ error: 'not_found' });
+      if (b.code != null && b.code !== '' && isDuplicateCode(bucket(), b.code, row.id)) {
+        return res.status(400).json({ error: 'duplicate_code', code: b.code });
+      }
+      if (isUom) {
+        const { clearOthers } = baseUnitRule(b, row);
+        if (clearOthers) for (const x of bucket()) if (x.dimension === clearOthers && String(x.id) !== String(row.id)) x.isBase = false;
+      }
+      if (b.code != null && b.code !== '') row.code = b.code;
+      if (b.name != null) row.name = b.name;
+      if (b.sortOrder != null) row.sortOrder = Number(b.sortOrder);
+      if (b.isActive != null) row.isActive = !!b.isActive;
+      if (b.note !== undefined) row.note = b.note;
+      if (isUom) {
+        if (b.dimension != null) row.dimension = b.dimension;
+        if (b.factor != null) row.factor = Number(b.factor);
+        if (b.isBase != null) row.isBase = !!b.isBase;
+        if (row.isBase) row.factor = 1;   // 基准单位的系数恒为 1
+      }
+      row.updatedAt = now();
+      res.json(mapper(row));
+    });
+    r.put(`/${path}/:id/status`, devRequirePerm('settings.edit'), (req, res) => {
+      const row = bucket().find((x) => String(x.id) === String(req.params.id));
+      if (!row) return res.status(404).json({ error: 'not_found' });
+      row.isActive = req.body && req.body.isActive !== undefined ? !!req.body.isActive : !row.isActive;
+      row.updatedAt = now();
+      res.json(mapper(row));
+    });
+    r.delete(`/${path}/:id`, devRequirePerm('settings.edit'), (req, res) => {
+      const rows = bucket();
+      const i = rows.findIndex((x) => String(x.id) === String(req.params.id));
+      if (i < 0) return res.status(404).json({ error: 'not_found' });
+      const type = MASTER_TYPES[path];
+      const counts = countRefs(devRefCollections(), type.refs, rows[i]);
+      const total = Object.values(counts).reduce((s, n) => s + n, 0);
+      if (total > 0) return res.status(409).json({ error: 'master_in_use', label: type.label, counts, hint: 'set isActive=false instead' });
+      const [gone] = rows.splice(i, 1);
+      res.json({ ok: true, deleted: String(gone.id) });
+    });
+  }
+
+  // ---- 产品主档(扁平清单):与生产 /menu/products 同一套拼装/过滤规则 ----
+  r.get('/menu/products', (req, res) => {
+    const all = buildProducts({
+      variants: store.variants.map(toVariant),
+      categories: store.categories.map(toMenuCategory),
+      bases: store.bases.map(toMenuBase),
+      mainGroups: store.mainGroups.map(toMainGroup),
+      printGroups: store.printGroups.map(toPrintGroup),
+      departments: store.departments.map(toDepartment),
+      suppliers: store.suppliers.map(toSupplier),
+      uoms: store.uoms.map(toUom),
+    });
+    const rows = all.filter((p) => matchProduct(p, req.query));
+    res.json({ rows, total: rows.length, summary: summarizeProducts(all) });
+  });
+
+  r.post('/menu/products/bulk', devRequirePerm('menu.edit'), (req, res) => {
+    const { ids, patch, error } = buildBulkPatch(req.body || {});
+    if (error) return res.status(400).json({ error });
+    const wanted = new Set(ids);
+    let updated = 0;
+    for (const v of store.variants) {
+      if (!wanted.has(String(v.id))) continue;
+      if (patch.isActive !== undefined) v.isActive = patch.isActive;
+      if (patch.mainGroupId !== undefined) v.mainGroupId = patch.mainGroupId;
+      if (patch.printGroupId !== undefined) v.printGroupId = patch.printGroupId;
+      if (patch.departmentId !== undefined) v.departmentId = patch.departmentId;
+      if (patch.supplierId !== undefined) v.supplierId = patch.supplierId;
+      if (patch.uom !== undefined) v.uom = patch.uom;
+      updated += 1;
+    }
+    res.json({ ok: true, requested: ids.length, updated, patch });
   });
 
   r.get('/menu/tree', (req, res) => {

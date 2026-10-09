@@ -70,6 +70,71 @@ export const DEFAULT_MEMBER_SETTINGS = {
   creditLimitDefault: 0,
 };
 
+// ---- 默认 Smcin 主数据（生产 seed 与 dev 预览共用同一份） ----
+// [code, name, sortOrder]
+export const DEFAULT_MAIN_GROUPS = [
+  ['BEV', '饮料 Beverage', 1],
+  ['FOOD', '食品 Food', 2],
+  ['SNACK', '小吃 Snack', 3],
+  ['TOBACCO', '香烟 Tobacco', 4],
+  ['RETAIL', '零售 Retail', 5],
+  ['OTHER', '其他 Others', 99],
+];
+// 打印分组决定小票/厨房单怎么归类打印;NONE = 只上小票不进后厨
+export const DEFAULT_PRINT_GROUPS = [
+  ['KITCHEN', '厨房单 Kitchen', 1],
+  ['BAR', '水吧单 Bar', 2],
+  ['COUNTER', '柜台单 Counter', 3],
+  ['NONE', '不打印 No Print', 99],
+];
+export const DEFAULT_DEPARTMENTS = [
+  ['BEVERAGE', '水吧 Beverage', 1],
+  ['KITCHEN', '厨房 Kitchen', 2],
+  ['COUNTER', '柜台 Counter', 3],
+  ['RETAIL', '零售 Retail', 4],
+];
+// [code, name, dimension, factor, isBase, sortOrder]
+// factor = 1 个本单位等于多少个该量纲的基准单位;每个量纲只有一个 is_base=1。
+export const DEFAULT_UOMS = [
+  ['PCS', '个 Piece', 'count', 1, 1, 1],
+  ['CUP', '杯 Cup', 'count', 1, 0, 2],
+  ['PLATE', '碟 Plate', 'count', 1, 0, 3],
+  ['BOWL', '碗 Bowl', 'count', 1, 0, 4],
+  ['BOTTLE', '瓶 Bottle', 'count', 1, 0, 5],
+  ['CAN', '罐 Can', 'count', 1, 0, 6],
+  ['PACK', '包 Pack', 'count', 1, 0, 7],
+  ['BOX', '箱 Box', 'count', 12, 0, 8],
+  ['KG', '公斤 Kilogram', 'weight', 1, 1, 20],
+  ['G', '克 Gram', 'weight', 0.001, 0, 21],
+  ['L', '升 Litre', 'volume', 1, 1, 30],
+  ['ML', '毫升 Millilitre', 'volume', 0.001, 0, 31],
+];
+// 四类主数据共用一套「编码+名称」结构,这里集中描述以便一次性建表/回填/暴露 CRUD。
+export const MASTER_KINDS = {
+  'main-groups': { table: 'main_groups', label: 'Main Group', defaults: DEFAULT_MAIN_GROUPS },
+  'print-groups': { table: 'print_groups', label: 'Print Group', defaults: DEFAULT_PRINT_GROUPS },
+  departments: { table: 'departments', label: 'Department', defaults: DEFAULT_DEPARTMENTS },
+  uoms: { table: 'uoms', label: 'UOM', defaults: DEFAULT_UOMS },
+};
+
+// 分类 -> 默认主分组 / 部门 / 打印分组。dev 预览与生产 seed 共用,避免两边种子不一致。
+export const CATEGORY_MASTER_MAP = {
+  KOPI: { mainGroup: 'BEV', department: 'BEVERAGE', printGroup: 'BAR' },
+  TEH: { mainGroup: 'BEV', department: 'BEVERAGE', printGroup: 'BAR' },
+  SUSU: { mainGroup: 'BEV', department: 'BEVERAGE', printGroup: 'BAR' },
+  MILO: { mainGroup: 'BEV', department: 'BEVERAGE', printGroup: 'BAR' },
+  NESCAFE: { mainGroup: 'BEV', department: 'BEVERAGE', printGroup: 'BAR' },
+  FRESH: { mainGroup: 'BEV', department: 'BEVERAGE', printGroup: 'BAR' },
+  'CAN DRINK': { mainGroup: 'BEV', department: 'COUNTER', printGroup: 'COUNTER' },
+  BEER: { mainGroup: 'BEV', department: 'COUNTER', printGroup: 'COUNTER' },
+  OTHER: { mainGroup: 'TOBACCO', department: 'RETAIL', printGroup: 'COUNTER' },
+};
+// 分类默认计量单位(商品可单独覆盖)
+export const CATEGORY_UOM_MAP = {
+  KOPI: 'CUP', TEH: 'CUP', SUSU: 'CUP', MILO: 'CUP', NESCAFE: 'CUP', FRESH: 'CUP',
+  'CAN DRINK': 'CAN', BEER: 'BOTTLE', OTHER: 'PCS',
+};
+
 // ---- Schema bootstrap ----
 export async function initSchema() {
   const stmts = [
@@ -194,6 +259,46 @@ export async function initSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (base_id), INDEX (category_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // ---- Smcin 主数据:商品大类 / 打印分组 / 部门 / 计量单位 ----
+    // 三者结构相同(编码 + 名称 + 排序 + 启停),共用一套 CRUD 与前端面板。
+    // 与 menu_categories.station 的区别:station 是 KDS 出单路由(Kitchen/Bar),
+    // department 是财务/报表归属(Beverage/Kitchen/Retail),两者语义不同,不复用。
+    `CREATE TABLE IF NOT EXISTS main_groups (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64) NOT NULL, name VARCHAR(255) NOT NULL, sort_order INT,
+      is_active TINYINT(1) DEFAULT 1, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS print_groups (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64) NOT NULL, name VARCHAR(255) NOT NULL, sort_order INT,
+      is_active TINYINT(1) DEFAULT 1, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS departments (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64) NOT NULL, name VARCHAR(255) NOT NULL, sort_order INT,
+      is_active TINYINT(1) DEFAULT 1, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // 计量单位:dimension 区分量纲(计数/重量/容量),factor = 1 个本单位等于多少个该量纲的基准单位。
+    // 每个量纲各有且只有一个 is_base=1 的单位(KG / L / PCS)。
+    `CREATE TABLE IF NOT EXISTS uoms (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(32) NOT NULL, name VARCHAR(255) NOT NULL,
+      dimension VARCHAR(16) DEFAULT 'count', factor DECIMAL(12,4) DEFAULT 1,
+      is_base TINYINT(1) DEFAULT 0, sort_order INT,
+      is_active TINYINT(1) DEFAULT 1, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS tables (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -740,6 +845,21 @@ export async function initSchema() {
     "ALTER TABLE orders ADD COLUMN points_redeemed INT DEFAULT 0",
     "ALTER TABLE orders ADD COLUMN points_earned INT DEFAULT 0",
     "ALTER TABLE orders ADD COLUMN tab_amount DECIMAL(12,2) DEFAULT 0",
+    // ---- Smcin 主数据接线 ----
+    // 分类上挂「默认主分组 / 默认部门」,商品没单独指定时按分类继承;
+    // 商品(变体)上是 SKU 级覆盖 —— 分组/部门/供应商/单位/包装。
+    "ALTER TABLE menu_categories ADD COLUMN main_group_id INT",
+    "ALTER TABLE menu_categories ADD COLUMN department_id INT",
+    "ALTER TABLE menu_categories ADD INDEX idx_cat_main_group (main_group_id)",
+    "ALTER TABLE menu_variants ADD COLUMN main_group_id INT",
+    "ALTER TABLE menu_variants ADD COLUMN print_group_id INT",
+    "ALTER TABLE menu_variants ADD COLUMN department_id INT",
+    "ALTER TABLE menu_variants ADD COLUMN supplier_id INT",
+    "ALTER TABLE menu_variants ADD COLUMN uom VARCHAR(32)",
+    "ALTER TABLE menu_variants ADD COLUMN pack_uom VARCHAR(32)",
+    "ALTER TABLE menu_variants ADD COLUMN pack_factor DECIMAL(12,4) DEFAULT 1",
+    "ALTER TABLE menu_variants ADD INDEX idx_var_main_group (main_group_id)",
+    "ALTER TABLE menu_variants ADD INDEX idx_var_department (department_id)",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -760,6 +880,33 @@ export async function initSchema() {
            VALUES (?,?,?,?,?,?,?,?,?,1)`,
           [p.org_id, p.store_id, code, name, disc, minSpend, minPoints, isDefault, sortOrder],
         );
+      }
+    }
+  } catch { /* 表不存在或权限不足，忽略 */ }
+
+  // ---- 默认 Smcin 主数据:同样只在「一类都没有」时补,管理员改过的不会被重启覆盖 ----
+  try {
+    const pairs = await query('SELECT o.id AS org_id, s.id AS store_id FROM organizations o JOIN stores s ON s.org_id = o.id');
+    for (const p of pairs) {
+      for (const [key, kind] of Object.entries(MASTER_KINDS)) {
+        const cnt = Number((await getRow(`SELECT COUNT(*) AS c FROM ${kind.table} WHERE org_id=? AND store_id=?`, [p.org_id, p.store_id]))?.c || 0);
+        if (cnt > 0) continue;
+        for (const row of kind.defaults) {
+          if (key === 'uoms') {
+            const [code, name, dimension, factor, isBase, sortOrder] = row;
+            await query(
+              `INSERT INTO uoms (org_id, store_id, code, name, dimension, factor, is_base, sort_order, is_active)
+               VALUES (?,?,?,?,?,?,?,?,1)`,
+              [p.org_id, p.store_id, code, name, dimension, factor, isBase, sortOrder],
+            );
+          } else {
+            const [code, name, sortOrder] = row;
+            await query(
+              `INSERT INTO ${kind.table} (org_id, store_id, code, name, sort_order, is_active) VALUES (?,?,?,?,?,1)`,
+              [p.org_id, p.store_id, code, name, sortOrder],
+            );
+          }
+        }
       }
     }
   } catch { /* 表不存在或权限不足，忽略 */ }
@@ -797,8 +944,29 @@ export const toMenuCategory = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id, name: r.name,
   color: r.color || null,
   station: r.station || 'Kitchen',
+  mainGroupId: r.main_group_id == null ? null : String(r.main_group_id),
+  departmentId: r.department_id == null ? null : String(r.department_id),
   sortOrder: r.sort_order, isActive: !!r.is_active,
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+
+// ---- Smcin 主数据映射 ----
+// Main Group / Print Group / Department 三者结构完全一致,共用同一个映射函数。
+const masterRow = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  code: r.code || null, name: r.name,
+  sortOrder: Number(r.sort_order || 0), isActive: !!r.is_active,
+  note: r.note || null,
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
+export const toMainGroup = masterRow;
+export const toPrintGroup = masterRow;
+export const toDepartment = masterRow;
+export const toUom = (r) => ({
+  ...masterRow(r),
+  dimension: r.dimension || 'count',
+  factor: Number(r.factor == null ? 1 : r.factor),
+  isBase: !!r.is_base,
 });
 export const toMenuBase = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
@@ -826,6 +994,14 @@ export const toVariant = (r) => ({
   price: Number(r.price || 0), cost: r.cost == null ? 0 : Number(r.cost),
   stockQty: Number(r.stock_qty || 0), stockThreshold: Number(r.stock_threshold || 0),
   barcode: r.barcode, sortOrder: r.sort_order, isActive: !!r.is_active,
+  // Smcin 产品主档:SKU 级的分组/部门/供应商与计量单位
+  mainGroupId: r.main_group_id == null ? null : String(r.main_group_id),
+  printGroupId: r.print_group_id == null ? null : String(r.print_group_id),
+  departmentId: r.department_id == null ? null : String(r.department_id),
+  supplierId: r.supplier_id == null ? null : String(r.supplier_id),
+  uom: r.uom || null,
+  packUom: r.pack_uom || null,
+  packFactor: Number(r.pack_factor == null ? 1 : r.pack_factor),
   createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
 });
 export const toTable = (r) => ({

@@ -4,11 +4,15 @@ import {
   toInventoryItem, toStockMovement, toGoodsReceipt, toGoodsReceiptLine,
   toStockTransfer, toStockTransferLine, toPurchaseOrderLine, toOrder,
   toMember, toMemberTier, toPointsLedger, toMemberTopup,
+  toMenuCategory, toMenuBase, toVariant, toMainGroup, toPrintGroup,
+  toDepartment, toUom, toSupplier,
 } from '../db.js';
 import { authenticate, tenant, requirePermission } from '../middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from '../reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from '../reportEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from '../exporters.js';
+// 产品主档拼装(含主分组/部门继承回落)与后台 /menu/products 共用同一份规则
+import { buildProducts } from '../productMaster.js';
 import {
   applyPoints, applyCredit, resolveTier, tierDiscountPercent,
   statementEvents, runStatement, sliceStatement,
@@ -753,7 +757,7 @@ async function buildReportDataset(orgId, storeId) {
     invoices, creditNotes, variants, categories, customerStock, stockTakes, suppliers, purchaseOrders,
     attendanceRows, reprintLogs, dayEnds, orderTransfers, vouchers, voucherTxns, rebates, settings,
     inventoryItems, stockMovements, purchaseOrderLines, goodsReceipts, goodsReceiptLines,
-    stockTransfers, stockTransferLines] = await Promise.all([
+    stockTransfers, stockTransferLines, mainGroups, printGroups, departments, uoms, menuBases] = await Promise.all([
     query('SELECT o.*, t.number AS table_no, u.name AS cashier_name, sp.name AS sales_person_name, m.member_no, m.name AS member_name FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by LEFT JOIN users sp ON sp.id=o.sales_person_id LEFT JOIN members m ON m.id=o.member_id WHERE o.org_id=? AND o.store_id=?', [orgId, storeId]),
     query('SELECT * FROM payments WHERE org_id=? AND store_id=?', [orgId, storeId]),
     query('SELECT * FROM refunds WHERE org_id=? AND store_id=?', [orgId, storeId]),
@@ -790,11 +794,33 @@ async function buildReportDataset(orgId, storeId) {
     safe('SELECT * FROM goods_receipt_lines WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM stock_transfers WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM stock_transfer_lines WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    // ---- Smcin 主数据(块⑨):报表分组口径 ----
+    safe('SELECT * FROM main_groups WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM print_groups WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM departments WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    safe('SELECT * FROM menu_bases WHERE org_id=? AND store_id=?', [orgId, storeId]),
   ]);
 
   const variantById = new Map(variants.map((v) => [String(v.id), v]));
+
+  // 产品主档:与后台 /menu/products 共用 buildProducts,报表分组口径与后台清单完全一致
+  // (主分组/部门在 SKU 未填时回落到所属分类的默认值)
+  const products = buildProducts({
+    variants: variants.map(toVariant),
+    categories: categories.map(toMenuCategory),
+    bases: menuBases.map(toMenuBase),
+    mainGroups: mainGroups.map(toMainGroup),
+    printGroups: printGroups.map(toPrintGroup),
+    departments: departments.map(toDepartment),
+    suppliers: suppliers.map(toSupplier),
+    uoms: uoms.map(toUom),
+  });
+  const productById = new Map(products.map((p) => [String(p.id), p]));
+
   const decorate = (it) => {
     const v = variantById.get(String(it.variantId || it.itemId));
+    const p = productById.get(String(it.variantId || it.itemId));
     const qty = Number(it.qty || 0);
     const unitPrice = Number(it.unitPrice || 0);
     return {
@@ -804,10 +830,17 @@ async function buildReportDataset(orgId, storeId) {
       amount: qty * unitPrice,
       category: (v && v.category_name) || 'Uncategorised',
       station: (v && v.station) || 'Kitchen',
+      // Smcin 主数据口径
+      mainGroup: p ? (p.mainGroupName || 'Unassigned') : 'Unassigned',
+      printGroup: p ? (p.printGroupName || 'No Print') : 'No Print',
+      department: p ? (p.departmentName || 'Unassigned') : 'Unassigned',
+      supplier: p ? (p.supplierName || '') : '',
     };
   };
 
   return {
+    // 产品主档(供 Product Listing 报表使用),与后台 /menu/products 同源
+    products,
     orders: orders.map((o) => ({
       id: o.id, orderNo: o.order_no, createdAt: dt(o.created_at), status: o.status, type: o.type,
       tableNo: o.table_no, cashierName: o.cashier_name || 'Unknown', salesPersonName: o.sales_person_name || o.cashier_name || 'Unknown',

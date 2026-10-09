@@ -325,3 +325,33 @@ body { margin: 0; background: #f4f6fb; }
 .account-msg.error { color: #c84e3d; background: #fdecea; }
 .modern-action-empty { grid-column: 1 / -1; padding: 22px; border: 1px dashed #d9e0ea; border-radius: 14px; color: #8b97a8; background: #fbfcfe; font-size: 12px; text-align: center; }
 .cashier-void-locked { display: block; padding: 6px 9px; border-radius: 7px; color: #b45309; background: #fdf7ec; font-size: 10px; font-weight: 700; }
+
+/* ---------------------------------------------------------------------------
+   菜单与产品主数据(Menu & Product Master)
+   --------------------------------------------------------------------------- */
+.menu-check { display: flex; align-items: center; }
+.menu-check input { width: 14px; height: 14px; margin: 0; cursor: pointer; }
+.menu-swatch { display: inline-block; width: 12px; height: 12px; margin-right: 5px; border: 1px solid #e1e6ef; border-radius: 3px; vertical-align: -1px; }
+.menu-missing { color: #b9c1cd; font-style: normal; }
+.menu-default { padding: 2px 7px; border-radius: 6px; color: #237b5c; background: #e9f8f2; font-size: 10px; font-weight: 750; }
+.menu-hint { margin: 12px 0 0; color: #9aa4b5; font-size: 11px; }
+.menu-subhead { margin: 18px 0 10px; padding-top: 14px; border-top: 1px dashed #e7ebf2; color: #25324a; font-size: 13px; }
+.menu-bulk { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; padding: 12px 14px; margin-bottom: 14px; border: 1px solid #ffd9d0; border-radius: 12px; background: #fff7f4; }
+.menu-bulk > b { align-self: center; color: #c2513a; font-size: 12px; }
+.menu-bulk .ops-action { min-height: 32px; }
+/* 产品清单列多,列宽按 1180 内容宽反推,保证 Edit/Delete 不被挤出可视区 */
+.menu-product-table .ops-row { grid-template-columns: 26px 88px minmax(130px, 1.4fr) 106px 98px 106px minmax(84px, 1fr) 72px 62px 46px 54px 104px; min-width: 1086px; }
+.menu-cat-table .ops-row { grid-template-columns: minmax(130px, 1.2fr) 150px 140px 140px 100px 60px 76px 130px; }
+.menu-base-table .ops-row { grid-template-columns: minmax(150px, 1.4fr) 150px 110px 70px 80px 130px; }
+.menu-mod-table .ops-row { grid-template-columns: 90px minmax(150px, 1.4fr) 120px 110px 70px 80px 130px; }
+.menu-link-table .ops-row { grid-template-columns: minmax(160px, 1.3fr) minmax(170px, 1.4fr) 140px 110px; }
+.menu-master-table .ops-row { grid-template-columns: 110px minmax(150px, 1.3fr) 60px 150px 80px minmax(140px, 1.2fr) 190px; }
+.menu-uom-table .ops-row { grid-template-columns: 90px minmax(150px, 1.3fr) 140px 110px 80px 60px 80px 130px; }
+.menu-product-table .ops-row span, .menu-cat-table .ops-row span, .menu-base-table .ops-row span,
+.menu-mod-table .ops-row span, .menu-link-table .ops-row span, .menu-master-table .ops-row span,
+.menu-uom-table .ops-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-product-table .ops-row .ops-inline-actions, .menu-cat-table .ops-row .ops-inline-actions,
+.menu-base-table .ops-row .ops-inline-actions, .menu-mod-table .ops-row .ops-inline-actions,
+.menu-link-table .ops-row .ops-inline-actions, .menu-master-table .ops-row .ops-inline-actions,
+.menu-uom-table .ops-row .ops-inline-actions { overflow: visible; }
+.menu-product-table .ops-row .menu-check, .menu-product-table .ops-row .member-sub { overflow: visible; }

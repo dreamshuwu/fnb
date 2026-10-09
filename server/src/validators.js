@@ -11,6 +11,9 @@ export const categorySchema = z.object({
   color: z.string().optional(),
   sortOrder: z.number().optional(),
   isActive: z.boolean().optional(),
+  // Smcin 主数据接线:分类可挂默认主分组/部门,商品没单独指定时继承
+  mainGroupId: z.string().optional(),
+  departmentId: z.string().optional(),
 });
 
 // 基底（第一步点的东西）
@@ -52,7 +55,43 @@ export const variantSchema = z.object({
   barcode: z.string().optional(),
   sortOrder: z.number().optional(),
   isActive: z.boolean().optional(),
+  // Smcin 产品主档:SKU 级分组/部门/供应商与计量单位
+  mainGroupId: z.string().optional(),
+  printGroupId: z.string().optional(),
+  departmentId: z.string().optional(),
+  supplierId: z.string().optional(),
+  uom: z.string().optional(),
+  packUom: z.string().optional(),
+  packFactor: z.number().positive().optional(),
 });
+// PUT 走部分更新(与本项目其它 update schema 一致),否则改一个字段也得把整份商品传回来
+export const variantUpdateSchema = variantSchema.partial();
+
+// ---- Smcin 主数据:商品大类 / 打印分组 / 部门 ----
+// 三者字段完全一致,共用同一份 shape;CRUD 也共用同一套路由工厂。
+const masterFields = {
+  code: z.string().optional(),          // 留空则由名称派生
+  name: z.string().min(1),
+  sortOrder: z.number().optional(),
+  isActive: z.boolean().optional(),
+  note: z.string().optional(),
+};
+export const mainGroupSchema = z.object(masterFields);
+export const mainGroupUpdateSchema = mainGroupSchema.partial();
+export const printGroupSchema = mainGroupSchema;
+export const printGroupUpdateSchema = mainGroupUpdateSchema;
+export const departmentSchema = mainGroupSchema;
+export const departmentUpdateSchema = mainGroupUpdateSchema;
+
+// 计量单位:dimension 区分量纲,factor = 1 个本单位等于多少个该量纲的基准单位
+export const UOM_DIMENSIONS = ['count', 'weight', 'volume'];
+export const uomSchema = z.object({
+  ...masterFields,
+  dimension: z.enum(UOM_DIMENSIONS).optional(),
+  factor: z.number().positive().optional(),
+  isBase: z.boolean().optional(),
+});
+export const uomUpdateSchema = uomSchema.partial();
 
 export const tableSchema = z.object({
   number: z.string().min(1),

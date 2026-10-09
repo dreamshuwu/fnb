@@ -55,6 +55,7 @@ function groupSum(list, keyFn, numFields) {
 /** 报表主金额列(用于顶部 KPI 合计)。 */
 const TOTAL_COLUMN = {
   sales_by_date: 'net', sales_by_product: 'amount', sales_by_category: 'amount', sales_by_department: 'amount',
+  sales_by_main_group: 'amount', sales_by_print_group: 'amount',
   sales_by_payment: 'amount', sales_by_hour: 'total', sales_by_cashier: 'total', sales_by_salesperson: 'total',
   sales_by_table: 'total', sales_by_member: 'total', sales_by_discount: 'discount', top_products: 'amount',
   bottom_products: 'amount', avg_spend: 'net', sales_trend_7day: 'total', monthly_sales: 'total',
@@ -120,11 +121,46 @@ function computeRows(type, ds, inRange, range) {
         .map((g) => ({ category: g._key, qty: g.qty, amount: round2(g.amount) }))
         .sort((a, b) => b.amount - a.amount);
     }
+    // 部门取「部门主数据」口径(商品上没填则回落到所属分类的默认部门),
+    // 与 KDS 出单路由(station)是两件事,不要混用。
     case 'sales_by_department': {
       const its = itemsOf(paid);
-      return groupSum(its, (i) => i.station || i.category || 'Kitchen', ['qty', 'amount'])
+      return groupSum(its, (i) => i.department || 'Unassigned', ['qty', 'amount'])
         .map((g) => ({ department: g._key, qty: g.qty, amount: round2(g.amount) }))
         .sort((a, b) => b.amount - a.amount);
+    }
+    case 'sales_by_main_group': {
+      const its = itemsOf(paid);
+      return groupSum(its, (i) => i.mainGroup || 'Unassigned', ['qty', 'amount'])
+        .map((g) => ({ mainGroup: g._key, qty: g.qty, amount: round2(g.amount) }))
+        .sort((a, b) => b.amount - a.amount);
+    }
+    case 'sales_by_print_group': {
+      const its = itemsOf(paid);
+      return groupSum(its, (i) => i.printGroup || 'No Print', ['qty', 'amount'])
+        .map((g) => ({ printGroup: g._key, qty: g.qty, amount: round2(g.amount) }))
+        .sort((a, b) => b.amount - a.amount);
+    }
+    // 产品主数据清单:不按订单汇总,直接列出商品主档(与后台 /menu/products 同口径)。
+    // 启用与停用都列出,由 Status 列区分 —— 主数据清单的价值就在于看清全貌。
+    case 'product_listing': {
+      const list = ds.products || [];
+      return list
+        .map((p) => ({
+          code: p.code, name: p.name,
+          category: p.categoryName || 'Uncategorised',
+          mainGroup: p.mainGroupName || 'Unassigned',
+          printGroup: p.printGroupName || 'No Print',
+          department: p.departmentName || 'Unassigned',
+          supplier: p.supplierName || '',
+          uom: p.uomName || p.uom || '',
+          packUom: p.packUomName || p.packUom || '',
+          packFactor: Number(p.packFactor || 1),
+          price: round2(p.price), cost: round2(p.cost),
+          stockQty: Number(p.stockQty || 0),
+          active: p.isActive ? 'Active' : 'Inactive',
+        }))
+        .sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
     }
     case 'sales_by_payment': {
       const pays = (ds.payments || []).filter((p) => inRange(p.createdAt));

@@ -1,5 +1,10 @@
 import bcrypt from 'bcryptjs';
-import { pool, query, insert, stringifyJSON, DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS } from './db.js';
+import {
+  pool, query, insert, stringifyJSON,
+  DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS,
+  DEFAULT_MAIN_GROUPS, DEFAULT_PRINT_GROUPS, DEFAULT_DEPARTMENTS, DEFAULT_UOMS,
+  CATEGORY_MASTER_MAP, CATEGORY_UOM_MAP,
+} from './db.js';
 import { ROLES, defaultPermissions } from './permissions.js';
 
 const DEMO_USERS = [
@@ -118,11 +123,38 @@ export async function seedIfEmpty() {
       0, 0, 0, 120, 0, 120]
   );
 
+  // ---- Smcin 主数据:商品大类 / 打印分组 / 部门 / 计量单位 ----
+  // 前三张表都是「编码 + 名称 + 排序」,id 存进 map 供分类与商品引用。
+  const insertMaster = async (table, rows) => {
+    const ids = {};
+    for (const [code, name, sort] of rows) {
+      ids[code] = await insert(
+        `INSERT INTO ${table} (org_id, store_id, code, name, sort_order) VALUES (?,?,?,?,?)`,
+        [orgId, storeId, code, name, sort]
+      );
+    }
+    return ids;
+  };
+  const mainGroupIds = await insertMaster('main_groups', DEFAULT_MAIN_GROUPS);
+  const printGroupIds = await insertMaster('print_groups', DEFAULT_PRINT_GROUPS);
+  const deptIds = await insertMaster('departments', DEFAULT_DEPARTMENTS);
+  const uomIds = {};
+  for (const [code, name, dimension, factor, isBase, sort] of DEFAULT_UOMS) {
+    uomIds[code] = await insert(
+      'INSERT INTO uoms (org_id, store_id, code, name, dimension, factor, is_base, sort_order) VALUES (?,?,?,?,?,?,?,?)',
+      [orgId, storeId, code, name, dimension, factor, isBase, sort]
+    );
+  }
+
   const catIds = {};
   for (const [name, color, sort] of CATS) {
+    const map = CATEGORY_MASTER_MAP[name] || {};
     const id = await insert(
-      'INSERT INTO menu_categories (org_id, store_id, name, color, sort_order) VALUES (?,?,?,?,?)',
-      [orgId, storeId, name, color, sort]
+      `INSERT INTO menu_categories (org_id, store_id, name, color, sort_order, main_group_id, department_id)
+       VALUES (?,?,?,?,?,?,?)`,
+      [orgId, storeId, name, color, sort,
+        map.mainGroup ? mainGroupIds[map.mainGroup] ?? null : null,
+        map.department ? deptIds[map.department] ?? null : null]
     );
     catIds[name] = id;
   }
@@ -162,16 +194,22 @@ export async function seedIfEmpty() {
     }
   }
 
-  // 变体
+  // 变体(产品主档 SKU):分组/部门/打印组/单位按分类继承,分类没配就留空
   let vsort = 1;
   const addVariant = async (bname, baseId, cat, code, name, price) => {
+    const map = CATEGORY_MASTER_MAP[cat] || {};
     await insert(
       `INSERT INTO menu_variants
-        (org_id, store_id, base_id, category_id, code, name, modifier_ids, price, cost, stock_qty, stock_threshold, sort_order)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        (org_id, store_id, base_id, category_id, code, name, modifier_ids, price, cost, stock_qty, stock_threshold, sort_order,
+         main_group_id, print_group_id, department_id, uom)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         orgId, storeId, baseId, catIds[cat], code, name, stringifyJSON([]),
         price, +(price * 0.4).toFixed(2), 50, 10, vsort++,
+        map.mainGroup ? mainGroupIds[map.mainGroup] ?? null : null,
+        map.printGroup ? printGroupIds[map.printGroup] ?? null : null,
+        map.department ? deptIds[map.department] ?? null : null,
+        CATEGORY_UOM_MAP[cat] || null,
       ]
     );
   };
@@ -249,7 +287,7 @@ export async function seedIfEmpty() {
     );
   }
 
-  console.log('[seed] org/store + 5 users + kopitiam menu (categories/bases/modifiers/variants) + tables + 3 suppliers + 10 inventory items + opening ledger + 4 member tiers + 1 demo member created');
+  console.log('[seed] org/store + 5 users + kopitiam menu (categories/bases/modifiers/variants) + tables + 3 suppliers + 10 inventory items + opening ledger + 4 member tiers + 1 demo member + Smcin master data (main groups/print groups/departments/uoms) created');
 }
 
 // 单独运行:node src/seed.js
