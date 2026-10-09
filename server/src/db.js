@@ -51,6 +51,25 @@ const r2 = (v) => Math.round(Number(v || 0) * 100) / 100;
 const r3 = (v) => Math.round(Number(v || 0) * 1000) / 1000;
 const r4 = (v) => Math.round(Number(v || 0) * 10000) / 10000;
 
+// ---- 默认会员等级（kopitiam 演示用；生产/预览共用同一份，避免两边漂移） ----
+// [code, name, discountPercent, minSpend, minPoints, isDefault, sortOrder]
+export const DEFAULT_MEMBER_TIERS = [
+  ['MEMBER', '普通会员 Member', 0, 0, 0, 1, 1],
+  ['SILVER', '银卡 Silver', 3, 500, 0, 0, 2],
+  ['GOLD', '金卡 Gold', 5, 2000, 0, 0, 3],
+  ['PLATINUM', '白金卡 Platinum', 8, 5000, 0, 0, 4],
+];
+
+// ---- 默认会员相关设置项（pointsPerAmount = 每消费 1 元得几分） ----
+export const DEFAULT_MEMBER_SETTINGS = {
+  pointsPerAmount: 1,
+  pointsRedeemValue: 0.01,
+  pointsMinRedeem: 100,
+  pointsExpiryDays: 0,
+  autoTierUpgrade: true,
+  creditLimitDefault: 0,
+};
+
 // ---- Schema bootstrap ----
 export async function initSchema() {
   const stmts = [
@@ -308,20 +327,48 @@ export async function initSchema() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       org_id INT NOT NULL, store_id INT NOT NULL,
       member_no VARCHAR(64), name VARCHAR(255) NOT NULL, phone VARCHAR(64),
-      credit_balance DECIMAL(12,2) DEFAULT 0, points INT DEFAULT 0,
-      status VARCHAR(32) DEFAULT 'active', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX (org_id, store_id), INDEX (member_no), INDEX (phone)
+      email VARCHAR(255), address VARCHAR(255), tax_no VARCHAR(64), birthday DATE,
+      gender VARCHAR(16), agent VARCHAR(255), term VARCHAR(64), do_no VARCHAR(64),
+      tier_id INT, credit_limit DECIMAL(12,2) DEFAULT 0,
+      credit_balance DECIMAL(12,2) DEFAULT 0, rebate_balance DECIMAL(12,2) DEFAULT 0,
+      points INT DEFAULT 0,
+      total_spend DECIMAL(14,2) DEFAULT 0,
+      points_earned_total INT DEFAULT 0, points_redeemed_total INT DEFAULT 0,
+      joined_at TIMESTAMP NULL, note TEXT,
+      status VARCHAR(32) DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (member_no), INDEX (phone), INDEX (tier_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE IF NOT EXISTS member_tiers (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64), name VARCHAR(255) NOT NULL,
+      discount_percent DECIMAL(6,2) DEFAULT 0,
+      min_spend DECIMAL(12,2) DEFAULT 0, min_points INT DEFAULT 0,
+      is_default TINYINT(1) DEFAULT 0, sort_order INT DEFAULT 0, is_active TINYINT(1) DEFAULT 1,
+      note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS member_topups (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
-      member_id INT NOT NULL, receipt_no VARCHAR(64), amount DECIMAL(12,2) NOT NULL,
-      created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX (org_id, store_id), INDEX (member_id)
+      member_id INT NOT NULL, receipt_no VARCHAR(64),
+      type VARCHAR(24) DEFAULT 'topup', amount DECIMAL(12,2) NOT NULL,
+      method VARCHAR(32) DEFAULT 'cash', balance_after DECIMAL(12,2) DEFAULT 0,
+      note VARCHAR(255), created_by INT, created_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (member_id), INDEX (type)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS points_ledger (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
-      member_id INT NOT NULL, delta INT NOT NULL, reason VARCHAR(255), created_by INT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (member_id)
+      member_id INT NOT NULL, delta INT NOT NULL,
+      type VARCHAR(32) DEFAULT 'adjust', reason VARCHAR(255),
+      ref_type VARCHAR(32), ref_id INT, ref_no VARCHAR(64),
+      balance_after INT DEFAULT 0,
+      created_by INT, created_by_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (member_id), INDEX (org_id, store_id), INDEX (type)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS cash_movements (
       id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
@@ -650,10 +697,72 @@ export async function initSchema() {
     "ALTER TABLE stock_transfer_lines ADD COLUMN before_qty DECIMAL(12,3) DEFAULT 0",
     "ALTER TABLE stock_transfer_lines ADD COLUMN after_qty DECIMAL(12,3) DEFAULT 0",
     "ALTER TABLE stock_transfer_lines ADD COLUMN avg_cost_after DECIMAL(12,4) DEFAULT 0",
+    // ---- 会员体系补全 ----
+    // 主档:等级 / 赊账额度 / 联系与税务资料 / 累计消费与积分统计
+    "ALTER TABLE members ADD COLUMN email VARCHAR(255)",
+    "ALTER TABLE members ADD COLUMN address VARCHAR(255)",
+    "ALTER TABLE members ADD COLUMN tax_no VARCHAR(64)",
+    "ALTER TABLE members ADD COLUMN birthday DATE",
+    "ALTER TABLE members ADD COLUMN gender VARCHAR(16)",
+    "ALTER TABLE members ADD COLUMN agent VARCHAR(255)",
+    "ALTER TABLE members ADD COLUMN term VARCHAR(64)",
+    "ALTER TABLE members ADD COLUMN do_no VARCHAR(64)",
+    "ALTER TABLE members ADD COLUMN tier_id INT",
+    "ALTER TABLE members ADD COLUMN credit_limit DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN total_spend DECIMAL(14,2) DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN points_earned_total INT DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN points_redeemed_total INT DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN joined_at TIMESTAMP NULL",
+    "ALTER TABLE members ADD COLUMN note TEXT",
+    "ALTER TABLE members ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "ALTER TABLE members ADD INDEX idx_member_tier (tier_id)",
+    // 充值单:支付方式 / 充值后余额 / 经手人
+    // 注意:这张表同时承载「储值流水」—— topup 为正、knockoff 为负,
+    // balance_after 是变动后的储值余额,所以它天然就是会员储值对账单的数据源。
+    "ALTER TABLE member_topups ADD COLUMN type VARCHAR(24) DEFAULT 'topup'",
+    "ALTER TABLE member_topups ADD COLUMN method VARCHAR(32) DEFAULT 'cash'",
+    "ALTER TABLE member_topups ADD COLUMN balance_after DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE member_topups ADD COLUMN note VARCHAR(255)",
+    "ALTER TABLE member_topups ADD COLUMN created_by_name VARCHAR(255)",
+    "ALTER TABLE member_topups ADD INDEX idx_topup_type (type)",
+    // 积分台账:业务类型 / 来源单据 / 变动后余额 —— 与 rebates 表结构对齐
+    "ALTER TABLE points_ledger ADD COLUMN type VARCHAR(32) DEFAULT 'adjust'",
+    "ALTER TABLE points_ledger ADD COLUMN ref_type VARCHAR(32)",
+    "ALTER TABLE points_ledger ADD COLUMN ref_id INT",
+    "ALTER TABLE points_ledger ADD COLUMN ref_no VARCHAR(64)",
+    "ALTER TABLE points_ledger ADD COLUMN balance_after INT DEFAULT 0",
+    "ALTER TABLE points_ledger ADD COLUMN created_by_name VARCHAR(255)",
+    "ALTER TABLE points_ledger ADD INDEX idx_points_org (org_id, store_id)",
+    "ALTER TABLE points_ledger ADD INDEX idx_points_type (type)",
+    // 结账时的会员抵扣/累积明细(报表与收据都要按项列示,不能只留一个总额)
+    "ALTER TABLE orders ADD COLUMN tier_discount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN points_discount DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN points_redeemed INT DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN points_earned INT DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN tab_amount DECIMAL(12,2) DEFAULT 0",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
   }
+
+  // ---- 默认会员等级:已有库若一个等级都没有,补一套默认等级 ----
+  // 与 role_permissions 的「无覆盖行才套默认值」保持同一策略:
+  // 只在完全没有等级时才补,管理员删改过的等级不会被重启覆盖。
+  try {
+    const pairs = await query('SELECT o.id AS org_id, s.id AS store_id FROM organizations o JOIN stores s ON s.org_id = o.id');
+    for (const p of pairs) {
+      const cnt = Number((await getRow('SELECT COUNT(*) AS c FROM member_tiers WHERE org_id=? AND store_id=?', [p.org_id, p.store_id]))?.c || 0);
+      if (cnt > 0) continue;
+      for (const [code, name, disc, minSpend, minPoints, isDefault, sortOrder] of DEFAULT_MEMBER_TIERS) {
+        await query(
+          `INSERT INTO member_tiers
+             (org_id, store_id, code, name, discount_percent, min_spend, min_points, is_default, sort_order, is_active)
+           VALUES (?,?,?,?,?,?,?,?,?,1)`,
+          [p.org_id, p.store_id, code, name, disc, minSpend, minPoints, isDefault, sortOrder],
+        );
+      }
+    }
+  } catch { /* 表不存在或权限不足，忽略 */ }
 }
 
 // ---- Mappers: DB row -> API object (camelCase + _id string) ----
@@ -746,6 +855,10 @@ export const toOrder = (r) => ({
   discountType: r.discount_type || null,
   mergedIntoOrderId: r.merged_into_order_id == null ? null : String(r.merged_into_order_id),
   voucherDiscount: Number(r.voucher_discount || 0), rebateRedeemed: Number(r.rebate_redeemed || 0),
+  // 会员结账明细:等级折扣 / 积分抵扣与累积 / 挂账金额
+  tierDiscount: Number(r.tier_discount || 0), pointsDiscount: Number(r.points_discount || 0),
+  pointsRedeemed: Number(r.points_redeemed || 0), pointsEarned: Number(r.points_earned || 0),
+  tabAmount: Number(r.tab_amount || 0),
   voidRequestedBy: r.void_requested_by == null ? null : String(r.void_requested_by),
   voidApprovedBy: r.void_approved_by == null ? null : String(r.void_approved_by),
   voidReason: r.void_reason,
@@ -928,6 +1041,65 @@ export const toRebate = (r) => ({
   reason: r.reason || null, expiresAt: dt(r.expires_at),
   createdBy: r.created_by == null ? null : String(r.created_by),
   createdByName: r.created_by_name || null, createdAt: dt(r.created_at),
+});
+
+// ---- 会员体系 ----
+export const toMemberTier = (r) => {
+  if (!r) return null;
+  return {
+    _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+    code: r.code || null, name: r.name,
+    discountPercent: Number(r.discount_percent || 0),
+    minSpend: r2(r.min_spend), minPoints: Number(r.min_points || 0),
+    isDefault: !!r.is_default, sortOrder: Number(r.sort_order || 0),
+    isActive: r.is_active == null ? true : !!r.is_active,
+    note: r.note || null,
+    createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+  };
+};
+export const toMember = (r) => {
+  if (!r) return null;
+  return {
+    _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+    memberNo: r.member_no || null, name: r.name, phone: r.phone || null,
+    email: r.email || null, address: r.address || null, taxNo: r.tax_no || null,
+    birthday: dtDate(r.birthday), gender: r.gender || null,
+    agent: r.agent || null, term: r.term || null, doNo: r.do_no || null,
+    tierId: r.tier_id == null ? null : String(r.tier_id),
+    creditLimit: r2(r.credit_limit), creditBalance: r2(r.credit_balance),
+    // owed = 当前欠款(余额为负时的绝对值),给前台/报表直接展示用
+    owed: r2(Math.max(0, -Number(r.credit_balance || 0))),
+    rebateBalance: r2(r.rebate_balance), points: Number(r.points || 0),
+    totalSpend: r2(r.total_spend),
+    pointsEarnedTotal: Number(r.points_earned_total || 0),
+    pointsRedeemedTotal: Number(r.points_redeemed_total || 0),
+    joinedAt: dt(r.joined_at), note: r.note || null,
+    status: r.status || 'active',
+    createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+  };
+};
+export const toPointsLedger = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  memberId: String(r.member_id),
+  delta: Number(r.delta || 0), type: r.type || 'adjust',
+  reason: r.reason || null,
+  refType: r.ref_type || null,
+  refId: r.ref_id == null ? null : String(r.ref_id),
+  refNo: r.ref_no || null,
+  balanceAfter: Number(r.balance_after || 0),
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at),
+});
+export const toMemberTopup = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  memberId: String(r.member_id), receiptNo: r.receipt_no || null,
+  type: r.type || 'topup',
+  amount: r2(r.amount), method: r.method || 'cash',
+  balanceAfter: r2(r.balance_after), note: r.note || null,
+  createdBy: r.created_by == null ? null : String(r.created_by),
+  createdByName: r.created_by_name || null,
+  createdAt: dt(r.created_at),
 });
 
 // ---- User lookups (used by auth + sockets) ----

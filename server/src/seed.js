@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { pool, query, insert, stringifyJSON } from './db.js';
+import { pool, query, insert, stringifyJSON, DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS } from './db.js';
 import { ROLES, defaultPermissions } from './permissions.js';
 
 const DEMO_USERS = [
@@ -92,6 +92,31 @@ export async function seedIfEmpty() {
       [orgId, storeId, role, stringifyJSON(defaultPermissions(role))]
     );
   }
+
+  // ---- 会员等级 + 会员设置 + 一个演示会员(新库开箱可用,不必手工建等级) ----
+  const tierIds = {};
+  for (const [code, name, disc, minSpend, minPoints, isDefault, sortOrder] of DEFAULT_MEMBER_TIERS) {
+    tierIds[code] = await insert(
+      `INSERT INTO member_tiers
+         (org_id, store_id, code, name, discount_percent, min_spend, min_points, is_default, sort_order, is_active)
+       VALUES (?,?,?,?,?,?,?,?,?,1)`,
+      [orgId, storeId, code, name, disc, minSpend, minPoints, isDefault, sortOrder]
+    );
+  }
+  for (const [key, value] of Object.entries(DEFAULT_MEMBER_SETTINGS)) {
+    await insert(
+      'INSERT INTO app_settings (org_id, store_id, setting_key, setting_value) VALUES (?,?,?,?)',
+      [orgId, storeId, key, JSON.stringify(value)]
+    );
+  }
+  await insert(
+    `INSERT INTO members
+       (org_id, store_id, member_no, name, phone, email, tier_id, credit_limit,
+        credit_balance, rebate_balance, points, total_spend, points_earned_total, joined_at, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),'active')`,
+    [orgId, storeId, 'M0001', 'Demo Member', '0123456789', 'demo@member.com', tierIds.MEMBER,
+      0, 0, 0, 120, 0, 120]
+  );
 
   const catIds = {};
   for (const [name, color, sort] of CATS) {
@@ -224,7 +249,7 @@ export async function seedIfEmpty() {
     );
   }
 
-  console.log('[seed] org/store + 5 users + kopitiam menu (categories/bases/modifiers/variants) + tables + 3 suppliers + 10 inventory items + opening ledger created');
+  console.log('[seed] org/store + 5 users + kopitiam menu (categories/bases/modifiers/variants) + tables + 3 suppliers + 10 inventory items + opening ledger + 4 member tiers + 1 demo member created');
 }
 
 // 单独运行:node src/seed.js

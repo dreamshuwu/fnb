@@ -41,6 +41,8 @@ export default function CashierPage() {
   const [payVouchers, setPayVouchers] = useState([]);   // [{ code, amount, voucherNo, maxRedeemable }]
   const [payRebate, setPayRebate] = useState('');       // 结账时抵扣的返利金额
   const [payMember, setPayMember] = useState(null);     // 正在结账的订单所属会员
+  const [payPoints, setPayPoints] = useState('');       // 结账时抵扣的积分(整数分)
+  const [appSettings, setAppSettings] = useState({});   // 积分汇率/最小抵扣等会员设置
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
@@ -68,6 +70,8 @@ export default function CashierPage() {
     loadSalesPersons();
     loadMembers();
     loadTransfers();
+    // 积分抵扣需要知道 1 分抵多少元 / 最小抵扣分数,统一从 /settings 取。
+    api.get('/settings').then((r) => setAppSettings(r.data || {})).catch(() => {});
     const socketUrl = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || undefined;
     const socket = io(socketUrl, { auth: { token: localStorage.getItem('token') } });
     const receiveOrder = (order) => setActive((prev) => [order, ...prev.filter((o) => o._id !== order._id)]);
@@ -179,15 +183,20 @@ export default function CashierPage() {
     setPaymentRows([{ method: 'cash', amount: String(Number(order.total).toFixed(2)) }]);
     setPayVouchers([]);
     setPayRebate('');
-    // 返利只能用于会员单:结账时把订单所属会员查出来,顺便刷新返利余额。
+    setPayPoints('');
+    // 返利/积分只能用于会员单:结账时把订单所属会员查出来,再拉一次最新余额(列表可能是旧的)。
     const m = order.memberId ? members.find((x) => String(x.id) === String(order.memberId)) : null;
     setPayMember(m || null);
+    if (order.memberId) api.get(`/members/${order.memberId}`).then((r) => setPayMember(r.data)).catch(() => {});
   };
   const confirmPayment = (rows) => {
     if (!paymentOrder) return;
     const cleanRows = rows.filter((row) => Number(row.amount) > 0).map((row) => ({ ...row, amount: Number(row.amount) }));
     const tendered = cleanRows.reduce((sum, row) => sum + row.amount, 0);
-    const deduction = payVouchers.reduce((s, v) => s + Number(v.amount || 0), 0) + Number(payRebate || 0);
+    const pointsRedeem = Math.max(0, Math.trunc(Number(payPoints || 0)));
+    const pointsValue = Number((pointsRedeem * Number(appSettings.pointsRedeemValue || 0.01)).toFixed(2));
+    const rawDeduction = payVouchers.reduce((s, v) => s + Number(v.amount || 0), 0) + Number(payRebate || 0) + pointsValue;
+    const deduction = Math.min(Number(paymentOrder.total), Number(rawDeduction.toFixed(2)));
     const due = Math.max(0, Number((Number(paymentOrder.total) - deduction).toFixed(2)));
     if (!Number.isFinite(tendered) || tendered < due) { alert(`付款总额不足，抵扣后应付 ¥${due.toFixed(2)}`); return; }
     // Payment 这里只确认金额；真正 checkout/扣库存/释放桌位在 Settlement 完成时执行。
@@ -195,6 +204,7 @@ export default function CashierPage() {
     setSettlement({
       order: paymentOrder, rows: cleanRows, tendered, due,
       vouchers: payVouchers, rebateAmount: Number(payRebate || 0),
+      pointsRedeem, pointsValue,
       deduction, change: Number((tendered - due).toFixed(2)),
     });
   };
@@ -204,11 +214,13 @@ export default function CashierPage() {
       payments: settlement.rows, tip: 0,
       vouchers: settlement.vouchers.map((v) => ({ code: v.code, amount: Number(v.amount) })),
       rebateAmount: settlement.rebateAmount || 0,
+      pointsRedeem: Number(settlement.pointsRedeem || 0),
     });
     setReceipt(result.data.receipt);
     setSettlement(null);
     setPayVouchers([]);
     setPayRebate('');
+    setPayPoints('');
     setPayMember(null);
     loadActive();
     loadTables();
@@ -423,7 +435,7 @@ export default function CashierPage() {
         </div>
       )}
 
-      {paymentOrder && <PaymentModal order={paymentOrder} rows={paymentRows} setRows={setPaymentRows} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} vouchers={payVouchers} setVouchers={setPayVouchers} rebate={payRebate} setRebate={setPayRebate} member={payMember} />}
+      {paymentOrder && <PaymentModal order={paymentOrder} rows={paymentRows} setRows={setPaymentRows} onConfirm={confirmPayment} onClose={() => setPaymentOrder(null)} vouchers={payVouchers} setVouchers={setPayVouchers} rebate={payRebate} setRebate={setPayRebate} member={payMember} points={payPoints} setPoints={setPayPoints} pointsCfg={appSettings} />}
       {settlement && <SettlementModal settlement={settlement} onComplete={completeSettlement} onClose={() => setSettlement(null)} />}
       {memberPicker && <MemberPickerModal members={members} current={memberPicker === 'page' ? activePage.memberId : memberPicker.memberId} onPick={memberPicker === 'page' ? setMember : bindMemberToOrder} onClose={() => setMemberPicker(null)} />}
       {receipt && <ReceiptModal receipt={receipt} onClose={() => setReceipt(null)} />}
@@ -501,7 +513,7 @@ function RecallModal({ holds, onPick, onClose }) {
   </section></div>;
 }
 
-function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setVouchers, rebate, setRebate, member }) {
+function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setVouchers, rebate, setRebate, member, points, setPoints, pointsCfg }) {
   const [code, setCode] = useState('');
   const [amount, setAmount] = useState('');
   const [busy, setBusy] = useState(false);
@@ -510,7 +522,10 @@ function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setV
   const tendered = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
   const voucherTotal = vouchers.reduce((s, v) => s + Number(v.amount || 0), 0);
   const rebateAmt = Number(rebate || 0);
-  const deduction = Math.min(Number(order.total), voucherTotal + rebateAmt);
+  const redeemValue = Number(pointsCfg?.pointsRedeemValue || 0.01);
+  const minRedeem = Math.max(0, Math.trunc(Number(pointsCfg?.pointsMinRedeem || 0)));
+  const pointsAmt = Number((Math.max(0, Math.trunc(Number(points || 0))) * redeemValue).toFixed(2));
+  const deduction = Math.min(Number(order.total), Number((voucherTotal + rebateAmt + pointsAmt).toFixed(2)));
   const due = Math.max(0, Number((Number(order.total) - deduction).toFixed(2)));
   const change = Math.max(0, Number((tendered - due).toFixed(2)));
   const updateRow = (index, patch) => setRows(rows.map((row, i) => i === index ? { ...row, ...patch } : row));
@@ -542,10 +557,21 @@ function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setV
   const onRebate = (val) => {
     let n = Number(val || 0);
     if (!Number.isFinite(n) || n < 0) n = 0;
-    const remaining = Math.max(0, Number((Number(order.total) - voucherTotal).toFixed(2)));
+    const remaining = Math.max(0, Number((Number(order.total) - voucherTotal - pointsAmt).toFixed(2)));
     if (n > rebateMax) { alert(`返利余额仅 ${money(rebateMax)}`); n = rebateMax; }
     if (n > remaining) n = remaining;
     setRebate(val === '' ? '' : String(Number(n.toFixed(2))));
+  };
+  // 积分抵扣:输入的是"分",不是金额。上限 = min(会员积分, 剩余应付 / 汇率)。
+  const pointsBalance = Number(member?.points || 0);
+  const pointsMaxByDue = redeemValue > 0 ? Math.floor(Math.max(0, Number(order.total) - voucherTotal - rebateAmt) / redeemValue) : 0;
+  const pointsMax = Math.max(0, Math.min(pointsBalance, pointsMaxByDue));
+  const onPoints = (val) => {
+    if (val === '') { setPoints(''); return; }
+    let n = Math.trunc(Number(val || 0));
+    if (!Number.isFinite(n) || n < 0) n = 0;
+    if (n > pointsMax) { alert(`最多可抵扣 ${pointsMax} 分（余额 ${pointsBalance} 分）`); n = pointsMax; }
+    setPoints(String(n));
   };
 
   return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Payment · {order.orderNo}</span><button onClick={onClose}>×</button></header><div className="legacy-window-body">
@@ -565,6 +591,16 @@ function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setV
           ? <><input type="number" min="0" step="0.01" placeholder="0.00" value={rebate} onChange={(e) => onRebate(e.target.value)} /><small>可用 {money(rebateMax)}</small></>
           : <small className="payment-rebate-off">此单未绑定会员，无法使用返利</small>}
       </div>
+      <div className="payment-rebate-row">
+        <span>Member Points{member ? ` · 余额 ${pointsBalance} 分` : ''}</span>
+        {member
+          ? <><input type="number" min="0" step="1" placeholder="0" value={points} onChange={(e) => onPoints(e.target.value)} /><small>{minRedeem > 0 ? `最少 ${minRedeem} 分 · ` : ''}最多 {pointsMax} 分（≈{money(pointsMax * redeemValue)}）</small></>
+          : <small className="payment-rebate-off">此单未绑定会员，无法使用积分</small>}
+      </div>
+      {member && (Number(member.tierDiscount) > 0 || Number(member.creditLimit) > 0) && <div className="payment-member-note">
+        {Number(member.tierDiscount) > 0 && <span>等级 {member.tierName} · 折扣 -{Number(member.tierDiscount)}%（结算时自动应用）</span>}
+        {Number(member.creditLimit) > 0 && <span>赊账额度 {money(member.creditLimit)} · 已欠 {money(member.owed)}{Number(member.owed) >= Number(member.creditLimit) - 0.001 ? ' · 额度已用尽' : ''}</span>}
+      </div>}
       {deduction > 0 && <div className="payment-change">Total Deduction <strong>−{money(deduction)}</strong></div>}
     </div>
 
@@ -573,26 +609,40 @@ function PaymentModal({ order, rows, setRows, onConfirm, onClose, vouchers, setV
 
 function SettlementModal({ settlement, onComplete, onClose }) {
   const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
-  const { vouchers = [], rebateAmount = 0, deduction = 0 } = settlement;
-  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Settlement · Complete Sale</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="settlement-success">Payment recorded</div><div className="settlement-summary"><div><span>Order</span><strong>{settlement.order.orderNo}</strong></div><div><span>Amount Due</span><strong>{money(settlement.due ?? settlement.order.total)}</strong></div>{deduction > 0 && <div><span>Deduction</span><strong>−{money(deduction)}</strong></div>}{vouchers.map((v) => <div key={v.code}><span>Voucher {v.code}</span><strong>−{money(v.amount)}</strong></div>)}{rebateAmount > 0 && <div><span>Member Rebate</span><strong>−{money(rebateAmount)}</strong></div>}<div><span>Tendered</span><strong>{money(settlement.tendered)}</strong></div><div><span>Change</span><strong className="change-value">{money(settlement.change)}</strong></div><div><span>Payment Type</span><strong>{settlement.rows.map((row) => `${row.method}: ${money(row.amount)}`).join(' + ')}</strong></div></div><p className="settlement-note">确认 Settlement 后，这张单会完成结算、核销礼券与返利、扣减库存、释放桌位并可打印小票。</p><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onComplete}>Complete Settlement</button><button className="legacy-btn pink" onClick={onClose}>Back</button></div></div></section></div>;
+  const { vouchers = [], rebateAmount = 0, deduction = 0, pointsRedeem = 0, pointsValue = 0 } = settlement;
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window"><header><span>Settlement · Complete Sale</span><button onClick={onClose}>×</button></header><div className="legacy-window-body"><div className="settlement-success">Payment recorded</div><div className="settlement-summary"><div><span>Order</span><strong>{settlement.order.orderNo}</strong></div><div><span>Amount Due</span><strong>{money(settlement.due ?? settlement.order.total)}</strong></div>{deduction > 0 && <div><span>Deduction</span><strong>−{money(deduction)}</strong></div>}{vouchers.map((v) => <div key={v.code}><span>Voucher {v.code}</span><strong>−{money(v.amount)}</strong></div>)}{rebateAmount > 0 && <div><span>Member Rebate</span><strong>−{money(rebateAmount)}</strong></div>}{Number(pointsRedeem) > 0 && <div><span>Points {Number(pointsRedeem)} pts</span><strong>−{money(pointsValue)}</strong></div>}<div><span>Tendered</span><strong>{money(settlement.tendered)}</strong></div><div><span>Change</span><strong className="change-value">{money(settlement.change)}</strong></div><div><span>Payment Type</span><strong>{settlement.rows.map((row) => `${row.method}: ${money(row.amount)}`).join(' + ')}</strong></div></div><p className="settlement-note">确认 Settlement 后，这张单会完成结算、核销礼券与返利、扣减库存、释放桌位并可打印小票。</p><div className="legacy-window-actions"><button className="legacy-btn green" onClick={onComplete}>Complete Settlement</button><button className="legacy-btn pink" onClick={onClose}>Back</button></div></div></section></div>;
 }
 
 function MemberPickerModal({ members, current, onPick, onClose }) {
   const [kw, setKw] = useState('');
+  const money = (n) => `¥${Number(n || 0).toFixed(2)}`;
   const list = members.filter((m) => {
     const k = kw.trim().toLowerCase();
     if (!k) return true;
-    return `${m.memberNo} ${m.name} ${m.phone || ''}`.toLowerCase().includes(k);
+    return `${m.memberNo} ${m.name} ${m.phone || ''} ${m.tierName || ''}`.toLowerCase().includes(k);
   }).slice(0, 40);
-  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 520 }}>
+  return <div className="legacy-window-wrap"><section className="legacy-window payment-window" style={{ width: 560 }}>
     <header><span>Member · 会员绑定</span><button onClick={onClose}>×</button></header>
     <div className="legacy-window-body">
-      <div className="payment-field"><label>Search<input placeholder="Member No. / 姓名 / 电话" value={kw} onChange={(e) => setKw(e.target.value)} /></label></div>
+      <div className="payment-field"><label>Search<input placeholder="Member No. / 姓名 / 电话 / 等级" value={kw} onChange={(e) => setKw(e.target.value)} /></label></div>
       <div className="recall-list">
-        {list.map((m) => <div key={m.id} className={`recall-row ${String(m.id) === String(current) ? 'active' : ''}`}>
-          <div><b>{m.memberNo} · {m.name}</b><small>{m.phone || '-'} · 积分 {Number(m.points || 0)} · 返利 {`¥${Number(m.rebateBalance || 0).toFixed(2)}`} · 储值 {`¥${Number(m.creditBalance || 0).toFixed(2)}`}</small></div>
-          <button className="legacy-btn green" onClick={() => onPick(m)}>{String(m.id) === String(current) ? 'Current' : 'Select'}</button>
-        </div>)}
+        {list.map((m) => {
+          const blocked = m.status === 'blocked';
+          const limit = Number(m.creditLimit || 0);
+          const owed = Number(m.owed || 0);
+          const full = limit > 0 && owed >= limit - 0.001;
+          return <div key={m.id} className={`recall-row ${String(m.id) === String(current) ? 'active' : ''}`}>
+            <div className="recall-member">
+              <b>{m.memberNo} · {m.name}
+                {m.tierName && <span className="member-tier"> {m.tierName}{Number(m.tierDiscount) > 0 ? ` -${Number(m.tierDiscount)}%` : ''}</span>}
+                {blocked && <span className="member-blocked"> 已冻结</span>}
+              </b>
+              <small>{m.phone || '-'} · 积分 {Number(m.points || 0)} · 返利 {money(m.rebateBalance)} · 储值 {money(m.creditBalance)}</small>
+              <small className={full ? 'member-owed' : ''}>赊账额度 {money(limit)}{owed > 0 ? ` · 已欠 ${money(owed)}` : ''}{full ? ' · 额度已用尽' : ''}</small>
+            </div>
+            <button className="legacy-btn green" disabled={blocked} onClick={() => onPick(m)}>{blocked ? 'Blocked' : String(m.id) === String(current) ? 'Current' : 'Select'}</button>
+          </div>;
+        })}
         {!list.length && <div className="ops-empty">没有匹配的会员</div>}
       </div>
       <div className="legacy-window-actions"><button className="legacy-btn pink" onClick={() => onPick(null)}>Clear Member</button><button className="legacy-btn pink" onClick={onClose}>Close</button></div>

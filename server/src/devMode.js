@@ -8,10 +8,20 @@ import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from './reportCatalo
 import { runReport, reportTitle, makeFilter } from './reportEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from './exporters.js';
 import { applyMovements, applyMovement, valuationOf, makeDocNo, derivePoStatus } from './inventoryEngine.js';
+// 会员引擎:等级 / 积分 / 信用额度 —— 与生产 routes/business.js 共用同一份逻辑
+import {
+  applyPoints, applyCredit, applyMemberSpend, resolveTier, tierDiscountPercent,
+  computeTierDiscount, computePointsEarn, computePointsValue, checkPointsRedeem, checkCreditLimit,
+  statementEvents, runStatement, sliceStatement, nextMemberNo, makeTierCode,
+} from './memberEngine.js';
+// 默认会员等级 / 会员设置:与生产 db.js / seed.js 共用同一份常量
+import { DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS } from './db.js';
 // 复用生产同一份 zod schema —— 否则「预览能过、生产报错」这类漂移会一直存在
 import {
   supplierSchema, purchaseOrderSchema, goodsReceiptSchema, stockTransferSchema,
-  inventoryItemSchema, adjustSchema,
+  inventoryItemSchema, adjustSchema, checkoutSchema,
+  memberSchema, memberUpdateSchema, memberTierSchema, memberTierUpdateSchema,
+  memberTopupSchema, memberKnockoffSchema, memberPointsSchema, memberStatusSchema,
 } from './validators.js';
 import {
   ROLES, PERMISSION_GROUPS, ALL_PERMISSIONS, defaultPermissions, hasPermission, resolveRolePermissions,
@@ -38,6 +48,8 @@ const store = {
   // 新增：采购与库存补全 —— 统一台账 / 采购行明细 / 收货单 / 库位调拨
   stockMovements: [], purchaseOrderLines: [], goodsReceipts: [], goodsReceiptLines: [],
   stockTransfers: [], stockTransferLines: [],
+  // 新增：会员体系补全 —— 会员等级
+  memberTiers: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -195,7 +207,46 @@ function seedDev() {
   for (const n of ['A1', 'A2', 'B1']) {
     store.tables.push({ id: nid(), orgId: '1', storeId: '1', number: n, zone: '大厅', seats: 4, status: 'free', currentOrderId: null });
   }
-  store.members.push({ id: nid(), orgId: '1', storeId: '1', memberNo: 'M0001', name: 'Demo Member', phone: '0123456789', creditBalance: 0, points: 120, status: 'active', createdAt: now() });
+  // ---- 会员等级 + 会员主档种子 ----
+  const tierByCode = {};
+  for (const [code, name, disc, minSpend, minPoints, isDefault, sortOrder] of DEFAULT_MEMBER_TIERS) {
+    const t = {
+      id: nid(), orgId: '1', storeId: '1', code, name,
+      discountPercent: disc, minSpend, minPoints,
+      isDefault: !!isDefault, sortOrder, isActive: true, note: null,
+      createdAt: now(), updatedAt: now(),
+    };
+    store.memberTiers.push(t);
+    tierByCode[code] = t;
+  }
+  const mkMember = (memberNo, name, phone, extra = {}) => {
+    const m = {
+      id: nid(), orgId: '1', storeId: '1', memberNo, name, phone,
+      email: null, address: null, taxNo: null, birthday: null, gender: null,
+      agent: null, term: null, doNo: null,
+      tierId: tierByCode.MEMBER.id,
+      creditLimit: 0, creditBalance: 0, rebateBalance: 0, points: 0,
+      totalSpend: 0, pointsEarnedTotal: 0, pointsRedeemedTotal: 0,
+      joinedAt: now(), note: null, status: 'active',
+      createdAt: now(), updatedAt: now(),
+      ...extra,
+    };
+    store.members.push(m);
+    return m;
+  };
+  mkMember('M0001', 'Demo Member', '0123456789', {
+    email: 'demo@member.com', birthday: '1990-05-12', gender: 'male',
+    points: 120, pointsEarnedTotal: 120,
+  });
+  mkMember('M0002', 'Silver Tan', '0129876543', {
+    email: 'silver@member.com', tierId: tierByCode.SILVER.id,
+    creditLimit: 300, totalSpend: 860.4, points: 860, pointsEarnedTotal: 900, pointsRedeemedTotal: 40,
+  });
+  mkMember('M0003', 'Gold Lim', '0162223333', {
+    email: 'gold@member.com', tierId: tierByCode.GOLD.id,
+    creditLimit: 1000, creditBalance: 128.5, totalSpend: 3420.75,
+    points: 1980, pointsEarnedTotal: 2600, pointsRedeemedTotal: 620,
+  });
   store.shifts.push({ id: nid(), orgId: '1', storeId: '1', cashierId: '3', openAmount: 0, expectedAmount: 0, closeAmount: 0, difference: 0, status: 'open', openedAt: now(), closedAt: null });
   store.settings.push({ id: nid(), orgId: '1', storeId: '1', key: 'taxRate', value: 0 });
 
@@ -217,6 +268,8 @@ function seedDev() {
     rebateExpiryDays: 90,
   };
   for (const [key, value] of Object.entries(DEFAULTS)) store.settings.push({ id: nid(), orgId: '1', storeId: '1', key, value });
+  // 会员积分 / 等级相关设置(与生产共用同一份默认值)
+  for (const [key, value] of Object.entries(DEFAULT_MEMBER_SETTINGS)) store.settings.push({ id: nid(), orgId: '1', storeId: '1', key, value });
 
   store.printers.push({ id: nid(), orgId: '1', storeId: '1', name: 'Counter Receipt', target: 'receipt', connection: 'usb', width: 80, isDefault: true, isActive: true });
   store.printers.push({ id: nid(), orgId: '1', storeId: '1', name: 'Kitchen Printer', target: 'kitchen', connection: 'lan', width: 80, isDefault: false, isActive: true });
@@ -226,7 +279,8 @@ function seedDev() {
   store.promotions.push({ id: nid(), orgId: '1', storeId: '1', code: 'HAPPY10', name: 'Happy Hour 10%', type: 'percent', value: 10, minSpend: 20, validFrom: null, validUntil: null, isActive: true, createdAt: now() });
   store.promotions.push({ id: nid(), orgId: '1', storeId: '1', code: 'RM2OFF', name: 'RM2 Off', type: 'amount', value: 2, minSpend: 10, validFrom: null, validUntil: null, isActive: true, createdAt: now() });
 
-  store.customerStock.push({ id: nid(), orgId: '1', storeId: '1', memberId: '1', memberNo: 'M0001', itemName: 'Heineken', qty: 6, unit: 'btl', note: 'Member kept stock', createdAt: now() });
+  const demoMemberRef = store.members.find((m) => m.memberNo === 'M0001') || store.members[0];
+  store.customerStock.push({ id: nid(), orgId: '1', storeId: '1', memberId: demoMemberRef.id, memberNo: demoMemberRef.memberNo, itemName: 'Heineken', qty: 6, unit: 'btl', note: 'Member kept stock', createdAt: now() });
 
   // 礼券种子：一张未使用、一张已部分核销、一张已过期
   const seedVoucher = (code, face, balance, status, extra = {}) => {
@@ -256,7 +310,7 @@ function seedDev() {
     return v;
   };
   seedVoucher('GV-1001', 50, 50, 'active');
-  seedVoucher('GV-1002', 100, 35, 'active', { issuedToMemberId: '1', issuedToName: 'Demo Member', note: 'Partial used' });
+  seedVoucher('GV-1002', 100, 35, 'active', { issuedToMemberId: demoMemberRef.id, issuedToName: demoMemberRef.name, note: 'Partial used' });
   seedVoucher('GV-1003', 20, 20, 'expired', { expiresAt: new Date(Date.now() - 86400000).toISOString() });
 
   // 返利种子：给 Demo Member 一笔已赚取返利
@@ -268,6 +322,45 @@ function seedDev() {
       memberName: demoMember.name, type: 'earn', amount: 8.5, balanceAfter: 8.5,
       orderId: null, orderNo: null, orderTotal: 85, percent: 10, reason: 'seed welcome rebate',
       expiresAt: null, createdBy: '1', createdByName: 'Admin', createdAt: now(),
+    });
+  }
+
+  // 积分台账 + 充值单种子：让会员对账单/积分流水一开箱就有内容
+  const seedPoints = (m, entries) => {
+    let bal = 0;
+    for (const [delta, type, reason, refType, refNo] of entries) {
+      bal += delta;
+      store.pointsLedger.push({
+        id: nid(), orgId: '1', storeId: '1', memberId: m.id, delta, type, reason,
+        refType: refType || null, refId: null, refNo: refNo || null,
+        balanceAfter: bal, createdBy: '1', createdByName: 'Admin', createdAt: now(),
+      });
+    }
+    m.points = bal;
+  };
+  for (const m of store.members) {
+    if (m.memberNo === 'M0001') {
+      seedPoints(m, [[100, 'bonus', '开卡礼 Welcome bonus'], [50, 'earn', '消费累积', 'order', 'SO-20261001-0001'], [-30, 'redeem', '结账抵扣', 'order', 'SO-20261001-0001']]);
+    } else if (m.memberNo === 'M0002') {
+      seedPoints(m, [[900, 'earn', '消费累积', 'order', null], [-40, 'redeem', '结账抵扣', 'order', null]]);
+    } else if (m.memberNo === 'M0003') {
+      seedPoints(m, [[2600, 'earn', '消费累积', 'order', null], [-620, 'redeem', '结账抵扣', 'order', null]]);
+    }
+  }
+  const goldMember = store.members.find((m) => m.memberNo === 'M0003');
+  if (goldMember) {
+    store.memberTopups.push({
+      id: nid(), orgId: '1', storeId: '1', memberId: goldMember.id, receiptNo: 'TU20261001001',
+      type: 'topup', amount: 200, method: 'cash', balanceAfter: 200, note: '开卡充值', createdBy: '1', createdByName: 'Admin', createdAt: now(),
+    });
+    store.memberTopups.push({
+      id: nid(), orgId: '1', storeId: '1', memberId: goldMember.id, receiptNo: 'TU20261002002',
+      type: 'topup', amount: 100, method: 'card', balanceAfter: 300, note: '第二次充值', createdBy: '1', createdByName: 'Admin', createdAt: now(),
+    });
+    // 一笔赊账核销(knock-off)负数流水,让储值对账单有借有贷
+    store.memberTopups.push({
+      id: nid(), orgId: '1', storeId: '1', memberId: goldMember.id, receiptNo: 'KO20261003003',
+      type: 'knockoff', amount: -171.5, method: 'cash', balanceAfter: 128.5, note: '结账核销赊账', createdBy: '1', createdByName: 'Admin', createdAt: now(),
     });
   }
 
@@ -361,12 +454,69 @@ const toOrder = (o) => ({
   createdBy: o.createdBy == null ? null : String(o.createdBy), shiftId: o.shiftId == null ? null : String(o.shiftId),
   salesPersonId: o.salesPersonId == null ? null : String(o.salesPersonId),
   memberId: o.memberId == null ? null : String(o.memberId),
+  discountType: o.discountType || null,
   mergedIntoOrderId: o.mergedIntoOrderId == null ? null : String(o.mergedIntoOrderId),
   voucherDiscount: Number(o.voucherDiscount || 0), rebateRedeemed: Number(o.rebateRedeemed || 0),
+  // 会员结账明细:等级折扣 / 积分抵扣与累积 / 挂账金额
+  tierDiscount: Number(o.tierDiscount || 0), pointsDiscount: Number(o.pointsDiscount || 0),
+  pointsRedeemed: Number(o.pointsRedeemed || 0), pointsEarned: Number(o.pointsEarned || 0),
+  tabAmount: Number(o.tabAmount || 0),
   voidRequestedBy: o.voidRequestedBy == null ? null : String(o.voidRequestedBy), voidApprovedBy: o.voidApprovedBy == null ? null : String(o.voidApprovedBy), voidReason: o.voidReason || null,
   createdAt: o.createdAt, updatedAt: o.updatedAt || o.createdAt,
 });
-const toMember = (m) => ({ _id: m.id, id: m.id, memberNo: m.memberNo, name: m.name, phone: m.phone, creditBalance: Number(m.creditBalance || 0), points: Number(m.points || 0), rebateBalance: Number(m.rebateBalance || 0), status: m.status, createdAt: m.createdAt });
+// ---- 会员体系(主档 / 等级 / 积分台账 / 充值单)----
+// 与生产 db.js 的 toMember 字段逐一对应,避免「预览有、生产没有」的漂移。
+const toMember = (m) => ({
+  _id: m.id, id: m.id, orgId: m.orgId || '1', storeId: m.storeId || '1',
+  memberNo: m.memberNo || null, name: m.name, phone: m.phone || null,
+  email: m.email || null, address: m.address || null, taxNo: m.taxNo || null,
+  birthday: m.birthday || null, gender: m.gender || null,
+  agent: m.agent || null, term: m.term || null, doNo: m.doNo || null,
+  tierId: m.tierId == null ? null : String(m.tierId),
+  creditLimit: round2(m.creditLimit), creditBalance: round2(m.creditBalance),
+  // owed = 当前欠款(余额为负时的绝对值),给前台/报表直接展示用
+  owed: round2(Math.max(0, -Number(m.creditBalance || 0))),
+  rebateBalance: round2(m.rebateBalance), points: Number(m.points || 0),
+  totalSpend: round2(m.totalSpend),
+  pointsEarnedTotal: Number(m.pointsEarnedTotal || 0),
+  pointsRedeemedTotal: Number(m.pointsRedeemedTotal || 0),
+  joinedAt: m.joinedAt || null, note: m.note || null,
+  status: m.status || 'active',
+  createdAt: m.createdAt, updatedAt: m.updatedAt || m.createdAt,
+});
+const toMemberTier = (t) => ({
+  _id: t.id, id: t.id, orgId: t.orgId || '1', storeId: t.storeId || '1',
+  code: t.code || null, name: t.name,
+  discountPercent: Number(t.discountPercent || 0),
+  minSpend: round2(t.minSpend), minPoints: Number(t.minPoints || 0),
+  isDefault: !!t.isDefault, sortOrder: Number(t.sortOrder || 0),
+  isActive: t.isActive == null ? true : !!t.isActive,
+  note: t.note || null,
+  createdAt: t.createdAt, updatedAt: t.updatedAt || t.createdAt,
+});
+const toPointsLedger = (p) => ({
+  _id: p.id, id: p.id, orgId: p.orgId || '1', storeId: p.storeId || '1',
+  memberId: String(p.memberId),
+  delta: Number(p.delta || 0), type: p.type || 'adjust',
+  reason: p.reason || null,
+  refType: p.refType || null,
+  refId: p.refId == null ? null : String(p.refId),
+  refNo: p.refNo || null,
+  balanceAfter: Number(p.balanceAfter || 0),
+  createdBy: p.createdBy == null ? null : String(p.createdBy),
+  createdByName: p.createdByName || null,
+  createdAt: p.createdAt,
+});
+const toMemberTopup = (t) => ({
+  _id: t.id, id: t.id, orgId: t.orgId || '1', storeId: t.storeId || '1',
+  memberId: String(t.memberId), receiptNo: t.receiptNo || null,
+  type: t.type || 'topup',
+  amount: round2(t.amount), method: t.method || 'cash',
+  balanceAfter: round2(t.balanceAfter), note: t.note || null,
+  createdBy: t.createdBy == null ? null : String(t.createdBy),
+  createdByName: t.createdByName || null,
+  createdAt: t.createdAt,
+});
 // ---- 礼券 / 返利 ----
 const toVoucher = (v) => ({
   _id: v.id, id: v.id, orgId: v.orgId, storeId: v.storeId, voucherNo: v.voucherNo, code: v.code,
@@ -697,6 +847,64 @@ const devInventoryAdapter = {
     return toStockMovement(row);
   },
 };
+
+// ---------------------------------------------------------------------------
+// 会员引擎的预览侧适配器：契约与 memberStore.js 完全一致，
+// 这样 memberEngine 的等级/积分/储值逻辑在生产与预览下走同一条代码路径。
+// ---------------------------------------------------------------------------
+const devMemberAdapter = {
+  async getMember(orgId, storeId, id) {
+    const m = store.members.find((x) => String(x.id) === String(id));
+    return m ? toMember(m) : null;
+  },
+  async saveMember(member, patch) {
+    const m = store.members.find((x) => String(x.id) === String(member.id));
+    if (!m) throw new Error('member vanished');
+    if (patch.points != null) m.points = Math.max(0, Math.trunc(Number(patch.points)));
+    if (patch.pointsEarnedTotal != null) m.pointsEarnedTotal = Math.max(0, Math.trunc(Number(patch.pointsEarnedTotal)));
+    if (patch.pointsRedeemedTotal != null) m.pointsRedeemedTotal = Math.max(0, Math.trunc(Number(patch.pointsRedeemedTotal)));
+    if (patch.totalSpend != null) m.totalSpend = round2(patch.totalSpend);
+    if (patch.creditBalance != null) m.creditBalance = round2(patch.creditBalance);
+    if (patch.tierId !== undefined) m.tierId = patch.tierId == null || patch.tierId === '' ? null : String(patch.tierId);
+    m.updatedAt = now();
+  },
+  async appendPoints(row) {
+    const r = {
+      id: nid(), orgId: row.orgId || '1', storeId: row.storeId || '1',
+      memberId: String(row.memberId), delta: Math.trunc(Number(row.delta)),
+      type: row.type || 'adjust', reason: row.reason ?? null,
+      refType: row.refType ?? null, refId: row.refId == null ? null : String(row.refId),
+      refNo: row.refNo ?? null, balanceAfter: Math.trunc(Number(row.balanceAfter)),
+      createdBy: row.createdBy == null ? null : String(row.createdBy),
+      createdByName: row.createdByName ?? null, createdAt: now(),
+    };
+    store.pointsLedger.push(r);
+    return r.id;
+  },
+  async appendCredit(row) {
+    const r = {
+      id: nid(), orgId: row.orgId || '1', storeId: row.storeId || '1',
+      memberId: String(row.memberId), receiptNo: row.receiptNo ?? null,
+      type: row.type || 'topup', amount: round2(row.amount),
+      method: row.method || 'cash', balanceAfter: round2(row.balanceAfter),
+      note: row.note ?? null,
+      createdBy: row.createdBy == null ? null : String(row.createdBy),
+      createdByName: row.createdByName ?? null, createdAt: now(),
+    };
+    store.memberTopups.push(r);
+    return r.id;
+  },
+  async listTiers() { return store.memberTiers.map(toMemberTier); },
+};
+/** zod 抛错 → 与 devParse 完全一致的 400 响应体。 */
+function devZodError(res, e) {
+  const issue = e && e.issues ? e.issues[0] : null;
+  return res.status(400).json({
+    error: 'validation_failed',
+    message: issue ? `${issue.path.join('.') || 'body'}: ${issue.message}` : 'validation_failed',
+    issues: (e && e.issues) || [],
+  });
+}
 /**
  * 用与生产完全相同的 zod schema 校验请求体。
  * 生产路由直接 schema.parse() 抛错给全局错误处理;预览里手动转成 400,
@@ -839,7 +1047,13 @@ function buildReportDataset() {
       openAmount: Number(s.openAmount || 0), expectedAmount: Number(s.expectedAmount || 0),
       closeAmount: Number(s.closeAmount || 0), difference: Number(s.difference || 0),
     })),
-    members: store.members.map((m) => ({ ...m, points: Number(m.points || 0), creditBalance: Number(m.creditBalance || 0), rebateBalance: Number(m.rebateBalance || 0) })),
+    members: store.members.map((m) => ({
+      ...m,
+      points: Number(m.points || 0), creditBalance: Number(m.creditBalance || 0),
+      rebateBalance: Number(m.rebateBalance || 0), creditLimit: Number(m.creditLimit || 0),
+      totalSpend: Number(m.totalSpend || 0),
+    })),
+    memberTiers: store.memberTiers.map(toMemberTier),
     memberTopups: store.memberTopups.map((t) => ({ ...t, amount: Number(t.amount || 0) })),
     pointsLedger: store.pointsLedger,
     invoices: store.invoices.map((v) => ({ ...v, amount: Number(v.amount || 0), tax: Number(v.tax || 0) })),
@@ -1413,14 +1627,36 @@ export function createDevRouter(io) {
     res.json(toOrder(o));
   });
 
-  r.post('/orders/:id/checkout', devRequirePerm('payment.settle'), (req, res) => {
+  r.post('/orders/:id/checkout', devRequirePerm('payment.settle'), async (req, res) => {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status === 'paid' || o.status === 'void') return res.status(400).json({ error: 'already closed' });
 
-    // ---- 先校验所有抵扣（礼券 / 返利），任何一项不通过就整体不落账 ----
-    const voucherInputs = (req.body.vouchers || []).map((x) => ({ code: x.code, amount: round2(x.amount) }));
-    const rebateAmount = round2(req.body.rebateAmount || 0);
+    let body;
+    try { body = checkoutSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const s = getSettings();
+    const gross = round2(Number(o.total || 0));
+
+    // ================= 第一步:全部试算 =================
+    // ---- 会员 + 等级折扣 ----
+    const memberRow = o.memberId ? memberOf(o.memberId) : null;
+    let member = memberRow ? toMember(memberRow) : null;
+    let tier = null;
+    let tierDiscount = 0;
+    let tierPercent = 0;
+    if (memberRow) {
+      if (memberRow.status !== 'active') return res.status(400).json({ error: 'member_inactive', status: memberRow.status });
+      tier = resolveTier(store.memberTiers, memberRow);
+      if (tier && body.applyTierDiscount !== false) {
+        const d = computeTierDiscount(tier, gross);
+        tierPercent = d.percent;
+        tierDiscount = d.amount;
+      }
+    }
+    const afterTier = round2(Math.max(0, gross - tierDiscount));
+
+    // ---- 礼券 ----
+    const voucherInputs = (body.vouchers || []).map((x) => ({ code: x.code, amount: round2(x.amount) }));
     const resolved = [];
     let voucherTotal = 0;
     for (const vi of voucherInputs) {
@@ -1433,20 +1669,52 @@ export function createDevRouter(io) {
       resolved.push({ v, amount: vi.amount });
       voucherTotal = round2(voucherTotal + vi.amount);
     }
+
+    // ---- 返利 ----
+    const rebateAmount = round2(body.rebateAmount || 0);
     let rebateMember = null;
     if (rebateAmount > 0) {
-      rebateMember = o.memberId ? memberOf(o.memberId) : null;
+      rebateMember = memberRow;
       if (!rebateMember) return res.status(400).json({ error: 'rebate requires a member on the order' });
       if (rebateAmount > Number(rebateMember.rebateBalance || 0) + 0.001) return res.status(400).json({ error: `rebate balance insufficient (${round2(rebateMember.rebateBalance)})` });
     }
-    const discountTotal = round2(voucherTotal + rebateAmount);
-    const dueAfterDiscount = Math.max(0, round2(Number(o.total || 0) - discountTotal));
-    const paidSum = (req.body.payments || []).reduce((s, x) => s + Number(x.amount), 0);
-    if (paidSum + Number(req.body.tip || 0) < dueAfterDiscount) {
+
+    // ---- 积分抵扣 ----
+    const pointsRedeem = Math.trunc(Number(body.pointsRedeem || 0));
+    let pointsValue = 0;
+    if (pointsRedeem > 0) {
+      if (!member) return res.status(400).json({ error: 'points_requires_member' });
+      const remaining = round2(Math.max(0, afterTier - voucherTotal - rebateAmount));
+      const wantValue = computePointsValue(pointsRedeem, s);
+      if (wantValue > remaining + 0.001) {
+        return res.status(400).json({
+          error: 'points_exceed_due', requestedValue: wantValue, maxValue: remaining,
+          maxPoints: Math.floor(remaining / Number(s.pointsRedeemValue || 1)),
+        });
+      }
+      const chk = checkPointsRedeem(member.points, wantValue, s);
+      if (!chk.ok) return res.status(400).json({ error: chk.error, ...chk });
+      pointsValue = wantValue;
+    }
+
+    const discountTotal = round2(tierDiscount + voucherTotal + rebateAmount + pointsValue);
+    const dueAfterDiscount = round2(Math.max(0, gross - discountTotal));
+    const normalized = normalizePayments(body.payments, dueAfterDiscount);
+    const paidSum = normalized.reduce((sum, x) => sum + x.amount, 0);
+    if (paidSum + Number(body.tip || 0) < dueAfterDiscount) {
       return res.status(400).json({ error: `amount not covered: due ${dueAfterDiscount}` });
     }
 
-    // ---- 校验通过，正式落账 ----
+    // ---- 信用额度:tab / credit 等于挂账 ----
+    const tabAmount = round2(normalized.filter((x) => x.method === 'tab' || x.method === 'credit').reduce((sum, x) => sum + x.amount, 0));
+    let creditCheck = null;
+    if (tabAmount > 0) {
+      if (!member) return res.status(400).json({ error: 'tab_requires_member' });
+      creditCheck = checkCreditLimit(member, tabAmount);
+      if (!creditCheck.ok) return res.status(400).json({ error: creditCheck.error, ...creditCheck });
+    }
+
+    // ================= 第二步:统一落账 =================
     const appliedVouchers = [];
     for (const r0 of resolved) {
       const rr = redeemVoucher(r0.v, r0.amount, { orderId: o.id, orderNo: o.orderNo, memberId: o.memberId, reason: 'redeemed at checkout' }, req.user);
@@ -1455,15 +1723,43 @@ export function createDevRouter(io) {
       store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: 'voucher', amount: r0.amount, tip: 0, createdAt: now() });
     }
     if (rebateAmount > 0) {
-      pushRebate(rebateMember, 'redeem', rebateAmount, { orderId: o.id, orderNo: o.orderNo, orderTotal: Number(o.total || 0), reason: 'rebate redeemed at checkout' }, req.user);
+      pushRebate(rebateMember, 'redeem', rebateAmount, { orderId: o.id, orderNo: o.orderNo, orderTotal: gross, reason: 'rebate redeemed at checkout' }, req.user);
       store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: 'rebate', amount: rebateAmount, tip: 0, createdAt: now() });
     }
-    for (const pm of normalizePayments(req.body.payments, dueAfterDiscount)) {
+    // ---- 积分抵扣:先扣分,再计本次得分 ----
+    let pointsRedeemed = null;
+    if (pointsRedeem > 0) {
+      const rp = await applyPoints(devMemberAdapter, [{
+        memberId: member.id, delta: -pointsRedeem, type: 'redeem',
+        reason: '结账积分抵扣', refType: 'order', refId: o.id, refNo: o.orderNo,
+      }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name || null });
+      if (!rp.ok) return res.status(400).json({ error: rp.errors[0].code, errors: rp.errors });
+      pointsRedeemed = { points: pointsRedeem, value: pointsValue, balanceAfter: rp.entries[0].balanceAfter };
+      store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: 'points', amount: pointsValue, tip: 0, createdAt: now() });
+    }
+    for (const pm of normalized) {
       store.payments.push({ id: nid(), orgId: '1', storeId: '1', orderId: o.id, method: pm.method, amount: pm.amount, tip: 0, createdAt: now() });
     }
-    o.voucherDiscount = discountTotal; o.rebateRedeemed = rebateAmount;
+    // ---- 挂账(tab):从会员账户余额扣,允许扣成负数(欠款) ----
+    let tabApplied = null;
+    if (tabAmount > 0) {
+      const rc = await applyCredit(devMemberAdapter, [{
+        memberId: member.id, amount: -tabAmount, type: 'knockoff',
+        method: 'tab', note: '结账挂账', receiptNo: o.orderNo,
+      }], { orgId: '1', storeId: '1', allowNegative: true, createdBy: req.user.id, createdByName: req.user.name || null });
+      if (!rc.ok) return res.status(400).json({ error: rc.errors[0].code, errors: rc.errors });
+      tabApplied = { amount: tabAmount, balanceAfter: rc.entries[0].balanceAfter };
+    }
+
+    o.voucherDiscount = round2(voucherTotal + rebateAmount + pointsValue);
+    o.rebateRedeemed = rebateAmount;
+    o.tierDiscount = tierDiscount;
+    o.pointsDiscount = pointsValue;
+    o.pointsRedeemed = pointsRedeem;
+    o.tabAmount = tabAmount;
+    // 用等级编码而不是显示名:编码稳定且是 ASCII,报表按 discount_type 分组时不会因改名而断档
+    if (tier && tierDiscount > 0) o.discountType = `tier:${tier.code || tier.name}`;
     o.status = 'paid'; o.updatedAt = now();
-    const s = getSettings();
     if (!o.invoiceNo) {
       const seq = store.invoices.length + 1;
       o.invoiceNo = `${s.invoicePrefix || 'INV'}-${new Date().getFullYear()}-${String(seq).padStart(5, '0')}`;
@@ -1483,38 +1779,81 @@ export function createDevRouter(io) {
     // ---- 自动返利：按 settings.rebatePercent 对实付金额计返利（会员单才计） ----
     let rebateEarned = null;
     const rebatePct = Number(s.rebatePercent || 0);
-    if (rebatePct > 0 && o.memberId) {
-      const earnMember = memberOf(o.memberId);
-      if (earnMember) {
-        const base = Math.max(0, round2(Number(o.total || 0) - discountTotal));
-        const earn = round2(base * rebatePct / 100);
-        if (earn > 0) {
-          const days = Number(s.rebateExpiryDays || 0);
-          const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : null;
-          const row = pushRebate(earnMember, 'earn', earn, {
-            orderId: o.id, orderNo: o.orderNo, orderTotal: base, percent: rebatePct,
-            reason: `auto rebate ${rebatePct}%`, expiresAt,
-          }, req.user);
-          rebateEarned = toRebate(row);
-        }
+    if (rebatePct > 0 && memberRow) {
+      const base = dueAfterDiscount;
+      const earn = round2(base * rebatePct / 100);
+      if (earn > 0) {
+        const days = Number(s.rebateExpiryDays || 0);
+        const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : null;
+        const row = pushRebate(memberRow, 'earn', earn, {
+          orderId: o.id, orderNo: o.orderNo, orderTotal: base, percent: rebatePct,
+          reason: `auto rebate ${rebatePct}%`, expiresAt,
+        }, req.user);
+        rebateEarned = toRebate(row);
       }
+    }
+
+    // ---- 积分累积 + 累计消费 + 自动升级 ----
+    let pointsEarned = null;
+    let spendApplied = null;
+    if (memberRow) {
+      const earn = computePointsEarn(dueAfterDiscount, s);
+      if (earn > 0) {
+        const rp = await applyPoints(devMemberAdapter, [{
+          memberId: memberRow.id, delta: earn, type: 'earn',
+          reason: '消费累积', refType: 'order', refId: o.id, refNo: o.orderNo,
+        }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name || null });
+        if (rp.ok) pointsEarned = { points: earn, balanceAfter: rp.entries[0].balanceAfter };
+      }
+      if (dueAfterDiscount > 0) {
+        const rs = await applyMemberSpend(devMemberAdapter, [{ memberId: memberRow.id, amount: dueAfterDiscount }], {
+          orgId: '1', storeId: '1', autoTierUpgrade: s.autoTierUpgrade !== false,
+          createdBy: req.user.id, createdByName: req.user.name || null,
+        });
+        if (rs.ok) spendApplied = rs.members[0];
+      }
+      o.pointsEarned = earn;
     }
 
     io.to(`store:${o.storeId}`).emit('order:closed', String(o.id));
     if (low.length) io.to(`store:${o.storeId}`).emit('inventory:low', low);
     const payments = store.payments.filter((p) => p.orderId === o.id);
+    const memberAfterRaw = memberRow ? (memberOf(memberRow.id) || memberRow) : null;
+    const memberAfterTier = memberAfterRaw ? resolveTier(store.memberTiers, memberAfterRaw) : null;
+    const memberAfter = memberAfterRaw ? {
+      ...toMember(memberAfterRaw),
+      tierName: memberAfterTier ? memberAfterTier.name : null,
+      tierCode: memberAfterTier ? memberAfterTier.code : null,
+      tierDiscount: tierDiscountPercent(memberAfterTier),
+    } : null;
     res.json({
       order: toOrder(o),
       appliedVouchers,
       rebateRedeemed: rebateAmount,
       rebateEarned,
+      tier: tier ? { id: String(tier.id), name: tier.name, code: tier.code, discountPercent: tierPercent } : null,
+      tierDiscount,
+      pointsRedeemed,
+      pointsEarned,
+      tabAmount,
+      creditCheck,
+      spendApplied,
+      member: memberAfter,
       dueAfterDiscount,
       receipt: {
         storeName: s.companyName || 'Demo Store', address: s.address || '', phone: s.phone || '', gstNo: s.gstNo || '',
         orderNo: o.orderNo, invoiceNo: o.invoiceNo, items: o.items, subtotal: o.subtotal, discount: o.discount,
         serviceCharge: o.serviceCharge, tax: o.tax, taxRate: s.taxRate, taxInclusive: s.taxInclusive, total: o.total,
-        voucherDiscount: discountTotal, rebateRedeemed: rebateAmount,
+        tierDiscount, tierName: tier ? tier.name : null, tierPercent,
+        voucherDiscount: round2(voucherTotal + rebateAmount), rebateRedeemed: rebateAmount,
+        pointsRedeemed: pointsRedeem, pointsDiscount: pointsValue,
+        pointsEarned: pointsEarned ? pointsEarned.points : 0,
+        pointsBalance: memberAfter ? memberAfter.points : null,
+        tabAmount,
         rebateEarned: rebateEarned ? Number(rebateEarned.amount || 0) : 0,
+        rebateBalance: memberAfter ? memberAfter.rebateBalance : null,
+        creditBalance: memberAfter ? memberAfter.creditBalance : null,
+        memberNo: member ? member.memberNo : null, memberName: member ? member.name : null,
         payments, footer: s.receiptFooter || '', createdAt: o.createdAt,
       },
     });
@@ -2244,37 +2583,271 @@ export function createDevRouter(io) {
     res.json({ date: now(), total, orderCount: paid.length, byMethod, saleMovements: 0 });
   });
 
-  // ---- 会员 / 会员充值 / 积分 / Knock Off ----
-  r.get('/members', (req, res) => res.json(store.members.map(toMember)));
+  // ================= 会员等级 Member Tier =================
+  // 与生产一致:等级是定价配置,写操作走 settings.edit(收银员不该能改折扣)
+  const tierWithCount = (t) => ({ ...toMemberTier(t), memberCount: store.members.filter((m) => String(m.tierId) === String(t.id)).length });
+  r.get('/member-tiers', (req, res) => {
+    let list = [...store.memberTiers].sort((a, b) => (Number(a.sortOrder) - Number(b.sortOrder)) || (Number(a.id) - Number(b.id))).map(tierWithCount);
+    if (req.query.active === '1') list = list.filter((t) => t.isActive);
+    res.json(list);
+  });
+  r.get('/member-tiers/:id', (req, res) => {
+    const t = store.memberTiers.find((x) => String(x.id) === String(req.params.id));
+    if (!t) return res.status(404).json({ error: 'not_found' });
+    res.json(tierWithCount(t));
+  });
+  r.post('/member-tiers', devRequirePerm('settings.edit'), (req, res) => {
+    let b; try { b = memberTierSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const code = String(b.code || '').trim() || makeTierCode(b.name, store.memberTiers.map((t) => t.code).filter(Boolean));
+    if (store.memberTiers.some((t) => String(t.code || '').toUpperCase() === code.toUpperCase())) {
+      return res.status(400).json({ error: 'duplicate_code', code });
+    }
+    if (b.isDefault) for (const t of store.memberTiers) t.isDefault = false;
+    const t = {
+      id: nid(), orgId: '1', storeId: '1', code, name: b.name,
+      discountPercent: Number(b.discountPercent || 0), minSpend: Number(b.minSpend || 0),
+      minPoints: Number(b.minPoints || 0), isDefault: !!b.isDefault,
+      sortOrder: Number(b.sortOrder || 0), isActive: b.isActive === false ? false : true,
+      note: b.note ?? null, createdAt: now(), updatedAt: now(),
+    };
+    store.memberTiers.push(t);
+    res.status(201).json(tierWithCount(t));
+  });
+  r.put('/member-tiers/:id', devRequirePerm('settings.edit'), (req, res) => {
+    let b; try { b = memberTierUpdateSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const t = store.memberTiers.find((x) => String(x.id) === String(req.params.id));
+    if (!t) return res.status(404).json({ error: 'not_found' });
+    if (b.isDefault) for (const x of store.memberTiers) x.isDefault = false;
+    if (b.code != null && b.code !== '') t.code = b.code;
+    if (b.name != null) t.name = b.name;
+    if (b.discountPercent != null) t.discountPercent = Number(b.discountPercent);
+    if (b.minSpend != null) t.minSpend = Number(b.minSpend);
+    if (b.minPoints != null) t.minPoints = Number(b.minPoints);
+    if (b.isDefault != null) t.isDefault = !!b.isDefault;
+    if (b.sortOrder != null) t.sortOrder = Number(b.sortOrder);
+    if (b.isActive != null) t.isActive = !!b.isActive;
+    if (b.note !== undefined) t.note = b.note;
+    t.updatedAt = now();
+    res.json(tierWithCount(t));
+  });
+  r.put('/member-tiers/:id/status', devRequirePerm('settings.edit'), (req, res) => {
+    const t = store.memberTiers.find((x) => String(x.id) === String(req.params.id));
+    if (!t) return res.status(404).json({ error: 'not_found' });
+    t.isActive = req.body && req.body.isActive !== undefined ? !!req.body.isActive : !t.isActive;
+    t.updatedAt = now();
+    res.json(tierWithCount(t));
+  });
+  r.delete('/member-tiers/:id', devRequirePerm('settings.edit'), (req, res) => {
+    const i = store.memberTiers.findIndex((x) => String(x.id) === String(req.params.id));
+    if (i < 0) return res.status(404).json({ error: 'not_found' });
+    const inUse = store.members.filter((m) => String(m.tierId) === String(store.memberTiers[i].id)).length;
+    if (inUse) return res.status(409).json({ error: 'tier_in_use', memberCount: inUse });
+    if (store.memberTiers.length <= 1) return res.status(409).json({ error: 'last_tier' });
+    const [gone] = store.memberTiers.splice(i, 1);
+    res.json({ ok: true, deleted: String(gone.id) });
+  });
+
+  // ================= 会员主档 Member =================
+  const memberWithTier = (m) => {
+    const t = resolveTier(store.memberTiers, m);
+    return { ...toMember(m), tierName: t ? t.name : null, tierCode: t ? t.code : null, tierDiscount: tierDiscountPercent(t) };
+  };
+  const findMember = (id) => store.members.find((x) => String(x.id) === String(id));
+  const sortMembers = () => [...store.members].sort((a, b) => (new Date(b.createdAt) - new Date(a.createdAt)) || (Number(b.id) - Number(a.id)));
+
+  r.get('/members', (req, res) => {
+    let list = sortMembers().map(memberWithTier);
+    if (req.query.status && req.query.status !== 'all') list = list.filter((m) => m.status === req.query.status);
+    if (req.query.tierId) list = list.filter((m) => String(m.tierId) === String(req.query.tierId));
+    // lowCredit = 欠款已达/超过信用额度(余额带符号,负数代表欠款)
+    if (req.query.lowCredit === '1') list = list.filter((m) => m.creditLimit > 0 && -m.creditBalance >= m.creditLimit - 0.001);
+    const q = String(req.query.q || '').trim().toLowerCase();
+    if (q) list = list.filter((m) => [m.memberNo, m.name, m.phone, m.email, m.taxNo].some((f) => String(f || '').toLowerCase().includes(q)));
+    res.json(list);
+  });
+  r.get('/members/next-code', (req, res) => res.json({ memberNo: nextMemberNo(store.members.map((m) => m.memberNo)) }));
   r.post('/members', devRequirePerm('member.create'), (req, res) => {
-    const b = req.body || {};
-    const m = { id: nid(), orgId: '1', storeId: '1', memberNo: b.memberNo || `M${String(store.members.length + 1).padStart(4, '0')}`, name: b.name || '', phone: b.phone || '', creditBalance: Number(b.creditBalance || 0), points: Number(b.points || 0), status: 'active', createdAt: now() };
-    store.members.push(m); res.status(201).json(toMember(m));
+    let b; try { b = memberSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const memberNo = String(b.memberNo || '').trim() || nextMemberNo(store.members.map((m) => m.memberNo));
+    if (store.members.some((m) => String(m.memberNo || '').toUpperCase() === memberNo.toUpperCase())) {
+      return res.status(400).json({ error: 'duplicate_member_no', memberNo });
+    }
+    const def = store.memberTiers.find((t) => t.isDefault) || store.memberTiers[0] || null;
+    const tierId = b.tierId == null || b.tierId === '' ? (def ? String(def.id) : null) : String(b.tierId);
+    if (tierId && !store.memberTiers.some((t) => String(t.id) === tierId)) return res.status(400).json({ error: 'tier_not_found' });
+    const m = {
+      id: nid(), orgId: '1', storeId: '1', memberNo, name: b.name,
+      phone: b.phone || null, email: b.email || null, address: b.address || null,
+      taxNo: b.taxNo || null, birthday: b.birthday || null, gender: b.gender || null,
+      agent: b.agent || null, term: b.term || null, doNo: b.doNo || null,
+      tierId,
+      creditLimit: b.creditLimit == null ? Number(getSettings().creditLimitDefault || 0) : Number(b.creditLimit),
+      creditBalance: 0, rebateBalance: 0, points: 0, totalSpend: 0,
+      pointsEarnedTotal: 0, pointsRedeemedTotal: 0,
+      joinedAt: now(), note: b.note ?? null, status: b.status || 'active',
+      createdAt: now(), updatedAt: now(),
+    };
+    store.members.push(m);
+    res.status(201).json(memberWithTier(m));
+  });
+  r.get('/members/:id', (req, res) => {
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    const t = resolveTier(store.memberTiers, m);
+    res.json({ ...memberWithTier(m), tier: t, tierDiscountPercent: tierDiscountPercent(t) });
   });
   r.put('/members/:id', devRequirePerm('member.create'), (req, res) => {
-    const m = store.members.find((x) => x.id === req.params.id);
-    if (!m) return res.status(404).json({ error: 'not found' });
-    Object.assign(m, { memberNo: req.body.memberNo ?? m.memberNo, name: req.body.name ?? m.name, phone: req.body.phone ?? m.phone, status: req.body.status ?? m.status });
-    res.json(toMember(m));
+    let b; try { b = memberUpdateSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    if (b.tierId != null && b.tierId !== '' && !store.memberTiers.some((t) => String(t.id) === String(b.tierId))) {
+      return res.status(400).json({ error: 'tier_not_found' });
+    }
+    if (b.memberNo && store.members.some((x) => String(x.memberNo || '').toUpperCase() === String(b.memberNo).toUpperCase() && String(x.id) !== String(m.id))) {
+      return res.status(400).json({ error: 'duplicate_member_no', memberNo: b.memberNo });
+    }
+    for (const k of ['memberNo', 'name', 'phone', 'email', 'address', 'taxNo', 'birthday', 'agent', 'term', 'doNo', 'note', 'status']) {
+      if (b[k] !== undefined) m[k] = b[k];
+    }
+    if (b.gender !== undefined) m.gender = b.gender || null;
+    if (b.tierId !== undefined) m.tierId = b.tierId == null || b.tierId === '' ? null : String(b.tierId);
+    if (b.creditLimit !== undefined) m.creditLimit = Number(b.creditLimit);
+    m.updatedAt = now();
+    res.json(memberWithTier(m));
   });
-  r.post('/members/:id/top-up', devRequirePerm('member.topup'), (req, res) => {
-    const m = store.members.find((x) => x.id === req.params.id);
-    const amount = Number(req.body.amount || 0);
-    if (!m || amount <= 0) return res.status(400).json({ error: 'invalid member or amount' });
-    m.creditBalance += amount;
-    const topup = { id: nid(), memberId: m.id, receiptNo: `TU${Date.now()}`, amount, createdAt: now(), createdBy: req.user.id };
-    store.memberTopups.push(topup); res.json({ member: toMember(m), topup });
+  r.put('/members/:id/status', devRequirePerm('member.create'), (req, res) => {
+    let b; try { b = memberStatusSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    m.status = b.status; m.updatedAt = now();
+    res.json(memberWithTier(m));
   });
-  r.get('/members/:id/ledger', (req, res) => res.json({ topups: store.memberTopups.filter((x) => x.memberId === req.params.id), points: store.pointsLedger.filter((x) => x.memberId === req.params.id) }));
-  r.post('/members/:id/points', devRequirePerm('member.points'), (req, res) => {
-    const m = store.members.find((x) => x.id === req.params.id); const delta = Number(req.body.delta || 0);
-    if (!m) return res.status(404).json({ error: 'not found' });
-    m.points = Math.max(0, m.points + delta); const row = { id: nid(), memberId: m.id, delta, reason: req.body.reason || 'manual', createdAt: now() }; store.pointsLedger.push(row); res.json({ member: toMember(m), entry: row });
+  r.put('/members/:id/tier', devRequirePerm('member.create'), (req, res) => {
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    const tid = req.body && req.body.tierId != null ? String(req.body.tierId) : '';
+    if (!tid) return res.status(400).json({ error: 'tier_required' });
+    const t = store.memberTiers.find((x) => String(x.id) === tid);
+    if (!t) return res.status(400).json({ error: 'tier_not_found' });
+    m.tierId = tid; m.updatedAt = now();
+    res.json(memberWithTier(m));
   });
-  r.post('/members/:id/knock-off', devRequirePerm('payment.settle'), (req, res) => {
-    const m = store.members.find((x) => x.id === req.params.id); const amount = Number(req.body.amount || 0);
-    if (!m || amount <= 0 || amount > m.creditBalance) return res.status(400).json({ error: 'invalid amount' });
-    m.creditBalance -= amount; res.json({ member: toMember(m), knockedOff: amount, receiptNo: `RV${Date.now()}` });
+  r.delete('/members/:id', devRequirePerm('member.create'), (req, res) => {
+    const i = store.members.findIndex((x) => String(x.id) === String(req.params.id));
+    if (i < 0) return res.status(404).json({ error: 'not_found' });
+    const id = String(store.members[i].id);
+    const counts = {
+      orders: store.orders.filter((o) => String(o.memberId) === id).length,
+      topups: store.memberTopups.filter((t) => String(t.memberId) === id).length,
+      points: store.pointsLedger.filter((p) => String(p.memberId) === id).length,
+      rebates: store.rebates.filter((r) => String(r.memberId) === id).length,
+      vouchers: store.vouchers.filter((v) => String(v.issuedToMemberId) === id).length,
+    };
+    const total = Object.values(counts).reduce((s, n) => s + n, 0);
+    if (total > 0) return res.status(409).json({ error: 'member_has_transactions', counts, hint: 'set status=inactive instead' });
+    store.members.splice(i, 1);
+    res.json({ ok: true, deleted: id });
+  });
+
+  // ---- 对账单 / 流水 / 历史订单 ----
+  const statementInputs = (id) => ({
+    credit: store.memberTopups.filter((t) => String(t.memberId) === String(id)).map(toMemberTopup),
+    points: store.pointsLedger.filter((p) => String(p.memberId) === String(id)).map(toPointsLedger),
+    rebate: store.rebates.filter((r) => String(r.memberId) === String(id)).map((r) => ({
+      id: r.id, createdAt: r.createdAt, type: r.type, amount: Number(r.amount || 0),
+      orderNo: r.orderNo || null, reason: r.reason || null, createdByName: r.createdByName || null,
+    })),
+  });
+  r.get('/members/:id/statement', (req, res) => {
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    const inputs = statementInputs(m.id);
+    const events = statementEvents(inputs);
+    const { opening, within } = sliceStatement(events, req.query.from || null, req.query.to || null);
+    const st = runStatement(within, opening);
+    const paid = store.orders.filter((o) => String(o.memberId) === String(m.id) && o.status === 'paid');
+    res.json({
+      member: memberWithTier(m),
+      period: { from: req.query.from || null, to: req.query.to || null },
+      ...st,
+      summary: {
+        paidOrders: paid.length,
+        paidAmount: round2(paid.reduce((s, o) => s + Number(o.total || 0), 0)),
+        creditBalance: Number(m.creditBalance || 0),
+        rebateBalance: Number(m.rebateBalance || 0),
+        points: Number(m.points || 0),
+        totalSpend: Number(m.totalSpend || 0),
+      },
+    });
+  });
+  r.get('/members/:id/ledger', (req, res) => {
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    const inputs = statementInputs(m.id);
+    const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 500)));
+    res.json({
+      member: memberWithTier(m),
+      credit: inputs.credit.slice(-limit).reverse(),
+      points: inputs.points.slice(-limit).reverse(),
+      rebates: inputs.rebate.slice(-limit).reverse(),
+      totals: {
+        creditBalance: Number(m.creditBalance || 0), rebateBalance: Number(m.rebateBalance || 0),
+        points: Number(m.points || 0), pointsEarnedTotal: Number(m.pointsEarnedTotal || 0),
+        pointsRedeemedTotal: Number(m.pointsRedeemedTotal || 0), totalSpend: Number(m.totalSpend || 0),
+      },
+    });
+  });
+  r.get('/members/:id/orders', (req, res) => {
+    const m = findMember(req.params.id);
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    let rows = store.orders.filter((o) => String(o.memberId) === String(m.id));
+    rows = rows.sort((a, b) => (new Date(b.createdAt) - new Date(a.createdAt)) || (Number(b.id) - Number(a.id)));
+    if (req.query.status && req.query.status !== 'all') rows = rows.filter((o) => o.status === req.query.status);
+    res.json(rows.map(toOrder));
+  });
+  r.get('/members/:id/topups', (req, res) => {
+    const list = store.memberTopups.filter((t) => String(t.memberId) === String(req.params.id))
+      .sort((a, b) => (new Date(b.createdAt) - new Date(a.createdAt)) || (Number(b.id) - Number(a.id)));
+    res.json(list.map(toMemberTopup));
+  });
+
+  // ---- 充值 / 核销 / 积分（与生产一致:统一走 memberEngine） ----
+  r.post('/members/:id/top-up', devRequirePerm('member.topup'), async (req, res) => {
+    let b; try { b = memberTopupSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const r0 = await applyCredit(devMemberAdapter, [{
+      memberId: req.params.id, amount: Number(b.amount), type: 'topup',
+      method: b.method || 'cash', note: b.note || null,
+      receiptNo: String(b.receiptNo || '').trim() || `TU${Date.now()}`,
+    }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name || null });
+    if (!r0.ok) return res.status(400).json({ error: r0.errors[0].code, errors: r0.errors });
+    const row = store.memberTopups.find((t) => String(t.id) === String(r0.entries[0].id));
+    res.json({ member: memberWithTier(findMember(req.params.id)), topup: toMemberTopup(row) });
+  });
+  r.post('/members/:id/knock-off', devRequirePerm('payment.settle'), async (req, res) => {
+    let b; try { b = memberKnockoffSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const r0 = await applyCredit(devMemberAdapter, [{
+      memberId: req.params.id, amount: -Number(b.amount), type: 'knockoff',
+      method: b.method || 'cash', note: b.note || null,
+      receiptNo: String(b.receiptNo || '').trim() || `KO${Date.now()}`,
+    }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name || null });
+    if (!r0.ok) return res.status(400).json({ error: r0.errors[0].code, errors: r0.errors });
+    const row = store.memberTopups.find((t) => String(t.id) === String(r0.entries[0].id));
+    res.json({
+      member: memberWithTier(findMember(req.params.id)),
+      knockedOff: Number(b.amount), receiptNo: row.receiptNo, entry: toMemberTopup(row),
+    });
+  });
+  r.post('/members/:id/points', devRequirePerm('member.points'), async (req, res) => {
+    let b; try { b = memberPointsSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const r0 = await applyPoints(devMemberAdapter, [{
+      memberId: req.params.id, delta: Number(b.delta),
+      type: b.type || (Number(b.delta) > 0 ? 'bonus' : 'adjust'),
+      reason: b.reason || 'manual adjustment',
+      refType: b.refType || null, refNo: b.refNo || null,
+    }], { orgId: '1', storeId: '1', createdBy: req.user.id, createdByName: req.user.name || null });
+    if (!r0.ok) return res.status(400).json({ error: r0.errors[0].code, errors: r0.errors });
+    const row = store.pointsLedger.find((p) => String(p.id) === String(r0.entries[0].id));
+    res.json({ member: memberWithTier(findMember(req.params.id)), entry: toPointsLedger(row) });
   });
 
   // ---- Cash In / Withdraw / Payment / Received / Credit Note ----

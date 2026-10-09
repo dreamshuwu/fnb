@@ -87,13 +87,17 @@ export const createOrderSchema = z.object({
 });
 
 export const checkoutSchema = z.object({
-  // 注意：voucher / rebate 故意不放进 method 枚举 —— 抵扣必须走下面的
-  // vouchers[] / rebateAmount，服务端才会真正扣减礼券余额和会员返利余额，
+  // 注意：voucher / rebate / points 故意不放进 method 枚举 —— 抵扣必须走下面的
+  // vouchers[] / rebateAmount / pointsRedeem，服务端才会真正扣减余额，
   // 否则客户端可以伪造一笔"礼券付款"而不核销任何券。
   payments: z.array(z.object({ method: z.enum(['cash', 'card', 'tab', 'cheque', 'credit']), amount: z.number().min(0) })).min(1),
   tip: z.number().optional(),
   vouchers: z.array(z.object({ code: z.string().min(1), amount: z.number().min(0) })).optional(),
   rebateAmount: z.number().min(0).optional(),
+  // 会员部分:等级折扣率由服务端按会员等级计算,客户端不能自报折扣率,
+  // 只能选择「要不要用」以及「抵多少积分」。
+  pointsRedeem: z.number().int().min(0).optional(),
+  applyTierDiscount: z.boolean().optional(),
 });
 
 export const voidSchema = z.object({ reason: z.string().min(1) });
@@ -198,3 +202,67 @@ export const stockTransferSchema = z.object({
     note: z.string().optional().nullable(),
   })).min(1),
 });
+
+// ---- 会员体系 ----
+const optStr = z.string().optional().nullable();
+const optId = z.union([z.string(), z.number()]).optional().nullable();
+const MEMBER_STATUS = ['active', 'inactive', 'blocked'];
+// 允许空串:前端清空输入框时会送 '' 而不是 undefined
+const genderField = z.union([z.enum(['male', 'female', 'other']), z.literal('')]).optional().nullable();
+
+export const memberSchema = z.object({
+  memberNo: optStr,
+  name: z.string().min(1),
+  phone: optStr,
+  email: optStr,
+  address: optStr,
+  taxNo: optStr,
+  birthday: optStr,
+  gender: genderField,
+  agent: optStr,
+  term: optStr,
+  doNo: optStr,
+  tierId: optId,
+  creditLimit: z.number().min(0).optional(),
+  status: z.enum(MEMBER_STATUS).optional(),
+  note: optStr,
+});
+export const memberUpdateSchema = memberSchema.partial();
+
+export const memberTierSchema = z.object({
+  code: optStr,
+  name: z.string().min(1),
+  discountPercent: z.number().min(0).max(100).optional(),
+  minSpend: z.number().min(0).optional(),
+  minPoints: z.number().int().min(0).optional(),
+  isDefault: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+  isActive: z.boolean().optional(),
+  note: optStr,
+});
+export const memberTierUpdateSchema = memberTierSchema.partial();
+
+// 充值 / 核销 / 积分调整的支付方式(不含 tab / credit —— 那是结账抵扣,不是储值)
+export const CREDIT_METHODS = ['cash', 'card', 'cheque', 'ewallet', 'transfer'];
+
+export const memberTopupSchema = z.object({
+  amount: z.number().positive(),
+  method: z.enum(CREDIT_METHODS).optional(),
+  receiptNo: optStr,
+  note: optStr,
+});
+export const memberKnockoffSchema = z.object({
+  amount: z.number().positive(),
+  method: z.enum(CREDIT_METHODS).optional(),
+  receiptNo: optStr,
+  note: optStr,
+});
+export const memberPointsSchema = z.object({
+  delta: z.number().int().refine((v) => v !== 0, { message: 'delta must not be zero' }),
+  type: z.enum(['earn', 'redeem', 'adjust', 'bonus', 'expire', 'refund', 'void']).optional(),
+  reason: optStr,
+  refType: optStr,
+  refNo: optStr,
+});
+export const memberStatusSchema = z.object({ status: z.enum(MEMBER_STATUS) });
+export const memberTierAssignSchema = z.object({ tierId: optId });

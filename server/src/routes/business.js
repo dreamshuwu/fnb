@@ -2,17 +2,36 @@ import { Router } from 'express';
 import {
   query, getRow, insert, stringifyJSON, parseJSON,
   toInventoryItem, toStockMovement, toGoodsReceipt, toGoodsReceiptLine,
-  toStockTransfer, toStockTransferLine, toPurchaseOrderLine,
+  toStockTransfer, toStockTransferLine, toPurchaseOrderLine, toOrder,
+  toMember, toMemberTier, toPointsLedger, toMemberTopup,
 } from '../db.js';
 import { authenticate, tenant, requirePermission } from '../middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from '../reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from '../reportEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from '../exporters.js';
+import {
+  applyPoints, applyCredit, resolveTier, tierDiscountPercent,
+  statementEvents, runStatement, sliceStatement,
+  nextMemberNo, makeTierCode,
+} from '../memberEngine.js';
+import { memberAdapter } from '../memberStore.js';
+import {
+  memberSchema, memberUpdateSchema, memberTierSchema, memberTierUpdateSchema,
+  memberTopupSchema, memberKnockoffSchema, memberPointsSchema, memberStatusSchema,
+  memberTierAssignSchema,
+} from '../validators.js';
 
 const router = Router();
 router.use(authenticate);
 const dt = (v) => v == null ? null : (v instanceof Date ? v.toISOString() : String(v));
-const member = (r) => ({ _id: r.id, id: r.id, memberNo: r.member_no, name: r.name, phone: r.phone, creditBalance: Number(r.credit_balance || 0), points: Number(r.points || 0), rebateBalance: Number(r.rebate_balance || 0), status: r.status, createdAt: dt(r.created_at) });
+const dtDate = (v) => v == null ? null : (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
+const member = (r) => toMember(r);
+const memberRow = (r) => ({
+  ...toMember(r),
+  tierName: r.tier_name || null,
+  tierCode: r.tier_code || null,
+  tierDiscount: Number(r.tier_discount || 0),
+});
 const voucher = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id, voucherNo: r.voucher_no, code: r.code,
   faceValue: Number(r.face_value || 0), balance: Number(r.balance || 0),
@@ -53,12 +72,367 @@ const attendance = (r) => ({ _id: r.id, id: r.id, userId: r.user_id, userName: r
 const shift = (r) => ({ _id: r.id, id: r.id, cashierId: r.cashier_id, openAmount: Number(r.open_amount || 0), expectedAmount: Number(r.expected_amount || 0), closeAmount: Number(r.close_amount || 0), difference: Number(r.difference_amount || 0), status: r.status, openedAt: dt(r.created_at), closedAt: dt(r.updated_at) });
 const supplier = (r) => ({ _id: r.id, id: r.id, code: r.code, name: r.name, phone: r.phone, contact: r.contact, status: r.status, createdAt: dt(r.created_at) });
 
-router.get('/members', async (req, res) => { const { orgId, storeId } = tenant(req); res.json((await query('SELECT * FROM members WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map(member)); });
-router.post('/members', requirePermission('member.create'), async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; const id = await insert('INSERT INTO members (org_id,store_id,member_no,name,phone,credit_balance,points) VALUES (?,?,?,?,?,?,?)', [orgId, storeId, b.memberNo || `M${Date.now()}`, b.name || '', b.phone || '', Number(b.creditBalance || 0), Number(b.points || 0)]); res.status(201).json(member(await getRow('SELECT * FROM members WHERE id=?', [id]))); });
-router.put('/members/:id', requirePermission('member.create'), async (req, res) => { const { orgId, storeId } = tenant(req); const b = req.body || {}; await query('UPDATE members SET member_no=COALESCE(?,member_no),name=COALESCE(?,name),phone=COALESCE(?,phone),status=COALESCE(?,status) WHERE id=? AND org_id=? AND store_id=?', [b.memberNo, b.name, b.phone, b.status, req.params.id, orgId, storeId]); res.json(member(await getRow('SELECT * FROM members WHERE id=?', [req.params.id]))); });
-router.post('/members/:id/top-up', requirePermission('member.topup'), async (req, res) => { const { orgId, storeId } = tenant(req); const amount = Number(req.body.amount || 0); const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!m || amount <= 0) return res.status(400).json({ error: 'invalid member or amount' }); await query('UPDATE members SET credit_balance=credit_balance+? WHERE id=?', [amount, m.id]); const id = await insert('INSERT INTO member_topups (org_id,store_id,member_id,receipt_no,amount,created_by) VALUES (?,?,?,?,?,?)', [orgId, storeId, m.id, `TU${Date.now()}`, amount, req.user.id]); res.json({ member: member(await getRow('SELECT * FROM members WHERE id=?', [m.id])), topup: await getRow('SELECT * FROM member_topups WHERE id=?', [id]) }); });
-router.post('/members/:id/points', requirePermission('member.points'), async (req, res) => { const { orgId, storeId } = tenant(req); const delta = Number(req.body.delta || 0); await query('UPDATE members SET points=GREATEST(0,points+?) WHERE id=? AND org_id=? AND store_id=?', [delta, req.params.id, orgId, storeId]); await insert('INSERT INTO points_ledger (org_id,store_id,member_id,delta,reason,created_by) VALUES (?,?,?,?,?,?)', [orgId, storeId, req.params.id, delta, req.body.reason || 'manual', req.user.id]); res.json(member(await getRow('SELECT * FROM members WHERE id=?', [req.params.id]))); });
-router.post('/members/:id/knock-off', requirePermission('payment.settle'), async (req, res) => { const { orgId, storeId } = tenant(req); const amount = Number(req.body.amount || 0); const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!m || amount <= 0 || amount > Number(m.credit_balance)) return res.status(400).json({ error: 'invalid amount' }); await query('UPDATE members SET credit_balance=credit_balance-? WHERE id=?', [amount, m.id]); res.json({ member: member(await getRow('SELECT * FROM members WHERE id=?', [m.id])), knockedOff: amount, receiptNo: `RV${Date.now()}` }); });
+// ================= 会员等级 Member Tier =================
+// 等级自带折扣率,属于「定价配置」而不是「会员录入」——写操作统一用 settings.edit,
+// 否则收银员(有 member.create)可以自建一个 100% 折扣的等级再把自己挂上去。
+const tierSelect = `SELECT t.*,
+    (SELECT COUNT(*) FROM members m WHERE m.tier_id = t.id) AS member_count
+  FROM member_tiers t WHERE t.org_id=? AND t.store_id=?`;
+const tierRow = (r) => ({ ...toMemberTier(r), memberCount: Number(r.member_count || 0) });
+
+router.get('/member-tiers', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query(`${tierSelect} ORDER BY t.sort_order ASC, t.id ASC`, [orgId, storeId]);
+  let list = rows.map(tierRow);
+  if (req.query.active === '1') list = list.filter((t) => t.isActive);
+  res.json(list);
+});
+
+router.get('/member-tiers/:id', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow(`${tierSelect} AND t.id=?`, [orgId, storeId, req.params.id]);
+  if (!r) return res.status(404).json({ error: 'not_found' });
+  res.json(tierRow(r));
+});
+
+router.post('/member-tiers', requirePermission('settings.edit'), async (req, res) => {
+  const b = memberTierSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const existing = await query('SELECT code FROM member_tiers WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const code = (b.code || '').trim() || makeTierCode(b.name, existing.map((r) => r.code).filter(Boolean));
+  const dup = existing.find((r) => String(r.code || '').toUpperCase() === code.toUpperCase());
+  if (dup) return res.status(400).json({ error: 'duplicate_code', code });
+  const isDefault = b.isDefault ? 1 : 0;
+  if (isDefault) await query('UPDATE member_tiers SET is_default=0 WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const id = await insert(
+    `INSERT INTO member_tiers
+       (org_id, store_id, code, name, discount_percent, min_spend, min_points, is_default, sort_order, is_active, note)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    [orgId, storeId, code, b.name, Number(b.discountPercent || 0), Number(b.minSpend || 0),
+      Number(b.minPoints || 0), isDefault, Number(b.sortOrder || 0),
+      b.isActive === false ? 0 : 1, b.note ?? null],
+  );
+  res.status(201).json(tierRow(await getRow(`${tierSelect} AND t.id=?`, [orgId, storeId, id])));
+});
+
+router.put('/member-tiers/:id', requirePermission('settings.edit'), async (req, res) => {
+  const b = memberTierUpdateSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const cur = await getRow('SELECT * FROM member_tiers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!cur) return res.status(404).json({ error: 'not_found' });
+  if (b.isDefault) await query('UPDATE member_tiers SET is_default=0 WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  await query(
+    `UPDATE member_tiers SET code=COALESCE(?,code), name=COALESCE(?,name),
+       discount_percent=COALESCE(?,discount_percent), min_spend=COALESCE(?,min_spend),
+       min_points=COALESCE(?,min_points), is_default=COALESCE(?,is_default),
+       sort_order=COALESCE(?,sort_order), is_active=COALESCE(?,is_active), note=COALESCE(?,note)
+     WHERE id=? AND org_id=? AND store_id=?`,
+    [b.code ?? null, b.name ?? null,
+      b.discountPercent == null ? null : Number(b.discountPercent),
+      b.minSpend == null ? null : Number(b.minSpend),
+      b.minPoints == null ? null : Number(b.minPoints),
+      b.isDefault == null ? null : (b.isDefault ? 1 : 0),
+      b.sortOrder == null ? null : Number(b.sortOrder),
+      b.isActive == null ? null : (b.isActive ? 1 : 0),
+      b.note ?? null, req.params.id, orgId, storeId],
+  );
+  res.json(tierRow(await getRow(`${tierSelect} AND t.id=?`, [orgId, storeId, req.params.id])));
+});
+
+router.put('/member-tiers/:id/status', requirePermission('settings.edit'), async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const active = req.body && req.body.isActive !== undefined
+    ? !!req.body.isActive
+    : !(await getRow('SELECT is_active FROM member_tiers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]))?.is_active;
+  const r = await getRow('SELECT * FROM member_tiers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not_found' });
+  await query('UPDATE member_tiers SET is_active=? WHERE id=?', [active ? 1 : 0, r.id]);
+  res.json(tierRow(await getRow(`${tierSelect} AND t.id=?`, [orgId, storeId, r.id])));
+});
+
+router.delete('/member-tiers/:id', requirePermission('settings.edit'), async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const r = await getRow('SELECT * FROM member_tiers WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!r) return res.status(404).json({ error: 'not_found' });
+  const inUse = Number((await getRow('SELECT COUNT(*) AS c FROM members WHERE tier_id=?', [r.id]))?.c || 0);
+  if (inUse) return res.status(409).json({ error: 'tier_in_use', memberCount: inUse });
+  const total = Number((await getRow('SELECT COUNT(*) AS c FROM member_tiers WHERE org_id=? AND store_id=?', [orgId, storeId]))?.c || 0);
+  if (total <= 1) return res.status(409).json({ error: 'last_tier' });
+  await query('DELETE FROM member_tiers WHERE id=?', [r.id]);
+  res.json({ ok: true, deleted: String(r.id) });
+});
+
+// ================= 会员主档 Member =================
+const memberSelect = `SELECT m.*, t.name AS tier_name, t.code AS tier_code, t.discount_percent AS tier_discount
+  FROM members m LEFT JOIN member_tiers t ON t.id = m.tier_id
+  WHERE m.org_id=? AND m.store_id=?`;
+
+async function memberDetail(orgId, storeId, id) {
+  const r = await getRow(`${memberSelect} AND m.id=?`, [orgId, storeId, id]);
+  return r ? memberRow(r) : null;
+}
+/** 会员等级折扣试算：结账与前台展示共用同一口径。 */
+function tierOfMember(tiers, m) { return resolveTier(tiers, m); }
+
+router.get('/members', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query(`${memberSelect} ORDER BY m.created_at DESC, m.id DESC`, [orgId, storeId]);
+  let list = rows.map(memberRow);
+  if (req.query.status && req.query.status !== 'all') list = list.filter((m) => m.status === req.query.status);
+  if (req.query.tierId) list = list.filter((m) => String(m.tierId) === String(req.query.tierId));
+  // lowCredit = 欠款已达/超过信用额度(余额是带符号的,负数代表欠款)
+  if (req.query.lowCredit === '1') list = list.filter((m) => m.creditLimit > 0 && -m.creditBalance >= m.creditLimit - 0.001);
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (q) list = list.filter((m) => [m.memberNo, m.name, m.phone, m.email, m.taxNo].some((f) => String(f || '').toLowerCase().includes(q)));
+  res.json(list);
+});
+
+router.get('/members/next-code', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT member_no FROM members WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  res.json({ memberNo: nextMemberNo(rows.map((r) => r.member_no)) });
+});
+
+router.post('/members', requirePermission('member.create'), async (req, res) => {
+  const b = memberSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const rows = await query('SELECT member_no FROM members WHERE org_id=? AND store_id=?', [orgId, storeId]);
+  const memberNo = (b.memberNo || '').trim() || nextMemberNo(rows.map((r) => r.member_no));
+  if (rows.some((r) => String(r.member_no || '').toUpperCase() === memberNo.toUpperCase())) {
+    return res.status(400).json({ error: 'duplicate_member_no', memberNo });
+  }
+  const tiers = await memberAdapter.listTiers(orgId, storeId);
+  const def = tiers.find((t) => t.isDefault) || tiers[0] || null;
+  const tierId = b.tierId == null || b.tierId === '' ? (def ? String(def.id) : null) : String(b.tierId);
+  if (tierId && !tiers.some((t) => String(t.id) === tierId)) return res.status(400).json({ error: 'tier_not_found' });
+  const settings = await loadSettings(orgId, storeId);
+  const creditLimit = b.creditLimit == null ? Number(settings.creditLimitDefault || 0) : Number(b.creditLimit);
+  const id = await insert(
+    `INSERT INTO members
+       (org_id, store_id, member_no, name, phone, email, address, tax_no, birthday, gender,
+        agent, term, do_no, tier_id, credit_limit, credit_balance, rebate_balance, points,
+        total_spend, points_earned_total, points_redeemed_total, joined_at, note, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,0,0,NOW(),?,?)`,
+    [orgId, storeId, memberNo, b.name, b.phone || null, b.email || null, b.address || null,
+      b.taxNo || null, b.birthday ? dtDate(b.birthday) : null, b.gender || null,
+      b.agent || null, b.term || null, b.doNo || null,
+      tierId == null ? null : Number(tierId), creditLimit,
+      b.note ?? null, b.status || 'active'],
+  );
+  res.status(201).json(await memberDetail(orgId, storeId, id));
+});
+
+router.get('/members/:id', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const m = await memberDetail(orgId, storeId, req.params.id);
+  if (!m) return res.status(404).json({ error: 'not_found' });
+  const tiers = await memberAdapter.listTiers(orgId, storeId);
+  const tier = tierOfMember(tiers, m);
+  res.json({ ...m, tier, tierDiscountPercent: tierDiscountPercent(tier) });
+});
+
+router.put('/members/:id', requirePermission('member.create'), async (req, res) => {
+  const b = memberUpdateSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const cur = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!cur) return res.status(404).json({ error: 'not_found' });
+  if (b.tierId != null && b.tierId !== '') {
+    const ok = await getRow('SELECT id FROM member_tiers WHERE id=? AND org_id=? AND store_id=?', [Number(b.tierId), orgId, storeId]);
+    if (!ok) return res.status(400).json({ error: 'tier_not_found' });
+  }
+  if (b.memberNo) {
+    const dup = await getRow('SELECT id FROM members WHERE org_id=? AND store_id=? AND UPPER(member_no)=UPPER(?) AND id<>?', [orgId, storeId, b.memberNo, cur.id]);
+    if (dup) return res.status(400).json({ error: 'duplicate_member_no', memberNo: b.memberNo });
+  }
+  await query(
+    `UPDATE members SET
+       member_no=COALESCE(?,member_no), name=COALESCE(?,name), phone=COALESCE(?,phone),
+       email=COALESCE(?,email), address=COALESCE(?,address), tax_no=COALESCE(?,tax_no),
+       birthday=COALESCE(?,birthday), gender=COALESCE(?,gender), agent=COALESCE(?,agent),
+       term=COALESCE(?,term), do_no=COALESCE(?,do_no),
+       tier_id=COALESCE(?,tier_id), credit_limit=COALESCE(?,credit_limit),
+       note=COALESCE(?,note), status=COALESCE(?,status)
+     WHERE id=? AND org_id=? AND store_id=?`,
+    [b.memberNo ?? null, b.name ?? null, b.phone ?? null,
+      b.email ?? null, b.address ?? null, b.taxNo ?? null,
+      b.birthday ? dtDate(b.birthday) : null, b.gender || null, b.agent ?? null,
+      b.term ?? null, b.doNo ?? null,
+      b.tierId == null || b.tierId === '' ? null : Number(b.tierId),
+      b.creditLimit == null ? null : Number(b.creditLimit),
+      b.note ?? null, b.status ?? null, cur.id, orgId, storeId],
+  );
+  res.json(await memberDetail(orgId, storeId, cur.id));
+});
+
+router.put('/members/:id/status', requirePermission('member.create'), async (req, res) => {
+  const b = memberStatusSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const cur = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!cur) return res.status(404).json({ error: 'not_found' });
+  await query('UPDATE members SET status=? WHERE id=?', [b.status, cur.id]);
+  res.json(await memberDetail(orgId, storeId, cur.id));
+});
+
+router.put('/members/:id/tier', requirePermission('member.create'), async (req, res) => {
+  const b = memberTierAssignSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const cur = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!cur) return res.status(404).json({ error: 'not_found' });
+  if (b.tierId == null || b.tierId === '') return res.status(400).json({ error: 'tier_required' });
+  const t = await getRow('SELECT * FROM member_tiers WHERE id=? AND org_id=? AND store_id=?', [Number(b.tierId), orgId, storeId]);
+  if (!t) return res.status(400).json({ error: 'tier_not_found' });
+  await query('UPDATE members SET tier_id=? WHERE id=?', [t.id, cur.id]);
+  res.json(await memberDetail(orgId, storeId, cur.id));
+});
+
+router.delete('/members/:id', requirePermission('member.create'), async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const cur = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!cur) return res.status(404).json({ error: 'not_found' });
+  // 有账务往来的会员不允许删除 —— 删掉会让历史订单/流水指向空会员,审计链断裂
+  const counts = {
+    orders: Number((await getRow('SELECT COUNT(*) AS c FROM orders WHERE member_id=?', [cur.id]))?.c || 0),
+    topups: Number((await getRow('SELECT COUNT(*) AS c FROM member_topups WHERE member_id=?', [cur.id]))?.c || 0),
+    points: Number((await getRow('SELECT COUNT(*) AS c FROM points_ledger WHERE member_id=?', [cur.id]))?.c || 0),
+    rebates: Number((await getRow('SELECT COUNT(*) AS c FROM rebates WHERE member_id=?', [cur.id]))?.c || 0),
+    vouchers: Number((await getRow('SELECT COUNT(*) AS c FROM vouchers WHERE issued_to_member_id=?', [cur.id]))?.c || 0),
+  };
+  const total = Object.values(counts).reduce((s, n) => s + n, 0);
+  if (total > 0) return res.status(409).json({ error: 'member_has_transactions', counts, hint: 'set status=inactive instead' });
+  await query('DELETE FROM members WHERE id=?', [cur.id]);
+  res.json({ ok: true, deleted: String(cur.id) });
+});
+
+// ---- 会员对账单 / 流水 / 历史订单 ----
+async function memberStatementInputs(orgId, storeId, memberId) {
+  const [creditRows, pointRows, rebateRows] = await Promise.all([
+    query('SELECT * FROM member_topups WHERE org_id=? AND store_id=? AND member_id=? ORDER BY created_at ASC, id ASC', [orgId, storeId, memberId]),
+    query('SELECT * FROM points_ledger WHERE org_id=? AND store_id=? AND member_id=? ORDER BY created_at ASC, id ASC', [orgId, storeId, memberId]),
+    query('SELECT * FROM rebates WHERE org_id=? AND store_id=? AND member_id=? ORDER BY created_at ASC, id ASC', [orgId, storeId, memberId]),
+  ]);
+  return {
+    credit: creditRows.map(toMemberTopup),
+    points: pointRows.map(toPointsLedger),
+    rebate: rebateRows.map((r) => ({
+      id: r.id, createdAt: dt(r.created_at), type: r.type, amount: Number(r.amount || 0),
+      orderNo: r.order_no || null, reason: r.reason || null,
+      createdByName: r.created_by_name || null,
+    })),
+  };
+}
+
+router.get('/members/:id/statement', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const m = await memberDetail(orgId, storeId, req.params.id);
+  if (!m) return res.status(404).json({ error: 'not_found' });
+  const inputs = await memberStatementInputs(orgId, storeId, m.id);
+  const events = statementEvents(inputs);
+  const { opening, within } = sliceStatement(events, req.query.from || null, req.query.to || null);
+  const st = runStatement(within, opening);
+  const orders = await query(
+    'SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS amount FROM orders WHERE org_id=? AND store_id=? AND member_id=? AND status=?',
+    [orgId, storeId, m.id, 'paid'],
+  );
+  res.json({
+    member: m,
+    period: { from: req.query.from || null, to: req.query.to || null },
+    ...st,
+    summary: {
+      paidOrders: Number(orders[0]?.c || 0),
+      paidAmount: Number(orders[0]?.amount || 0),
+      creditBalance: m.creditBalance,
+      rebateBalance: m.rebateBalance,
+      points: m.points,
+      totalSpend: m.totalSpend,
+    },
+  });
+});
+
+router.get('/members/:id/ledger', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const m = await memberDetail(orgId, storeId, req.params.id);
+  if (!m) return res.status(404).json({ error: 'not_found' });
+  const inputs = await memberStatementInputs(orgId, storeId, m.id);
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 500)));
+  res.json({
+    member: m,
+    credit: inputs.credit.slice(-limit).reverse(),
+    points: inputs.points.slice(-limit).reverse(),
+    rebates: inputs.rebate.slice(-limit).reverse(),
+    totals: {
+      creditBalance: m.creditBalance, rebateBalance: m.rebateBalance, points: m.points,
+      pointsEarnedTotal: m.pointsEarnedTotal, pointsRedeemedTotal: m.pointsRedeemedTotal,
+      totalSpend: m.totalSpend,
+    },
+  });
+});
+
+router.get('/members/:id/orders', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const m = await getRow('SELECT * FROM members WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
+  if (!m) return res.status(404).json({ error: 'not_found' });
+  let rows = await query(
+    'SELECT * FROM orders WHERE org_id=? AND store_id=? AND member_id=? ORDER BY created_at DESC, id DESC LIMIT 500',
+    [orgId, storeId, m.id],
+  );
+  if (req.query.status && req.query.status !== 'all') rows = rows.filter((o) => o.status === req.query.status);
+  res.json(rows.map(toOrder));
+});
+
+router.get('/members/:id/topups', async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const rows = await query(
+    'SELECT * FROM member_topups WHERE org_id=? AND store_id=? AND member_id=? ORDER BY created_at DESC, id DESC',
+    [orgId, storeId, req.params.id],
+  );
+  res.json(rows.map(toMemberTopup));
+});
+
+// ---- 储值充值 / 赊账核销 / 积分调整（统一走 memberEngine，保证原子性） ----
+router.post('/members/:id/top-up', requirePermission('member.topup'), async (req, res) => {
+  const b = memberTopupSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const r = await applyCredit(memberAdapter, [{
+    memberId: req.params.id, amount: Number(b.amount), type: 'topup',
+    method: b.method || 'cash', note: b.note || null,
+    receiptNo: (b.receiptNo || '').trim() || `TU${Date.now()}`,
+  }], { orgId, storeId, createdBy: req.user.id, createdByName: req.user.name || null });
+  if (!r.ok) return res.status(400).json({ error: r.errors[0].code, errors: r.errors });
+  const topup = await getRow('SELECT * FROM member_topups WHERE id=?', [Number(r.entries[0].id)]);
+  res.json({ member: await memberDetail(orgId, storeId, req.params.id), topup: toMemberTopup(topup) });
+});
+
+router.post('/members/:id/knock-off', requirePermission('payment.settle'), async (req, res) => {
+  const b = memberKnockoffSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const r = await applyCredit(memberAdapter, [{
+    memberId: req.params.id, amount: -Number(b.amount), type: 'knockoff',
+    method: b.method || 'cash', note: b.note || null,
+    receiptNo: (b.receiptNo || '').trim() || `KO${Date.now()}`,
+  }], { orgId, storeId, createdBy: req.user.id, createdByName: req.user.name || null });
+  if (!r.ok) return res.status(400).json({ error: r.errors[0].code, errors: r.errors });
+  const row = await getRow('SELECT * FROM member_topups WHERE id=?', [Number(r.entries[0].id)]);
+  res.json({
+    member: await memberDetail(orgId, storeId, req.params.id),
+    knockedOff: Number(b.amount),
+    receiptNo: row.receipt_no,
+    entry: toMemberTopup(row),
+  });
+});
+
+router.post('/members/:id/points', requirePermission('member.points'), async (req, res) => {
+  const b = memberPointsSchema.parse(req.body || {});
+  const { orgId, storeId } = tenant(req);
+  const r = await applyPoints(memberAdapter, [{
+    memberId: req.params.id, delta: Number(b.delta),
+    type: b.type || (Number(b.delta) > 0 ? 'bonus' : 'adjust'),
+    reason: b.reason || 'manual adjustment',
+    refType: b.refType || null, refNo: b.refNo || null,
+  }], { orgId, storeId, createdBy: req.user.id, createdByName: req.user.name || null });
+  if (!r.ok) return res.status(400).json({ error: r.errors[0].code, errors: r.errors });
+  const entry = await getRow('SELECT * FROM points_ledger WHERE id=?', [Number(r.entries[0].id)]);
+  res.json({ member: await memberDetail(orgId, storeId, req.params.id), entry: toPointsLedger(entry) });
+});
 
 // ================= 礼券 Gift Voucher =================
 // 注意：字面量路由必须排在 /:id 之前

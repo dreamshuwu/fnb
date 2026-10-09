@@ -275,6 +275,33 @@ body { margin: 0; background: #f4f6fb; }
 .perm-table .ops-row:not(.ops-head):not(.perm-group-row):hover { background: #fbfcfe; }
 
 /* ---------------------------------------------------------------------------
+   会员体系(Member Accounts / Tiers / Statement / Ledger)
+   --------------------------------------------------------------------------- */
+/* 会员列表:编号 / 姓名 / 等级 / 储值(含欠款) / 积分 / 累计消费 / 状态 / 操作 */
+.member-table .ops-row { grid-template-columns: 92px minmax(150px, 1.2fr) 132px 176px 76px 108px 76px 152px; }
+/* 三本账(对账单 / 积分 / 储值)共用同一套列宽:日期 / 类型 / 说明 / 单号 / 借 / 贷 / 余额 / 经办 */
+.member-ledger .ops-row { grid-template-columns: 142px 92px minmax(150px, 1.3fr) 108px 84px 84px 96px 104px; }
+.member-tier-table .ops-row { grid-template-columns: 96px minmax(150px, 1.2fr) 80px 96px 86px 60px 76px 74px 178px; }
+.member-table .ops-row span, .member-ledger .ops-row span, .member-tier-table .ops-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-table .ops-row .ops-inline-actions, .member-tier-table .ops-row .ops-inline-actions { overflow: visible; }
+.member-sub { display: block; color: #a3adbc; font-size: 9px; font-weight: 500; }
+.member-owed { color: #c84e3d; font-size: 10px; font-weight: 700; }
+.member-pos { color: #237b5c; font-weight: 700; }
+.member-neg { color: #c84e3d; font-weight: 700; }
+.member-tier { display: inline-block; padding: 2px 7px; border-radius: 20px; color: #b45309; background: #fdf0dd; font-size: 10px; font-weight: 700; }
+.member-default { color: #35bd88; font-size: 9px; font-weight: 700; }
+.member-blocked { color: #b1452f; font-weight: 700; }
+.member-alert { margin: 0 0 14px; padding: 11px 14px; border-left: 3px solid #fb6b53; border-radius: 0 9px 9px 0; color: #a4543f; background: #fff5f2; font-size: 11px; }
+.member-ledger-tag { display: inline-block; padding: 2px 6px; border-radius: 6px; font-size: 9px; font-weight: 700; text-transform: capitalize; }
+.member-ledger-tag.credit { color: #1d6fa5; background: #e5f1fa; }
+.member-ledger-tag.rebate { color: #7c3aed; background: #f1e9fe; }
+.member-ledger-tag.points { color: #0f766e; background: #e0f5f2; }
+/* 收银端:会员选择行(等级/额度)与结账弹窗里的会员提示条 */
+.recall-member { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.recall-member small { display: block; }
+.payment-member-note { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; padding: 9px 11px; border-radius: 8px; color: #66748a; background: #f7f9fc; font-size: 11px; }
+
+/* ---------------------------------------------------------------------------
    登录页 PIN 快捷登录 + 桌面 Account(改密 / PIN / 换班)
    --------------------------------------------------------------------------- */
 .login-mode-switch { display: flex; gap: 6px; padding: 8px 10px 0; }
