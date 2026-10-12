@@ -6,12 +6,33 @@ import { getReport } from './reportCatalog.js';
 import { movementLabel } from './inventoryEngine.js';
 // 价目解析与后台 /menu/price-matrix 共用同一份规则,报表与界面不会各算一套
 import { resolveVariantPrice, buildPriceMap, defaultLevelCode, normCode } from './priceEngine.js';
+// 期间对比(块⑪):期间解析 / 环比同比 / 分桶对齐全部收敛在 periodEngine,
+// 报表、导出与前端面板共用同一份规则,不可能出现「界面一套、导出另一套」。
+import {
+  resolvePeriod, comparePeriod, summarizePeriod, compareMetrics, compareCategories,
+  alignSeries, bucketize, salesOrders, dayKeyOf, TREND_LABEL,
+} from './periodEngine.js';
 
 const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
 const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
 const round4 = (n) => Math.round(Number(n || 0) * 10000) / 10000;
 const dayKey = (d) => String(d || '').slice(0, 10);
 const monthKey = (d) => String(d || '').slice(0, 7);
+
+/**
+ * 期间报表的「本期」:显式给了 from/to 就用它(periodEngine 会推断日历锚点,
+ * 让 3/1~3/31 的上期落到整个 2 月),否则默认本月。
+ */
+function periodFromRange(range) {
+  if (!range.from && !range.to) return resolvePeriod('this_month');
+  return resolvePeriod('custom', { from: range.from || range.to, to: range.to || range.from });
+}
+
+/** 订单是否落在期间内。日期都是 'YYYY-MM-DD',字符串比较即为日期比较。 */
+const inPeriod = (o, p) => {
+  const d = dayKeyOf(o.createdAt);
+  return !!d && d >= p.from && d <= p.to;
+};
 
 /** 礼券的有效状态:过期按 expiresAt 惰性判定,与 /vouchers 接口口径一致。 */
 function voucherEffectiveStatus(v) {
@@ -73,6 +94,16 @@ const TOTAL_COLUMN = {
   inventory_valuation: 'value', stock_movement_ledger: 'amount', stock_transfer_log: 'amount',
   purchase_by_item: 'amount', goods_received: 'amount', cost_variance: 'varianceAmount',
   cashier_performance: 'total', day_end_history: 'countedCash',
+  period_sales: 'current', period_category: 'amount',
+};
+
+/**
+ * 少数报表不能靠「把某一列加起来」得到合计。
+ * 指标对比表的每一行是**不同量纲**的指标(净销售 / 订单数 / 客单价),
+ * 相加毫无意义 —— 直接取「净销售」那一行的本期值作为顶部 KPI。
+ */
+const CUSTOM_TOTAL = {
+  period_comparison: (rows) => Number((rows.find((r) => r.key === 'net') || {}).current || 0),
 };
 
 /**
@@ -88,7 +119,9 @@ export function runReport(type, ds, opts = {}) {
   const inRange = makeFilter(from, to);
   const rows = computeRows(type, ds, inRange, { from, to });
   const totalKey = TOTAL_COLUMN[type];
-  const total = totalKey ? round2(rows.reduce((s, r) => s + Number(r[totalKey] || 0), 0)) : 0;
+  const total = CUSTOM_TOTAL[type]
+    ? round2(CUSTOM_TOTAL[type](rows))
+    : totalKey ? round2(rows.reduce((s, r) => s + Number(r[totalKey] || 0), 0)) : 0;
   return { type, rows, total, count: rows.length, from, to };
 }
 
@@ -655,6 +688,41 @@ function computeRows(type, ds, inRange, range) {
         date: d.date, expectedCash: round2(d.expectedCash), countedCash: round2(d.countedCash),
         difference: round2(d.difference), closedAt: d.closedAt,
       }));
+
+    // ---------------------------------------------------------- Period 期间对比
+    // 注意:这里**不能**用上面那个 inRange(它已经按 from/to 过滤过 paid),
+    // 因为上期数据落在区间之外,必须拿全量订单自己按期间取。
+    case 'period_sales': {
+      const period = periodFromRange(range);
+      const prev = comparePeriod(period, 'prev');
+      const all = salesOrders(orders);
+      const cur = all.filter((o) => inPeriod(o, period));
+      const pr = all.filter((o) => inPeriod(o, prev));
+      return alignSeries(
+        bucketize(cur, period.from, period.to, period.grain),
+        bucketize(pr, prev.from, prev.to, period.grain),
+        'net',
+      ).map((r) => ({ ...r, bucket: r.index, trend: TREND_LABEL[r.direction] }));
+    }
+    case 'period_comparison': {
+      const period = periodFromRange(range);
+      const prev = comparePeriod(period, 'prev');
+      const all = salesOrders(orders);
+      return compareMetrics(
+        summarizePeriod(all.filter((o) => inPeriod(o, period))),
+        summarizePeriod(all.filter((o) => inPeriod(o, prev))),
+      ).map((m) => ({ ...m, trend: TREND_LABEL[m.direction] }));
+    }
+    case 'period_category': {
+      const period = periodFromRange(range);
+      const prev = comparePeriod(period, 'prev');
+      const all = salesOrders(orders);
+      return compareCategories(
+        all.filter((o) => inPeriod(o, period)),
+        all.filter((o) => inPeriod(o, prev)),
+        'category',
+      ).map((r) => ({ ...r, trend: TREND_LABEL[r.direction] }));
+    }
 
     default:
       return paid.map((o) => ({

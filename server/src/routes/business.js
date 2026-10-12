@@ -10,6 +10,8 @@ import {
 import { authenticate, tenant, requirePermission } from '../middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from '../reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from '../reportEngine.js';
+// 期间对比(块⑪):载荷组装 / 分节取行 / 列定义全部复用共享模块
+import { periodReportPayload, periodSectionRows, periodSectionReport, PERIOD_SECTION_KEYS } from '../periodEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from '../exporters.js';
 // 产品主档拼装(含主分组/部门继承回落)与后台 /menu/products 共用同一份规则
 import { buildProducts } from '../productMaster.js';
@@ -933,6 +935,27 @@ router.get('/reports/query', requirePermission('report.view'), async (req, res) 
   res.json(runReport(req.query.type || 'sales_by_date', ds, { from: req.query.from, to: req.query.to }));
 });
 
+/**
+ * 统一的导出出口:CSV / Excel(xlsx) / 打印页(浏览器另存为 PDF)。
+ * 通用报表与期间报表共用,避免两条导出路径各写一份、日久漂移。
+ */
+function sendReportExport(res, { format, fileBase, title, subtitle, columns, rows, meta, csvMeta }) {
+  if (format === 'xlsx' || format === 'excel') {
+    const buf = buildXlsx(title, columns, rows, { title, subtitle });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.xlsx"`);
+    return res.end(buf);
+  }
+  if (format === 'html' || format === 'pdf') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.end(buildPrintHtml({ title, subtitle, columns, rows, meta }));
+  }
+  const csv = buildCsv(columns, rows, csvMeta);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
+  return res.end(csv);
+}
+
 router.get('/reports/export', requirePermission('report.export'), async (req, res) => {
   const { orgId, storeId } = tenant(req);
   const type = req.query.type || 'sales_by_date';
@@ -946,21 +969,51 @@ router.get('/reports/export', requirePermission('report.export'), async (req, re
   const rangeLabel = from || to ? `${from || '...'} → ${to || '...'}` : 'All dates';
   const meta = [['Report', title], ['Period', rangeLabel], ['Store', ds.settings.companyName || '-'], ['Rows', result.rows.length]];
   const fileBase = `${type}_${new Date().toISOString().slice(0, 10)}`;
+  sendReportExport(res, {
+    format, fileBase, title,
+    subtitle: `${rangeLabel} · ${ds.settings.companyName || ''}`,
+    columns, rows: result.rows, meta,
+    csvMeta: { Report: title, Period: rangeLabel, Store: ds.settings.companyName || '' },
+  });
+});
 
-  if (format === 'xlsx' || format === 'excel') {
-    const buf = buildXlsx(title, columns, result.rows, { title, subtitle: rangeLabel });
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.xlsx"`);
-    return res.end(buf);
-  }
-  if (format === 'html' || format === 'pdf') {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.end(buildPrintHtml({ title, subtitle: `${rangeLabel} · ${ds.settings.companyName || ''}`, columns, rows: result.rows, meta }));
-  }
-  const csv = buildCsv(columns, result.rows, { Report: title, Period: rangeLabel, Store: ds.settings.companyName || '' });
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
-  res.end(csv);
+// ---- 期间对比(块⑪):预设期间 / 环比·同比 / 日周月分桶 ----
+// 期间解析与上期推导全在 periodEngine,前端面板与导出走的是同一份数字。
+router.get('/reports/period', requirePermission('report.view'), async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const ds = await buildReportDataset(orgId, storeId);
+  res.json(periodReportPayload(ds.orders || [], req.query));
+});
+
+router.get('/reports/period/export', requirePermission('report.export'), async (req, res) => {
+  const { orgId, storeId } = tenant(req);
+  const ds = await buildReportDataset(orgId, storeId);
+  const payload = periodReportPayload(ds.orders || [], req.query);
+  const section = PERIOD_SECTION_KEYS.includes(req.query.section) ? req.query.section : 'metrics';
+  const type = periodSectionReport(section);
+  const rows = periodSectionRows(payload, section);
+  const columns = reportColumns(type, rows);
+  const title = reportTitle(type);
+  const thisLabel = `${payload.period.from} → ${payload.period.to}`;
+  const cmpLabel = `${payload.previous.from} → ${payload.previous.to}`;
+  const cmpName = payload.compare === 'yoy' ? 'Last Year 去年同期' : 'Prev Period 上期';
+  const format = String(req.query.format || 'csv').toLowerCase();
+  const meta = [
+    ['Report', title],
+    ['This Period 本期', thisLabel],
+    [cmpName, cmpLabel],
+    ['Grain 粒度', payload.grain],
+    ['Store', ds.settings.companyName || '-'],
+    ['Rows', rows.length],
+  ];
+  sendReportExport(res, {
+    format,
+    fileBase: `period_${section}_${payload.period.from}_${payload.period.to}`,
+    title,
+    subtitle: `${thisLabel} vs ${cmpLabel} · ${ds.settings.companyName || ''}`,
+    columns, rows, meta,
+    csvMeta: { Report: title, 'This Period': thisLabel, [cmpName]: cmpLabel, Store: ds.settings.companyName || '' },
+  });
 });
 
 

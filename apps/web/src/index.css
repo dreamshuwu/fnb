@@ -378,3 +378,72 @@ body { margin: 0; background: #f4f6fb; }
 /* 收银端价格级别:会改变成交价,所以用琥珀色让它显眼一点 */
 .cashier-pricelevel select { color: #96690f; border-color: #f0dcae; background: #fdf7ec; font-weight: 750; }
 .cashier-pricelevel select:disabled { color: #a3adbc; border-color: #e1e6ef; background: #f2f5fa; }
+
+/* ---------------------------------------------------------------------------
+   期间对比(块⑪):预设期间 / 环比·同比 / 日周月分桶 / 双线趋势
+   涨跌配色按中国市场惯例(涨红跌绿);discount 这类 inverse 指标走中性灰,
+   因为「折扣涨了」既不是好事也不是坏事,给红/绿都会被误读。
+   --------------------------------------------------------------------------- */
+/* 页签加到 13 个后在 1180 内容宽里放不下一行 —— 换行比横向滚动好,
+   否则新增的页签会被藏在右侧看不见(原来的 overflow-x:auto 就是这么来的)。 */
+.operations-tabs { flex-wrap: wrap; overflow-x: visible; }
+.period-seg { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 13px; }
+.period-seg-label { margin-right: 3px; color: #a3adbc; font-size: 10px; font-weight: 800; letter-spacing: .5px; }
+.period-seg button { min-height: 33px; padding: 0 12px; border: 1px solid #e1e6ef; border-radius: 9px; color: #728097; background: #fff; font-size: 11px; font-weight: 700; }
+.period-seg button:hover { color: #fb6b53; border-color: #ffc9bd; }
+.period-seg button.active { color: #fff; border-color: #fb6b53; background: #fb6b53; box-shadow: 0 6px 14px rgba(251,107,83,.16); }
+
+.period-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 11px; margin-bottom: 15px; }
+
+.period-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; padding: 14px 16px; margin-bottom: 15px; border: 1px solid #e6eaf2; border-radius: 13px; background: #fafbfc; }
+.period-head h3 { margin: 0 0 5px; color: #172033; font-size: 16px; }
+.period-head p { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; color: #8b97aa; font-size: 11px; }
+.period-vs { color: #7e8ba1; font-size: 11px; text-align: right; }
+.period-vs b { display: block; margin-bottom: 5px; color: #25324a; font-size: 12px; }
+.period-tag { display: inline-block; margin-left: 7px; padding: 3px 8px; border-radius: 20px; font-size: 9px; font-weight: 800; }
+.period-tag.complete { color: #237b5c; background: #e9f8f2; }
+.period-tag.running { color: #8a6d18; background: #fff8df; }
+.period-warn { padding: 3px 8px; border-radius: 20px; color: #8a6d18; background: #fff8df; font-size: 10px; font-weight: 750; }
+
+.period-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(186px, 1fr)); gap: 11px; margin-bottom: 4px; }
+.period-card { padding: 13px 14px; border: 1px solid #e6eaf2; border-left: 3px solid #cbd3e0; border-radius: 12px; background: #fff; }
+.period-card.up { border-left-color: #e04e3d; }
+.period-card.down { border-left-color: #35bd88; }
+.period-card > small { display: block; margin-bottom: 7px; color: #8b97aa; font-size: 10px; font-weight: 700; }
+.period-card > strong { display: block; color: #172033; font-size: 21px; letter-spacing: -.6px; }
+.period-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 9px; }
+.period-card-foot em { color: #a3adbc; font-size: 10px; font-style: normal; }
+
+.period-badge { display: inline-block; padding: 3px 8px; border-radius: 20px; font-size: 10px; font-weight: 800; white-space: nowrap; }
+.period-badge.up { color: #b1452f; background: #fdeceb; }
+.period-badge.down { color: #237b5c; background: #e9f8f2; }
+.period-badge.flat { color: #7e8ba1; background: #eef1f6; }
+.period-delta.up { color: #b1452f; font-weight: 700; }
+.period-delta.down { color: #237b5c; font-weight: 700; }
+
+.period-chart { padding: 15px 16px 13px; border: 1px solid #e6eaf2; border-radius: 13px; background: #fff; }
+.period-chart-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-bottom: 8px; color: #7e8ba1; font-size: 11px; }
+.period-chart-legend span { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; }
+.period-chart-legend small { margin-left: auto; color: #a3adbc; font-size: 10px; font-weight: 500; }
+.period-chart-legend .swatch { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
+.period-chart-legend .swatch.this { background: #fb6b53; }
+.period-chart-legend .swatch.prev { background: #9aa4b5; }
+.period-svg { display: block; width: 100%; height: auto; }
+.period-axis { fill: #a3adbc; font-size: 10px; font-weight: 600; }
+.period-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 15px; margin-top: 9px; padding: 10px 13px; border-radius: 10px; background: #f7f9fc; color: #7e8ba1; font-size: 11px; }
+.period-readout b { color: #172033; font-size: 13px; }
+.period-readout strong { color: #25324a; }
+.period-readout .period-badge { margin-left: auto; }
+
+.period-hint { margin: 15px 0 0; padding: 11px 14px; border-left: 3px solid #fb6b53; border-radius: 0 9px 9px 0; color: #7e8ba1; background: #f7f9fc; font-size: 11px; line-height: 1.75; }
+.period-hint b { color: #25324a; }
+/* 桶数不等(9 月 30 天 vs 8 月 31 天)时如实说明,别让用户以为最后一天没营业 */
+.period-note { margin-top: 10px; padding: 9px 13px; border-radius: 9px; color: #7e8ba1; background: #fff8df; font-size: 11px; line-height: 1.7; }
+
+/* 分类对比:名称下挂一条相对份额条,一眼看出哪类在扛营业额 */
+.period-cat-table .ops-row { grid-template-columns: minmax(150px, 1.6fr) 78px 78px 108px 108px 106px 84px 78px; min-height: 46px; }
+.period-cat-name { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.period-cat-name b { overflow: hidden; color: #25324a; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.period-share { display: block; max-width: 118px; height: 4px; border-radius: 2px; background: #eef1f6; }
+.period-share i { display: block; height: 100%; border-radius: 2px; background: #fb6b53; }
+.period-cat-table .ops-row.ops-head { min-height: 36px; }

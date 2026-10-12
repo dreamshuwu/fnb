@@ -18,11 +18,12 @@ const htmlEsc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;'
  */
 export function cellValue(raw, kind) {
   if (raw == null || raw === '') return '';
-  if (kind === 'money' || kind === 'int' || kind === 'qty') {
+  if (kind === 'money' || kind === 'int' || kind === 'qty' || kind === 'percent' || kind === 'num') {
     const n = Number(raw);
     if (Number.isFinite(n)) {
       if (kind === 'money') return Math.round(n * 100) / 100;
       if (kind === 'qty') return Math.round(n * 1000) / 1000;
+      if (kind === 'percent' || kind === 'num') return Math.round(n * 100) / 100;
       return Math.round(n);
     }
   }
@@ -31,9 +32,14 @@ export function cellValue(raw, kind) {
 
 /** 展示用字符串(CSV / HTML 表格共用)。 */
 export function displayValue(raw, kind) {
+  // 增幅无定义(上期为 0)时必须显示 N/A —— 显示成 0% 等于把「无法比较」说成「没有变化」。
+  if (kind === 'percent' && (raw == null || raw === '')) return 'N/A';
   const v = cellValue(raw, kind);
   if (v === '') return '';
   if (kind === 'money') return Number(v).toFixed(2);
+  if (kind === 'percent') return `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+  // num:同一列可能既是金额又是计数(指标对比表),整数不带小数、有小数才留两位
+  if (kind === 'num') return Number.isInteger(Number(v)) ? String(Number(v)) : Number(v).toFixed(2);
   // 数量去掉无意义的尾随零:12.5 而不是 12.500,3 而不是 3.000
   if (kind === 'qty') return String(Number(v));
   if (kind === 'date') {
@@ -230,6 +236,9 @@ export function buildXlsx(sheetName, columns, rows, meta = {}) {
       if (kind === 'money') return numberCell(ref, 3, Number(val));
       if (kind === 'int') return numberCell(ref, 4, Number(val));
       if (kind === 'qty') return numberCell(ref, 5, Number(val));
+      // 增幅带 +/- 符号,写成文本才不会被 Excel 当成普通数字丢掉符号与百分号
+      if (kind === 'percent') return inlineStrCell(ref, 0, displayValue(row[c.key], kind));
+      if (kind === 'num') return numberCell(ref, 3, Number(val));
       if (kind === 'date') return inlineStrCell(ref, 0, displayValue(row[c.key], kind));
       return inlineStrCell(ref, 0, String(val));
     });
@@ -270,12 +279,12 @@ export function buildPrintHtml({ title, subtitle, columns, rows, meta = [], tota
   const head = columns.map((c) => `<th>${htmlEsc(c.label)}</th>`).join('');
   const body = rows.map((r) => `<tr>${columns.map((c) => {
     const kind = c.kind;
-    const cls = kind === 'money' || kind === 'int' || kind === 'qty' ? 'num' : '';
+    const cls = kind === 'money' || kind === 'int' || kind === 'qty' || kind === 'percent' ? 'num' : '';
     return `<td class="${cls}">${htmlEsc(displayValue(r[c.key], kind))}</td>`;
   }).join('')}</tr>`).join('');
   const metaHtml = meta.map(([k, v]) => `<div><span>${htmlEsc(k)}</span><b>${htmlEsc(v)}</b></div>`).join('');
   const totalHtml = totals
-    ? `<tfoot><tr>${columns.map((c, i) => `<td class="${c.kind === 'money' || c.kind === 'int' || c.kind === 'qty' ? 'num' : ''}">${i === 0 ? htmlEsc(totals.label || 'TOTAL') : htmlEsc(totals.values?.[c.key] ?? '')}</td>`).join('')}</tr></tfoot>`
+    ? `<tfoot><tr>${columns.map((c, i) => `<td class="${c.kind === 'money' || c.kind === 'int' || c.kind === 'qty' || c.kind === 'percent' ? 'num' : ''}">${i === 0 ? htmlEsc(totals.label || 'TOTAL') : htmlEsc(totals.values?.[c.key] ?? '')}</td>`).join('')}</tr></tfoot>`
     : '';
 
   return `<!DOCTYPE html>

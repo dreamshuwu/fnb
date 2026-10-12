@@ -6,7 +6,7 @@ import { useAuth } from '../auth/AuthContext.jsx';
 const TABS = [
   ['members', 'Members'], ['member-tiers', 'Member Tiers'], ['finance', 'Cash / Vouchers'], ['voids', 'Void Approval'], ['refunds', 'Refunds'],
   ['reprint', 'Reprint / Unsettle'], ['attendance', 'Attendance'], ['shifts', 'Close Shift'], ['day-end', 'Day End'],
-  ['suppliers', 'Suppliers'], ['purchases', 'Purchase / GRN'], ['reports', 'Reports'],
+  ['suppliers', 'Suppliers'], ['purchases', 'Purchase / GRN'], ['reports', 'Reports'], ['period', 'Period Compare'],
 ];
 
 const REPRINT_TYPES = [
@@ -22,7 +22,7 @@ export default function OperationsPage() {
   const [params, setParams] = useSearchParams();
   const tab = params.get('tab') || 'members';
   const active = TABS.some(([key]) => key === tab) ? tab : 'members';
-  return <div className="operations-page"><div className="operations-heading"><div><div className="modern-eyebrow">SMPOS / BACK OFFICE</div><h1>Operations Center</h1><p>会员、财务、取消审批、退款、班结、采购和报表</p></div><div className="operations-date">{new Date().toLocaleDateString('en-GB')}</div></div><div className="operations-tabs">{TABS.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div><div className="operations-content">{active === 'members' && <MembersPanel />} {active === 'member-tiers' && <MemberTiersPanel />} {active === 'finance' && <FinancePanel />} {active === 'voids' && <VoidPanel />} {active === 'refunds' && <RefundPanel />} {active === 'reprint' && <ReprintPanel />} {active === 'attendance' && <AttendancePanel />} {active === 'shifts' && <ShiftPanel />} {active === 'day-end' && <DayEndPanel />} {active === 'suppliers' && <SupplierPanel />} {active === 'purchases' && <PurchasePanel />} {active === 'reports' && <ReportPanel />}</div></div>;
+  return <div className="operations-page"><div className="operations-heading"><div><div className="modern-eyebrow">SMPOS / BACK OFFICE</div><h1>Operations Center</h1><p>会员、财务、取消审批、退款、班结、采购和报表</p></div><div className="operations-date">{new Date().toLocaleDateString('en-GB')}</div></div><div className="operations-tabs">{TABS.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setParams({ tab: key })}>{label}</button>)}</div><div className="operations-content">{active === 'members' && <MembersPanel />} {active === 'member-tiers' && <MemberTiersPanel />} {active === 'finance' && <FinancePanel />} {active === 'voids' && <VoidPanel />} {active === 'refunds' && <RefundPanel />} {active === 'reprint' && <ReprintPanel />} {active === 'attendance' && <AttendancePanel />} {active === 'shifts' && <ShiftPanel />} {active === 'day-end' && <DayEndPanel />} {active === 'suppliers' && <SupplierPanel />} {active === 'purchases' && <PurchasePanel />} {active === 'reports' && <ReportPanel />} {active === 'period' && <PeriodPanel />}</div></div>;
 }
 
 function Panel({ title, subtitle, children }) { return <section className="ops-panel"><div className="ops-panel-heading"><div><h2>{title}</h2><p>{subtitle}</p></div></div>{children}</section>; }
@@ -1014,6 +1014,315 @@ function ReportPanel() {
           </span>
         </div>)}
         {!templates.length && <Empty text="No saved templates yet" />}
+      </div>
+    </Panel>
+  </>;
+}
+
+// ---------------------------------------------------------------- 期间对比(块⑪)
+// 期间解析、上期推导、分桶口径全部由服务端 periodEngine 计算 —— 前端一行日期运算都不写,
+// 这样「屏幕上看到的增幅」和「导出的 CSV / Excel」永远是同一份数字。
+const PERIOD_TREND_ICON = { up: '▲', down: '▼', flat: '—' };
+// 与后端 TREND_LABEL 同一套文案:表格与导出的 CSV 读起来一致
+const PERIOD_TREND_TEXT = { up: 'Rise', down: 'Fall', flat: 'Flat' };
+
+// 下面的兜底列表只在首次请求返回前用一帧;服务端返回 options 后一律以服务端为准,
+// 免得预设改名后前端还留着一份过期的文案。
+const PERIOD_PRESET_FALLBACK = [
+  ['today', 'Today 今天'], ['yesterday', 'Yesterday 昨天'],
+  ['this_week', 'This Week 本周'], ['last_week', 'Last Week 上周'],
+  ['this_month', 'This Month 本月'], ['last_month', 'Last Month 上月'],
+  ['this_quarter', 'This Quarter 本季'], ['last_quarter', 'Last Quarter 上季'],
+  ['this_year', 'This Year 本年'], ['last_year', 'Last Year 去年'],
+  ['custom', 'Custom 自定义'],
+];
+const PERIOD_GRAIN_FALLBACK = [['day', 'Day 日'], ['week', 'Week 周'], ['month', 'Month 月']];
+const PERIOD_COMPARE_FALLBACK = [['prev', 'Previous Period 环比'], ['yoy', 'Same Period Last Year 同比']];
+const PERIOD_SECTION_FALLBACK = [
+  ['metrics', 'Metrics 指标对比'], ['series', 'Trend 趋势'], ['categories', 'Categories 分类对比'],
+];
+
+// 带符号金额:¥ 必须写在符号之后 —— money2(-5.62) 会拼出「¥-5.62」这种别扭的写法。
+const signedMoney = (n, alwaysSign = false) => {
+  const v = Number(n || 0);
+  const sign = v > 0 ? (alwaysSign ? '+' : '') : v < 0 ? '-' : '';
+  return `${sign}¥${Math.abs(v).toFixed(2)}`;
+};
+
+const fmtMetric = (v, kind, signed = false) => {
+  if (v == null || v === '') return '-';
+  if (kind === 'money') return signedMoney(v, signed);
+  const num = Number(v);
+  const s = Number.isInteger(num) ? String(num) : num.toFixed(2);
+  return signed && num > 0 ? `+${s}` : s;
+};
+// 上期为 0 而本期非 0 时,增幅在数学上无定义(服务端给 null)—— 必须显示 N/A。
+// 写成 0% 等于把「无法比较」说成「没有变化」,是报表里最容易被误读的一种错。
+const fmtGrowth = (g) => (g == null ? 'N/A' : `${Number(g) > 0 ? '+' : ''}${Number(g).toFixed(2)}%`);
+// 涨红跌绿(中国市场惯例)。两种情况必须走中性灰:
+//   inverse 指标(折扣)——「折扣涨了」既不是好事也不是坏事;
+//   增幅无定义(growth == null)—— 上期为 0,算不出百分比,涂成红/绿等于替用户下了个不存在的结论。
+const toneOf = (row) => (row.inverse || row.growth == null ? 'flat' : (row.direction || 'flat'));
+// 增幅无定义时只写 N/A,不再挂 ▲▼ 箭头 —— 箭头代表「比较出来的方向」,而这次比较根本没成立。
+const growthText = (row) => (row.growth == null ? 'N/A' : `${PERIOD_TREND_ICON[row.direction]} ${fmtGrowth(row.growth)}`);
+const growthTip = (row) => (row.growth == null ? '上期为 0,增幅无法计算(不是 0%)' : '');
+
+/** 把纵轴上限抬到一个「好看」的整数,免得出现 7185.79 这种刻度。 */
+const niceCeil = (v) => {
+  if (!(v > 0)) return 10;
+  const exp = 10 ** Math.floor(Math.log10(v));
+  const n = v / exp;
+  const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+  return step * exp;
+};
+
+// 双线趋势图:零依赖手绘 SVG。本期实线 + 面积,上期虚线;悬停出十字准星与读数条。
+function PeriodTrendChart({ series }) {
+  const [hover, setHover] = useState(null);
+  const W = 1060;
+  const H = 268;
+  const pad = { l: 68, r: 20, t: 18, b: 32 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+  const n = series.length;
+  const baseY = pad.t + plotH;
+  const max = niceCeil(Math.max(1, ...series.map((r) => Math.max(Number(r.current || 0), Number(r.previous || 0)))));
+  const xOf = (i) => (n <= 1 ? pad.l + plotW / 2 : pad.l + (i * plotW) / (n - 1));
+  const yOf = (v) => baseY - (Math.max(0, Number(v || 0)) / max) * plotH;
+  const pathOf = (key) => series.map((r, i) => `${i ? 'L' : 'M'}${xOf(i).toFixed(1)},${yOf(r[key]).toFixed(1)}`).join(' ');
+  const areaPath = n
+    ? `M${xOf(0).toFixed(1)},${baseY.toFixed(1)} ${series.map((r, i) => `L${xOf(i).toFixed(1)},${yOf(r.current).toFixed(1)}`).join(' ')} L${xOf(n - 1).toFixed(1)},${baseY.toFixed(1)} Z`
+    : '';
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => ({ y: baseY - f * plotH, v: max * f }));
+  const labelStep = Math.max(1, Math.ceil(n / 11));
+  const active = n ? (hover == null ? n - 1 : hover) : -1;
+  const current = active >= 0 ? series[active] : null;
+
+  const onMove = (e) => {
+    const svg = e.currentTarget.ownerSVGElement;
+    if (!svg) return;
+    const box = svg.getBoundingClientRect();
+    const x = ((e.clientX - box.left) / (box.width || 1)) * W;
+    const idx = n <= 1 ? 0 : Math.round(((x - pad.l) / plotW) * (n - 1));
+    setHover(Math.max(0, Math.min(n - 1, idx)));
+  };
+
+  if (!n) return <Empty text="该区间内没有可对比的销售数据" />;
+
+  return <div className="period-chart">
+    <div className="period-chart-legend">
+      <span><i className="swatch this" />This period 本期</span>
+      <span><i className="swatch prev" />Prev period 上期</span>
+      <small>鼠标划过图表查看任意一段的明细</small>
+    </div>
+    <svg viewBox={`0 0 ${W} ${H}`} className="period-svg" onMouseLeave={() => setHover(null)}>
+      <defs>
+        <linearGradient id="periodAreaFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#fb6b53" stopOpacity="0.20" />
+          <stop offset="100%" stopColor="#fb6b53" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {ticks.map((t) => <g key={t.y}>
+        <line x1={pad.l} y1={t.y} x2={W - pad.r} y2={t.y} stroke="#eef1f6" strokeWidth="1" />
+        <text x={pad.l - 10} y={t.y + 4} textAnchor="end" className="period-axis">{money2(t.v)}</text>
+      </g>)}
+      {areaPath && <path d={areaPath} fill="url(#periodAreaFill)" />}
+      <path d={pathOf('previous')} fill="none" stroke="#9aa4b5" strokeWidth="2" strokeDasharray="5 4" strokeLinejoin="round" />
+      <path d={pathOf('current')} fill="none" stroke="#fb6b53" strokeWidth="2.5" strokeLinejoin="round" />
+      {series.map((r, i) => (i % labelStep === 0 || i === n - 1)
+        ? <text key={`x-${i}`} x={xOf(i)} y={H - 10} textAnchor="middle" className="period-axis period-x-label">{r.currentLabel}</text>
+        : null)}
+      {n <= 32 && series.map((r, i) => <g key={`d-${i}`}>
+        <circle cx={xOf(i)} cy={yOf(r.previous)} r="2.6" fill="#fff" stroke="#9aa4b5" strokeWidth="1.6" />
+        <circle cx={xOf(i)} cy={yOf(r.current)} r="3" fill="#fff" stroke="#fb6b53" strokeWidth="1.8" />
+      </g>)}
+      {current && <g>
+        <line x1={xOf(active)} y1={pad.t} x2={xOf(active)} y2={baseY} stroke="#cbd3e0" strokeWidth="1" strokeDasharray="3 3" />
+        <circle cx={xOf(active)} cy={yOf(current.previous)} r="4.5" fill="#9aa4b5" />
+        <circle cx={xOf(active)} cy={yOf(current.current)} r="5" fill="#fb6b53" />
+      </g>}
+      <rect x={pad.l} y={pad.t} width={plotW} height={plotH} fill="transparent" onMouseMove={onMove} />
+    </svg>
+    {current && <div className="period-readout">
+      <b>{current.currentLabel}</b>
+      <span>本期 <strong>{money2(current.current)}</strong> · {current.orders} 单</span>
+      <span>上期 <strong>{money2(current.previous)}</strong> · {current.prevOrders} 单</span>
+      <span className={`period-badge ${toneOf(current)}`} title={growthTip(current)}>{growthText(current)}</span>
+    </div>}
+  </div>;
+}
+
+function PeriodPanel() {
+  const { can } = useAuth();
+  const canExport = can('report.export');
+  const [preset, setPreset] = useState('this_month');
+  const [compare, setCompare] = useState('prev');
+  const [grain, setGrain] = useState('');
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [section, setSection] = useState('metrics');
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  // 自定义区间必须至少给一端,否则服务端会回落到「本月」,界面上的选择就和数据对不上了。
+  const ready = preset !== 'custom' || !!from || !!to;
+
+  const params = () => {
+    const qs = new URLSearchParams();
+    if (preset === 'custom') { if (from) qs.set('from', from); if (to) qs.set('to', to); }
+    else qs.set('preset', preset);
+    qs.set('compare', compare);
+    if (grain) qs.set('grain', grain);
+    return qs;
+  };
+
+  const load = async () => {
+    if (!ready) { setData(null); return; }
+    setBusy(true); setErr('');
+    try {
+      setData((await api.get(`/reports/period?${params().toString()}`)).data);
+    } catch (e) {
+      setErr(e?.response?.data?.error || e?.message || '加载失败');
+      setData(null);
+    } finally { setBusy(false); }
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [preset, compare, grain, from, to]);
+
+  const openExport = (format) => {
+    const qs = params();
+    qs.set('section', section);
+    qs.set('format', format);
+    const t = localStorage.getItem('token');
+    if (t) qs.set('token', t);
+    const url = `${API_BASE}/reports/period/export?${qs.toString()}`;
+    if (format === 'html') window.open(url, '_blank');
+    else window.location.href = url; // 触发浏览器下载
+  };
+
+  const presets = data?.options?.presets || PERIOD_PRESET_FALLBACK.map(([key, label]) => ({ key, label }));
+  const grains = data?.options?.grains || PERIOD_GRAIN_FALLBACK.map(([key, label]) => ({ key, label }));
+  const compares = data?.options?.compares || PERIOD_COMPARE_FALLBACK.map(([key, label]) => ({ key, label }));
+  const sections = data?.options?.sections || PERIOD_SECTION_FALLBACK.map(([key, label]) => ({ key, label }));
+
+  const period = data?.period;
+  const previous = data?.previous;
+  const grainLabel = (grains.find((g) => g.key === data?.grain) || {}).label || data?.grain || '';
+  // 用户显式选了日/周,但区间长到会撑爆图表时服务端会粗化一档 —— 必须说出来,不能悄悄改。
+  const coarsened = !!(grain && data && data.grain !== grain);
+  const maxCat = Math.max(1, ...(data?.categories || []).map((c) => Number(c.amount || 0)));
+
+  return <>
+    <Panel title="Period Comparison / 期间对比" subtitle="日 / 周 / 月分桶 · 环比(上期)与同比(去年同期)· 指标、趋势、分类三个视角 · 可导出 CSV / Excel / 打印页">
+      <div className="period-seg">
+        <span className="period-seg-label">PERIOD</span>
+        {presets.map((p) => <button key={p.key} className={preset === p.key ? 'active' : ''} onClick={() => setPreset(p.key)}>{p.label}</button>)}
+      </div>
+
+      <div className="period-bar">
+        {preset === 'custom' && <>
+          <Input label="From" type="date" value={from} onChange={setFrom} />
+          <Input label="To" type="date" value={to} onChange={setTo} />
+        </>}
+        <label className="ops-field"><span>Compare 对比方式</span>
+          <select value={compare} onChange={(e) => setCompare(e.target.value)}>
+            {compares.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
+          </select>
+        </label>
+        <label className="ops-field"><span>Grain 粒度</span>
+          <select value={grain} onChange={(e) => setGrain(e.target.value)}>
+            <option value="">Auto 自动</option>
+            {grains.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}
+          </select>
+        </label>
+        <Action tone="secondary" onClick={load}>Refresh</Action>
+        {busy && <span className="ops-saved">加载中…</span>}
+      </div>
+
+      {err && <div className="member-alert">{err}</div>}
+      {!ready && <Empty text="请选择自定义区间的起止日期" />}
+
+      {data && period && previous && <>
+        <div className="period-head">
+          <div>
+            <h3>{period.label}</h3>
+            <p>{period.from} → {period.to} · {period.days} 天 · 粒度 {grainLabel}
+              {coarsened && <span className="period-warn">区间过长,已按 {grainLabel} 聚合</span>}
+            </p>
+          </div>
+          <div className="period-vs">
+            <b>vs {previous.label}</b>
+            {previous.from} → {previous.to}
+            {/* 用 final(数据是否定稿)而不是 complete(整单元是否走完):今天既是一个完整的「日」单元,
+                又显然还没定稿 —— 用 complete 会把「今天」标成「完整期间」。 */}
+            <span className={`period-tag ${period.final ? 'complete' : 'running'}`}>
+              {period.final ? '完整期间' : '进行中'}
+            </span>
+          </div>
+        </div>
+
+        <div className="period-cards">
+          {data.metrics.map((m) => <div className={`period-card ${toneOf(m)}`} key={m.key}>
+            <small>{m.label}</small>
+            <strong>{fmtMetric(m.current, m.kind)}</strong>
+            <div className="period-card-foot">
+              <em>上期 {fmtMetric(m.previous, m.kind)} · Δ {fmtMetric(m.delta, m.kind, true)}</em>
+              <span className={`period-badge ${toneOf(m)}`} title={growthTip(m)}>{growthText(m)}</span>
+            </div>
+          </div>)}
+        </div>
+
+        <h3 className="dayend-sub">Trend / 趋势对比</h3>
+        <PeriodTrendChart series={data.series} />
+        {data.seriesMeta && data.seriesMeta.currentBuckets !== data.seriesMeta.previousBuckets &&
+          <div className="period-note">
+            {`两个期间的桶数不等:本期 ${data.seriesMeta.currentBuckets} 个 · 上期 ${data.seriesMeta.previousBuckets} 个,`
+              + `趋势图按前 ${data.seriesMeta.alignedBuckets} 个桶一一对齐;多出来的`
+              + `${data.seriesMeta.currentBuckets > data.seriesMeta.previousBuckets ? '本期' : '上期'}尾部`
+              + '不进趋势图,但已计入上方指标合计。'}
+          </div>}
+
+        <h3 className="dayend-sub">Categories / 分类对比</h3>
+        <div className="ops-table period-cat-table tall">
+          <div className="ops-row ops-head cols-8"><span>Category</span><span>Qty (This)</span><span>Qty (Prev)</span><span>Amount (This)</span><span>Amount (Prev)</span><span>Delta</span><span>Growth</span><span>Trend</span></div>
+          {data.categories.map((c) => <div className="ops-row cols-8" key={c.name}>
+            <span className="period-cat-name">
+              <b>{c.name}</b>
+              <span className="period-share"><i style={{ width: `${Math.round((Number(c.amount || 0) / maxCat) * 100)}%` }} /></span>
+            </span>
+            <span>{Number(c.qty || 0)}</span>
+            <span>{Number(c.prevQty || 0)}</span>
+            <span>{money2(c.amount)}</span>
+            <span>{money2(c.prevAmount)}</span>
+            <span className={Number(c.delta) === 0 ? '' : `period-delta ${toneOf(c)}`}>
+              {signedMoney(c.delta, true)}
+            </span>
+            <span className={`period-badge ${toneOf(c)}`} title={growthTip(c)}>{growthText(c)}</span>
+            <span>{PERIOD_TREND_ICON[c.direction]} {PERIOD_TREND_TEXT[c.direction]}</span>
+          </div>)}
+          {!data.categories.length && <Empty text="该区间内没有销售分类数据" />}
+        </div>
+
+        <div className="period-hint">
+          <b>环比口径</b>:进行中的期间(如本月 1~13 号)对齐到上月的 1~13 号同期,避免被上月后半段的促销拉偏;
+          已走完的期间(如 9 月整月)取完整的上一期(8 月整月)。
+          {compare === 'yoy' && <> 同比把整个窗口整体前移一年,2/29 自动夹取到 2/28。</>}
+          {' '}趋势图与导出文件都由服务端 <b>periodEngine</b> 计算,与界面同源。
+        </div>
+      </>}
+
+      <h3 className="dayend-sub">Export / 导出</h3>
+      <div className="ops-form inline">
+        <label className="ops-field"><span>Section 分节</span>
+          <select value={section} onChange={(e) => setSection(e.target.value)}>
+            {sections.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+        </label>
+        {canExport ? <>
+          <Action tone="secondary" onClick={() => openExport('csv')}>Export CSV</Action>
+          <Action tone="secondary" onClick={() => openExport('xlsx')}>Export Excel</Action>
+          <Action tone="secondary" onClick={() => openExport('html')}>Print / PDF</Action>
+        </> : <span className="perm-hint">当前账号没有 report.export 权限,导出已隐藏。</span>}
       </div>
     </Panel>
   </>;

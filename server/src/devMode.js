@@ -6,6 +6,8 @@ import jwt from 'jsonwebtoken';
 import { signTokens, JWT_SECRET } from './middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from './reportCatalog.js';
 import { runReport, reportTitle, makeFilter } from './reportEngine.js';
+// 期间对比(块⑪):载荷组装 / 分节取行 / 列定义全部复用共享模块,与生产同一份
+import { periodReportPayload, periodSectionRows, periodSectionReport, PERIOD_SECTION_KEYS } from './periodEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from './exporters.js';
 import { applyMovements, applyMovement, valuationOf, makeDocNo, derivePoStatus } from './inventoryEngine.js';
 // 会员引擎:等级 / 积分 / 信用额度 —— 与生产 routes/business.js 共用同一份逻辑
@@ -27,6 +29,8 @@ import { buildProducts, matchProduct, summarizeProducts, buildBulkPatch } from '
 // 价目解析与单位换算 —— 定价与库存扣减的唯一口径,与生产共用
 import { resolveVariantPrice, buildPriceMap, buildPriceMatrix, summarizePrices, applyLevelToItems, defaultLevelCode, findLevel } from './priceEngine.js';
 import { stockDeltaForSale, resolveVariantStock, describeConversion, stockQtyOfItem } from './uomConvert.js';
+// 演示销售历史:只用于开发预览 —— 否则报表中心/期间对比全空,预览像坏的
+import { buildDemoSalesHistory } from './demoSales.js';
 // 复用生产同一份 zod schema —— 否则「预览能过、生产报错」这类漂移会一直存在
 import {
   supplierSchema, purchaseOrderSchema, goodsReceiptSchema, stockTransferSchema,
@@ -453,6 +457,30 @@ function seedDev() {
     ['stock_report', 'Stock Report', ['name', 'code', 'stockQty', 'stockThreshold']],
   ]) {
     store.reportTemplates.push({ id: nid(), orgId: '1', storeId: '1', type: t[0], name: t[1], columns: t[2], isSystem: true, createdAt: now() });
+  }
+
+  // ---- 演示销售历史:近 90 天的已结算订单 ----
+  // 没有它,报表中心(65 个报表)、期间对比、客单价、日结全是空的。
+  // 固定种子 → 每次启动生成的历史完全一致,报表数字可对照、可排查。
+  // 只进开发预览;生产 seed.js 不塞假销售。
+  // DEV_DEMO_SALES=0 可关掉(排查「某条断言是不是被演示数据带偏」时用)。
+  if (process.env.DEV_DEMO_SALES !== '0') {
+    const hist = buildDemoSalesHistory({
+      variants: store.variants.filter((v) => v.isActive !== false),
+      tables: store.tables,
+      users: store.users,
+      members: store.members,
+      settings: getSettings(),
+      totalsOf: computeOrderTotals,
+      priceOf: (v, levelCode) => resolveVariantPrice(v, levelCode, devPriceMap(), devLevels()).price,
+      nextId: nid,
+      // 90 天:让「上月 vs 上上月」「本季 vs 上季」两侧都有完整数据,
+      // 否则上期只有半个月,增幅会被算得虚高(看起来像暴涨,其实是数据不全)。
+      days: 90,
+      anchor: new Date(),
+    });
+    store.orders.push(...hist.orders);
+    store.payments.push(...hist.payments);
   }
 
   // 角色权限矩阵:与生产 seed 一致,先把默认值存一份,后台改动覆盖它。
@@ -3945,6 +3973,24 @@ export function createDevRouter(io) {
   });
 
   // ---- 报表导出:CSV / Excel(xlsx) / 打印页(浏览器另存为 PDF) ----
+  // 与生产同名的共用出口:通用报表与期间报表走同一条路径。
+  const sendExport = (res, { format, fileBase, title, subtitle, columns, rows, meta, csvMeta }) => {
+    if (format === 'xlsx' || format === 'excel') {
+      const buf = buildXlsx(title, columns, rows, { title, subtitle });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.xlsx"`);
+      return res.end(buf);
+    }
+    if (format === 'html' || format === 'pdf') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.end(buildPrintHtml({ title, subtitle, columns, rows, meta }));
+    }
+    const csv = buildCsv(columns, rows, csvMeta);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
+    return res.end(csv);
+  };
+
   r.get('/reports/export', devRequirePerm('report.export'), (req, res) => {
     const type = req.query.type || 'sales_by_date';
     const format = String(req.query.format || 'csv').toLowerCase();
@@ -3957,21 +4003,48 @@ export function createDevRouter(io) {
     const rangeLabel = from || to ? `${from || '...'} → ${to || '...'}` : 'All dates';
     const meta = [['Report', title], ['Period', rangeLabel], ['Store', ds.settings.companyName || '-'], ['Rows', result.rows.length]];
     const fileBase = `${type}_${new Date().toISOString().slice(0, 10)}`;
+    sendExport(res, {
+      format, fileBase, title,
+      subtitle: `${rangeLabel} · ${ds.settings.companyName || ''}`,
+      columns, rows: result.rows, meta,
+      csvMeta: { Report: title, Period: rangeLabel, Store: ds.settings.companyName || '' },
+    });
+  });
 
-    if (format === 'xlsx' || format === 'excel') {
-      const buf = buildXlsx(title, columns, result.rows, { title, subtitle: rangeLabel });
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.xlsx"`);
-      return res.end(buf);
-    }
-    if (format === 'html' || format === 'pdf') {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      return res.end(buildPrintHtml({ title, subtitle: `${rangeLabel} · ${ds.settings.companyName || ''}`, columns, rows: result.rows, meta }));
-    }
-    const csv = buildCsv(columns, result.rows, { Report: title, Period: rangeLabel, Store: ds.settings.companyName || '' });
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
-    res.end(csv);
+  // ---- 期间对比(块⑪):预设期间 / 环比·同比 / 日周月分桶 ----
+  r.get('/reports/period', devRequirePerm('report.view'), (req, res) => {
+    const ds = buildReportDataset();
+    res.json(periodReportPayload(ds.orders || [], req.query));
+  });
+
+  r.get('/reports/period/export', devRequirePerm('report.export'), (req, res) => {
+    const ds = buildReportDataset();
+    const payload = periodReportPayload(ds.orders || [], req.query);
+    const section = PERIOD_SECTION_KEYS.includes(req.query.section) ? req.query.section : 'metrics';
+    const type = periodSectionReport(section);
+    const rows = periodSectionRows(payload, section);
+    const columns = reportColumns(type, rows);
+    const title = reportTitle(type);
+    const thisLabel = `${payload.period.from} → ${payload.period.to}`;
+    const cmpLabel = `${payload.previous.from} → ${payload.previous.to}`;
+    const cmpName = payload.compare === 'yoy' ? 'Last Year 去年同期' : 'Prev Period 上期';
+    const format = String(req.query.format || 'csv').toLowerCase();
+    const meta = [
+      ['Report', title],
+      ['This Period 本期', thisLabel],
+      [cmpName, cmpLabel],
+      ['Grain 粒度', payload.grain],
+      ['Store', ds.settings.companyName || '-'],
+      ['Rows', rows.length],
+    ];
+    sendExport(res, {
+      format,
+      fileBase: `period_${section}_${payload.period.from}_${payload.period.to}`,
+      title,
+      subtitle: `${thisLabel} vs ${cmpLabel} · ${ds.settings.companyName || ''}`,
+      columns, rows, meta,
+      csvMeta: { Report: title, 'This Period': thisLabel, [cmpName]: cmpLabel, Store: ds.settings.companyName || '' },
+    });
   });
 
   return r;

@@ -15,6 +15,7 @@ export const REPORT_CATEGORIES = [
   { key: 'purchase', label: 'Purchase 采购' },
   { key: 'staff', label: 'Staff 员工' },
   { key: 'dayend', label: 'Day End 日结' },
+  { key: 'period', label: 'Period 期间对比' },
 ];
 
 // kind: 'money' 金额列 / 'int' 整数列 / 'text' 文本列 / 'date' 日期列
@@ -108,6 +109,13 @@ export const REPORT_CATALOG = [
   { key: 'product_listing', label: 'Product Listing', category: 'menu', desc: '产品主数据清单(含主分组 / 打印组 / 部门 / 供应商 / 计量单位)', columns: [['code', 'Code', 'text'], ['name', 'Product', 'text'], ['category', 'Category', 'text'], ['mainGroup', 'Main Group', 'text'], ['printGroup', 'Print Group', 'text'], ['department', 'Department', 'text'], ['supplier', 'Supplier', 'text'], ['uom', 'UOM', 'text'], ['packUom', 'Pack UOM', 'text'], ['packFactor', 'Pack Factor', 'qty'], ['stockUom', 'Stock UOM', 'text'], ['unitsPerStock', 'Units / Stock', 'qty'], ['priceLevels', 'Price Levels', 'int'], ['price', 'Price', 'money'], ['cost', 'Cost', 'money'], ['stockQty', 'On Hand', 'qty'], ['active', 'Status', 'text']] },
   // 价目表:每个 SKU 在各价格级别下的售价与毛利,采购/定价复核用
   { key: 'price_list', label: 'Price List', category: 'menu', desc: '价目表(各价格级别售价与毛利)', columns: [['code', 'Code', 'text'], ['name', 'Product', 'text'], ['category', 'Category', 'text'], ['cost', 'Cost', 'money'], ['retail', 'Retail', 'money'], ['member', 'Member', 'money'], ['wholesale', 'Wholesale', 'money'], ['staff', 'Staff', 'money'], ['lowest', 'Lowest', 'money'], ['margin', 'Margin %', 'text'], ['source', 'Pricing', 'text']] },
+
+  // ---------- Period 期间对比 ----------
+  // 这三个报表由 reportEngine 走 periodEngine 计算:日期区间即「本期」,
+  // 上期由 periodEngine 自动推导(进行中期间对齐同期,完整期间取完整上一期)。
+  { key: 'period_sales', label: 'Period Sales (Trend)', category: 'period', desc: '本期与上期按日/周/月对齐的销售趋势', columns: [['bucket', 'Bucket', 'text'], ['currentLabel', 'This Period', 'text'], ['previousLabel', 'Prev Period', 'text'], ['orders', 'Orders', 'int'], ['current', 'Net (This)', 'money'], ['previous', 'Net (Prev)', 'money'], ['delta', 'Delta', 'money'], ['growth', 'Growth', 'percent']] },
+  { key: 'period_comparison', label: 'Period Comparison', category: 'period', desc: '本期 vs 上期/去年同期 的指标对比', columns: [['label', 'Metric', 'text'], ['current', 'This Period', 'num'], ['previous', 'Prev Period', 'num'], ['delta', 'Delta', 'num'], ['growth', 'Growth', 'percent'], ['trend', 'Trend', 'text']] },
+  { key: 'period_category', label: 'Period By Category', category: 'period', desc: '按菜单分类的本期 vs 上期对比', columns: [['name', 'Category', 'text'], ['qty', 'Qty (This)', 'qty'], ['amount', 'Amount (This)', 'money'], ['prevQty', 'Qty (Prev)', 'qty'], ['prevAmount', 'Amount (Prev)', 'money'], ['delta', 'Delta', 'money'], ['growth', 'Growth', 'percent'], ['trend', 'Trend', 'text']] },
 ];
 
 export const REPORT_KEYS = REPORT_CATALOG.map((r) => r.key);
