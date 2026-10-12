@@ -17,13 +17,16 @@ import {
 // 默认会员等级 / 会员设置 / Smcin 主数据:与生产 db.js / seed.js 共用同一份常量
 import {
   DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS,
-  DEFAULT_MAIN_GROUPS, DEFAULT_PRINT_GROUPS, DEFAULT_DEPARTMENTS, DEFAULT_UOMS,
+  DEFAULT_MAIN_GROUPS, DEFAULT_PRINT_GROUPS, DEFAULT_DEPARTMENTS, DEFAULT_UOMS, DEFAULT_PRICE_LEVELS,
   CATEGORY_MASTER_MAP, CATEGORY_UOM_MAP,
 } from './db.js';
 // 主数据共享规则:编码生成 / 删除保护 / 基准单位唯一 —— 与生产 routes/menu.js 同一份
-import { MASTER_TYPES, MASTER_PATHS, makeMasterCode, isDuplicateCode, countRefs, baseUnitRule } from './masterData.js';
+import { MASTER_TYPES, MASTER_PATHS, makeMasterCode, isDuplicateCode, countRefs, baseUnitRule, defaultLevelRule } from './masterData.js';
 // 产品主档拼装/过滤/批量修改规则 —— 同样与生产共用
 import { buildProducts, matchProduct, summarizeProducts, buildBulkPatch } from './productMaster.js';
+// 价目解析与单位换算 —— 定价与库存扣减的唯一口径,与生产共用
+import { resolveVariantPrice, buildPriceMap, buildPriceMatrix, summarizePrices, applyLevelToItems, defaultLevelCode, findLevel } from './priceEngine.js';
+import { stockDeltaForSale, resolveVariantStock, describeConversion, stockQtyOfItem } from './uomConvert.js';
 // 复用生产同一份 zod schema —— 否则「预览能过、生产报错」这类漂移会一直存在
 import {
   supplierSchema, purchaseOrderSchema, goodsReceiptSchema, stockTransferSchema,
@@ -32,6 +35,7 @@ import {
   memberTopupSchema, memberKnockoffSchema, memberPointsSchema, memberStatusSchema,
   mainGroupSchema, mainGroupUpdateSchema, printGroupSchema, printGroupUpdateSchema,
   departmentSchema, departmentUpdateSchema, uomSchema, uomUpdateSchema,
+  priceLevelSchema, priceLevelUpdateSchema, variantPricesSchema,
   variantSchema, variantUpdateSchema,
 } from './validators.js';
 import {
@@ -63,6 +67,8 @@ const store = {
   memberTiers: [],
   // 新增：Smcin 主数据 —— 商品大类 / 打印分组 / 部门 / 计量单位
   mainGroups: [], printGroups: [], departments: [], uoms: [],
+  // 新增：价格级别(价目表) + SKU 价格覆盖行(只存非默认级别)
+  priceLevels: [], variantPrices: [],
 };
 const nid = () => String(store.seq++);
 const now = () => new Date().toISOString();
@@ -98,6 +104,13 @@ const MODIFIERS = [
   ['P', 'Peng 冰', 0.5, 4], ['K', 'Kow 浓', 0.1, 5], ['SP', 'Special', 0.6, 6],
   ['SUSU', '加奶', 0.3, 7], ['Tarik', '拉', 0.4, 8], ['DANGGUT', '', 0.1, 9],
 ];
+// 整箱进货、按罐/瓶/包零售的商品:销售单位 → 库存单位 的换算。
+// 只有这几类才需要换算;现做的饮料卖一杯扣一杯,销售单位 = 库存单位。
+const PACK_BY_CAT = {
+  'CAN DRINK': { packUom: 'BOX', packFactor: 24, stockQty: 6, stockThreshold: 2 },
+  BEER: { packUom: 'BOX', packFactor: 12, stockQty: 4, stockThreshold: 2 },
+  OTHER: { packUom: 'BOX', packFactor: 20, stockQty: 3, stockThreshold: 1 },
+};
 
 function seedDev() {
   if (store.users.length) return;
@@ -133,6 +146,13 @@ function seedDev() {
     const id = nid();
     store.uoms.push({ id, orgId: '1', storeId: '1', code, name, dimension, factor, isBase, sortOrder: sort, isActive: true, note: null });
     uomIds[code] = id;
+  }
+  // 价格级别(价目表):RETAIL 为默认级别,其价格即 menu_variants.price
+  const priceLevelIds = {};
+  for (const [code, name, sort, isDefault] of DEFAULT_PRICE_LEVELS) {
+    const id = nid();
+    store.priceLevels.push({ id, orgId: '1', storeId: '1', code, name, sortOrder: sort, isDefault: !!isDefault, isActive: true, note: null });
+    priceLevelIds[code] = id;
   }
 
   const catIds = {};
@@ -172,15 +192,27 @@ function seedDev() {
   let vsort = 1;
   const addVar = (baseId, cat, code, name, price) => {
     const map = CATEGORY_MASTER_MAP[cat] || {};
+    const pack = PACK_BY_CAT[cat] || {};
+    const id = nid();
     store.variants.push({
-      id: nid(), orgId: '1', storeId: '1', baseId, categoryId: catIds[cat], code, name,
-      modifierIds: [], price, cost: +(price * 0.4).toFixed(2), stockQty: 50, stockThreshold: 10, barcode: null, sortOrder: vsort++, isActive: true,
+      id, orgId: '1', storeId: '1', baseId, categoryId: catIds[cat], code, name,
+      modifierIds: [], price, cost: +(price * 0.4).toFixed(2),
+      stockQty: pack.stockQty ?? 50, stockThreshold: pack.stockThreshold ?? 10,
+      barcode: null, sortOrder: vsort++, isActive: true,
       // 分组/部门/打印组/单位按分类继承(与生产 seed.js 同一套映射)
       mainGroupId: map.mainGroup ? mainGroupIds[map.mainGroup] ?? null : null,
       printGroupId: map.printGroup ? printGroupIds[map.printGroup] ?? null : null,
       departmentId: map.department ? deptIds[map.department] ?? null : null,
       supplierId: null,
-      uom: CATEGORY_UOM_MAP[cat] || null, packUom: null, packFactor: 1,
+      uom: CATEGORY_UOM_MAP[cat] || null,
+      packUom: pack.packUom ?? null,
+      packFactor: pack.packFactor ?? 1,
+    });
+    // MEMBER 级价目预置 95 折,演示「非默认级别存覆盖行」;
+    // WHOLESALE / STAFF 故意留空,演示「没有覆盖行 = 回落基础价」。
+    store.variantPrices.push({
+      id: nid(), orgId: '1', storeId: '1', variantId: id,
+      levelCode: 'MEMBER', price: +(price * 0.95).toFixed(2),
     });
   };
   for (const [name, cat, price] of DRINK_BASES) {
@@ -467,6 +499,17 @@ const toUom = (r) => ({
   factor: Number(r.factor == null ? 1 : r.factor),
   isBase: !!r.isBase,
 });
+const toPriceLevel = (r) => ({
+  ...masterRow(r),
+  isDefault: !!r.isDefault,
+});
+// SKU 价格覆盖行。默认级别不会有行(它的价就是 menu_variants.price)。
+const toVariantPrice = (r) => ({
+  _id: r.id, id: r.id, orgId: r.orgId || '1', storeId: r.storeId || '1',
+  variantId: String(r.variantId), levelCode: r.levelCode,
+  price: Number(r.price || 0),
+  createdAt: r.createdAt || now(), updatedAt: r.updatedAt || now(),
+});
 const toMenuBase = (b) => ({ _id: b.id, id: b.id, orgId: b.orgId, storeId: b.storeId, categoryId: b.categoryId == null ? null : String(b.categoryId), name: b.name, basePrice: Number(b.basePrice || 0), sortOrder: b.sortOrder, isActive: !!b.isActive, createdAt: now(), updatedAt: now() });
 const toModifier = (m) => ({ _id: m.id, id: m.id, orgId: m.orgId, storeId: m.storeId, code: m.code, label: m.label, defaultDelta: Number(m.defaultDelta || 0), sortOrder: m.sortOrder, isActive: !!m.isActive, createdAt: now(), updatedAt: now() });
 const toBaseModifier = (bm) => ({ _id: bm.id, id: bm.id, orgId: bm.orgId, storeId: bm.storeId, baseId: String(bm.baseId), modifierId: String(bm.modifierId), delta: bm.delta == null ? null : Number(bm.delta), createdAt: now(), updatedAt: now() });
@@ -530,6 +573,10 @@ const toOrder = (o) => ({
   salesPersonId: o.salesPersonId == null ? null : String(o.salesPersonId),
   memberId: o.memberId == null ? null : String(o.memberId),
   discountType: o.discountType || null,
+  // 价目级别:空/缺省表示用的是默认级别(基础价)。
+  // 必须在这里透出 —— 报表走的是 buildReportDataset 自己的拼装,不会经过本函数,
+  // 漏了它就会出现「报表有、接口没有」的漂移(与生产 db.js 的 toOrder 对齐)。
+  priceLevel: o.priceLevel || null,
   mergedIntoOrderId: o.mergedIntoOrderId == null ? null : String(o.mergedIntoOrderId),
   voucherDiscount: Number(o.voucherDiscount || 0), rebateRedeemed: Number(o.rebateRedeemed || 0),
   // 会员结账明细:等级折扣 / 积分抵扣与累积 / 挂账金额
@@ -1076,16 +1123,7 @@ function buildReportDataset() {
   const catById = new Map(store.categories.map((c) => [String(c.id), c]));
 
   // 商品主档:复用 /menu/products 的同一套拼装(含继承回落),报表分组口径才不会与后台清单分叉
-  const products = buildProducts({
-    variants: store.variants.map(toVariant),
-    categories: store.categories.map(toMenuCategory),
-    bases: store.bases.map(toMenuBase),
-    mainGroups: store.mainGroups.map(toMainGroup),
-    printGroups: store.printGroups.map(toPrintGroup),
-    departments: store.departments.map(toDepartment),
-    suppliers: store.suppliers.map(toSupplier),
-    uoms: store.uoms.map(toUom),
-  });
+  const products = buildProducts(devProductCtx());
   const productById = new Map(products.map((p) => [String(p.id), p]));
 
   const decorateItem = (it) => {
@@ -1116,7 +1154,9 @@ function buildReportDataset() {
     const m = memberById(o.memberId);
     return {
       ...o,
-      items: (o.items || []).map(decorateItem),
+      // 订单行带上生效的价目级别,报表按级别分组才不会出现空档
+      items: (o.items || []).map((it) => ({ ...decorateItem(it), priceLevel: it.priceLevel || o.priceLevel || null })),
+      priceLevel: o.priceLevel || null,
       tableNo: t ? t.number : null,
       cashierName: u ? u.name : 'Unknown',
       salesPersonName: (userById(o.salesPersonId) || u || {}).name || 'Unknown',
@@ -1134,6 +1174,10 @@ function buildReportDataset() {
     orders,
     // 产品主档(供 Product Listing 报表使用),与后台 /menu/products 同源
     products,
+    // 价目级别与 SKU 价格覆盖行(供 Sales By Price Level / Price List 报表使用)
+    priceLevels: devLevels(),
+    variantPrices: store.variantPrices.map(toVariantPrice),
+    uoms: devUoms(),
     payments: store.payments.map((p) => ({ ...p, amount: Number(p.amount || 0) })),
     refunds: store.refunds.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
     unsettles: store.unsettles.map((x) => ({ ...x, amount: Number(x.amount || 0) })),
@@ -1185,6 +1229,72 @@ function buildReportDataset() {
     dayEnds: store.dayEnds.map((d) => ({ ...d, expectedCash: Number(d.expectedCash || 0), countedCash: Number(d.countedCash || 0), difference: Number(d.difference || 0) })),
     settings: getSettings(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// 定价与库存换算(dev 侧) —— 与生产同一套共享模块,这里只做「从 store 取数」
+// ---------------------------------------------------------------------------
+const devLevels = () => store.priceLevels.map(toPriceLevel);
+const devUoms = () => store.uoms.map(toUom);
+const devPriceMap = () => buildPriceMap(store.variantPrices.map(toVariantPrice));
+const devVariantById = () => new Map(store.variants.map((v) => [String(v.id), toVariant(v)]));
+
+/** buildProducts 的入参:后台清单 / 价目矩阵 / 报表数据集三处共用同一份拼装口径。 */
+function devProductCtx() {
+  return {
+    variants: store.variants.map(toVariant),
+    categories: store.categories.map(toMenuCategory),
+    bases: store.bases.map(toMenuBase),
+    mainGroups: store.mainGroups.map(toMainGroup),
+    printGroups: store.printGroups.map(toPrintGroup),
+    departments: store.departments.map(toDepartment),
+    suppliers: store.suppliers.map(toSupplier),
+    uoms: devUoms(),
+    variantPrices: store.variantPrices.map(toVariantPrice),
+  };
+}
+
+/**
+ * 按价目级别重算订单行单价。
+ * 只重算能解析到真实变体的行 —— Open Item(临时商品)必须保留收银员输入的价。
+ */
+function devPriceItems(items, levelCode) {
+  return applyLevelToItems(items || [], devVariantById(), {
+    levelCode, priceMap: devPriceMap(), levels: devLevels(),
+  });
+}
+
+/**
+ * 扣减成品库存:销售单位 → 库存单位换算后再扣。
+ * 换算结果写回订单行,退款/反结算时按同一份数字回补,不因后来改包装系数而漂移。
+ * @returns {{low:Array, converted:Array}}
+ */
+function devStockOut(items) {
+  const uoms = devUoms();
+  const low = []; const converted = [];
+  for (const it of items || []) {
+    const v = store.variants.find((x) => x.id === String(it.variantId || it.itemId));
+    if (!v) continue;
+    const conv = stockDeltaForSale(v, it.qty, uoms);
+    it.stockQty = conv.stockQty;
+    it.uomFactor = conv.factor;
+    it.sellUom = conv.sellUom;
+    it.stockUom = conv.stockUom;
+    if (conv.converted) converted.push({ variantId: v.id, code: v.code, sellQty: conv.sellQty, stockQty: conv.stockQty, factor: conv.factor, sellUom: conv.sellUom, stockUom: conv.stockUom });
+    v.stockQty = round3(Math.max(0, Number(v.stockQty || 0) - conv.stockQty));
+    if (Number(v.stockQty) < Number(v.stockThreshold || 0)) low.push({ itemId: v.id, name: v.name, quantity: v.stockQty });
+  }
+  return { low, converted };
+}
+
+/** 回补成品库存(反结算 / 退款 / 贷项单)。按结账时记下的 stockQty 回补。 */
+function devStockIn(items) {
+  const uoms = devUoms();
+  for (const it of items || []) {
+    const v = store.variants.find((x) => x.id === String(it.variantId || it.itemId));
+    if (!v) continue;
+    v.stockQty = round3(Number(v.stockQty || 0) + stockQtyOfItem(it, v, uoms));
+  }
 }
 
 export function createDevRouter(io) {
@@ -1518,7 +1628,10 @@ export function createDevRouter(io) {
       supplierId: sid(b.supplierId), uom: b.uom || null, packUom: b.packUom || null,
       packFactor: b.packFactor ?? 1,
     };
-    store.variants.push(v); res.status(201).json(toVariant(v));
+    store.variants.push(v);
+    // 建商品时可一并写非默认级别的价目(默认级别请直接写 price)
+    if (b.prices?.length) devWriteVariantPrices(v.id, b.prices);
+    res.status(201).json(toVariant(v));
   });
   r.put('/menu/variants/:id', devRequirePerm('menu.edit'), (req, res) => {
     const v = store.variants.find((x) => x.id === req.params.id);
@@ -1546,7 +1659,60 @@ export function createDevRouter(io) {
   });
   r.delete('/menu/variants/:id', devRequirePerm('menu.edit'), (req, res) => {
     store.variants = store.variants.filter((x) => x.id !== req.params.id);
+    // 级联清掉价格覆盖行,不留孤儿
+    store.variantPrices = store.variantPrices.filter((p) => String(p.variantId) !== String(req.params.id));
     res.json({ ok: true });
+  });
+
+  // ---- 价目(价格级别):与生产同一套不变量 ----
+  // 默认级别的价格写在 variant.price 上;非默认级别写 variantPrices 覆盖行。
+  const devWriteVariantPrices = (variantId, entries) => {
+    const levels = store.priceLevels;
+    const def = levels.find((l) => l.isDefault);
+    const defCode = String((def && def.code) || '').toUpperCase();
+    const known = new Set(levels.map((l) => String(l.code).toUpperCase()));
+    const applied = []; const skipped = [];
+    for (const e of entries || []) {
+      const code = String(e.levelCode || '').trim().toUpperCase();
+      if (!code) continue;
+      if (!known.has(code)) { skipped.push(code); continue; }
+      if (code === defCode) {
+        const v = store.variants.find((x) => String(x.id) === String(variantId));
+        if (v && e.price != null) v.price = Number(e.price);
+        applied.push({ levelCode: code, price: e.price == null ? null : Number(e.price), target: 'variant' });
+        continue;
+      }
+      const i = store.variantPrices.findIndex((p) => String(p.variantId) === String(variantId) && String(p.levelCode).toUpperCase() === code);
+      if (e.price == null) {
+        if (i >= 0) store.variantPrices.splice(i, 1);
+      } else if (i >= 0) {
+        store.variantPrices[i].price = Number(e.price);
+      } else {
+        store.variantPrices.push({ id: nid(), orgId: '1', storeId: '1', variantId: String(variantId), levelCode: code, price: Number(e.price) });
+      }
+      applied.push({ levelCode: code, price: e.price == null ? null : Number(e.price), target: 'override' });
+    }
+    return { applied, skipped };
+  };
+  r.put('/menu/variants/:id/prices', devRequirePerm('menu.edit'), (req, res) => {
+    const v = store.variants.find((x) => x.id === req.params.id);
+    if (!v) return res.status(404).json({ error: 'not_found' });
+    let b; try { b = variantPricesSchema.parse(req.body || {}); } catch (e) { return devZodError(res, e); }
+    const result = devWriteVariantPrices(v.id, b.prices);
+    res.json({
+      ...result,
+      variant: toVariant(v),
+      prices: store.variantPrices.filter((x) => String(x.variantId) === String(v.id)).map(toVariantPrice),
+      levels: store.priceLevels.map(toPriceLevel),
+    });
+  });
+  // ---- 价目矩阵:SKU × 价格级别 ----
+  r.get('/menu/price-matrix', (req, res) => {
+    const products = buildProducts(devProductCtx());
+    const levels = devLevels();
+    const prices = store.variantPrices.map(toVariantPrice);
+    const rows = buildPriceMatrix(products, levels, prices);
+    res.json({ rows, total: rows.length, levels, summary: summarizePrices(products, levels, prices) });
   });
 
   // ---- Smcin 主数据:商品大类 / 打印分组 / 部门 / 计量单位 ----
@@ -1557,11 +1723,23 @@ export function createDevRouter(io) {
     'print-groups': () => store.printGroups,
     departments: () => store.departments,
     uoms: () => store.uoms,
+    'price-levels': () => store.priceLevels,
   };
-  const devMasterMapper = { 'main-groups': toMainGroup, 'print-groups': toPrintGroup, departments: toDepartment, uoms: toUom };
-  const devMasterSchema = { 'main-groups': mainGroupSchema, 'print-groups': printGroupSchema, departments: departmentSchema, uoms: uomSchema };
-  const devMasterUpdate = { 'main-groups': mainGroupUpdateSchema, 'print-groups': printGroupUpdateSchema, departments: departmentUpdateSchema, uoms: uomUpdateSchema };
-  const devRefCollections = () => ({ categories: store.categories, variants: store.variants });
+  const devMasterMapper = {
+    'main-groups': toMainGroup, 'print-groups': toPrintGroup,
+    departments: toDepartment, uoms: toUom, 'price-levels': toPriceLevel,
+  };
+  const devMasterSchema = {
+    'main-groups': mainGroupSchema, 'print-groups': printGroupSchema,
+    departments: departmentSchema, uoms: uomSchema, 'price-levels': priceLevelSchema,
+  };
+  const devMasterUpdate = {
+    'main-groups': mainGroupUpdateSchema, 'print-groups': printGroupUpdateSchema,
+    departments: departmentUpdateSchema, uoms: uomUpdateSchema, 'price-levels': priceLevelUpdateSchema,
+  };
+  const devRefCollections = () => ({
+    categories: store.categories, variants: store.variants, variantPrices: store.variantPrices,
+  });
 
   for (const path of MASTER_PATHS) {
     const bucket = devMasterBucket[path];
@@ -1569,6 +1747,7 @@ export function createDevRouter(io) {
     const schema = devMasterSchema[path];
     const updateSchema = devMasterUpdate[path];
     const isUom = path === 'uoms';
+    const isLevel = path === 'price-levels';
 
     r.get(`/${path}`, (req, res) => {
       let list = [...bucket()].sort((a, b) => (Number(a.sortOrder) - Number(b.sortOrder)) || (Number(a.id) - Number(b.id)));
@@ -1589,6 +1768,8 @@ export function createDevRouter(io) {
         const { clearOthers } = baseUnitRule(b, null);
         if (clearOthers) for (const x of rows) if (x.dimension === clearOthers) x.isBase = false;
       }
+      // 每个 (org,store) 只能有一个默认价格级别;新建的若是默认,其余全部降级
+      if (isLevel && b.isDefault) for (const x of rows) x.isDefault = false;
       const row = {
         id: nid(), orgId: '1', storeId: '1', code, name: b.name,
         sortOrder: Number(b.sortOrder || 0), isActive: b.isActive === false ? false : true,
@@ -1599,6 +1780,10 @@ export function createDevRouter(io) {
         row.dimension = b.dimension || 'count';
         row.factor = forceFactorOne ? 1 : Number(b.factor ?? 1);
         row.isBase = !!b.isBase;
+      }
+      if (isLevel) {
+        // 第一个级别必须成为默认级别,否则「基础价存在哪一级」没有答案
+        row.isDefault = b.isDefault === true || rows.length === 0;
       }
       rows.push(row);
       res.status(201).json(mapper(row));
@@ -1613,6 +1798,11 @@ export function createDevRouter(io) {
       if (isUom) {
         const { clearOthers } = baseUnitRule(b, row);
         if (clearOthers) for (const x of bucket()) if (x.dimension === clearOthers && String(x.id) !== String(row.id)) x.isBase = false;
+      }
+      if (isLevel) {
+        const { clearOthers, forceDefault } = defaultLevelRule(b, row);
+        if (clearOthers) for (const x of bucket()) if (String(x.id) !== String(row.id)) x.isDefault = false;
+        row.isDefault = forceDefault;
       }
       if (b.code != null && b.code !== '') row.code = b.code;
       if (b.name != null) row.name = b.name;
@@ -1640,26 +1830,28 @@ export function createDevRouter(io) {
       const i = rows.findIndex((x) => String(x.id) === String(req.params.id));
       if (i < 0) return res.status(404).json({ error: 'not_found' });
       const type = MASTER_TYPES[path];
+      // 默认价格级别是「基础价」的落点,删掉整条价格链就断了
+      if (type.undeletable === 'default_level' && rows[i].isDefault) {
+        return res.status(409).json({
+          error: 'master_in_use', label: type.label, counts: {}, reason: 'default_level',
+          hint: 'set another level as default first',
+        });
+      }
       const counts = countRefs(devRefCollections(), type.refs, rows[i]);
       const total = Object.values(counts).reduce((s, n) => s + n, 0);
       if (total > 0) return res.status(409).json({ error: 'master_in_use', label: type.label, counts, hint: 'set isActive=false instead' });
       const [gone] = rows.splice(i, 1);
+      // 级联清掉该级别的价格覆盖行,不留孤儿
+      if (type.refs.some((r) => r.collection === 'variantPrices')) {
+        store.variantPrices = store.variantPrices.filter((p) => String(p.levelCode).toUpperCase() !== String(gone.code).toUpperCase());
+      }
       res.json({ ok: true, deleted: String(gone.id) });
     });
   }
 
   // ---- 产品主档(扁平清单):与生产 /menu/products 同一套拼装/过滤规则 ----
   r.get('/menu/products', (req, res) => {
-    const all = buildProducts({
-      variants: store.variants.map(toVariant),
-      categories: store.categories.map(toMenuCategory),
-      bases: store.bases.map(toMenuBase),
-      mainGroups: store.mainGroups.map(toMainGroup),
-      printGroups: store.printGroups.map(toPrintGroup),
-      departments: store.departments.map(toDepartment),
-      suppliers: store.suppliers.map(toSupplier),
-      uoms: store.uoms.map(toUom),
-    });
+    const all = buildProducts(devProductCtx());
     const rows = all.filter((p) => matchProduct(p, req.query));
     res.json({ rows, total: rows.length, summary: summarizeProducts(all) });
   });
@@ -1723,7 +1915,8 @@ export function createDevRouter(io) {
   });
   r.post('/orders', devRequirePerm('order.create'), (req, res) => {
     const b = req.body;
-    const items = (b.items || []).map((i) => ({ ...i, status: 'pending' }));
+    const priced = devPriceItems(b.items || [], b.priceLevel);
+    const items = priced.items.map((i) => ({ ...i, status: 'pending' }));
     const totals = computeOrderTotals(items, b.discount || 0);
     const held = !!b.hold;
     const o = {
@@ -1735,6 +1928,7 @@ export function createDevRouter(io) {
       heldAt: held ? now() : null, reprintCount: 0,
       createdBy: req.user.id, salesPersonId: b.salesPersonId ? String(b.salesPersonId) : null,
       memberId: b.memberId ? String(b.memberId) : null, voucherDiscount: 0, rebateRedeemed: 0,
+      priceLevel: priced.levelCode,
       shiftId: store.shifts.find((s) => s.status === 'open')?.id || null, voidReason: null,
       createdAt: now(), updatedAt: now(),
     };
@@ -1749,7 +1943,8 @@ export function createDevRouter(io) {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (o.status !== 'open') return res.status(400).json({ error: 'order not open' });
-    o.items.push({ ...req.body, status: 'pending' });
+    const priced = devPriceItems([req.body], o.priceLevel);
+    o.items.push({ ...priced.items[0], status: 'pending' });
     const totals = computeOrderTotals(o.items, o.discount);
     Object.assign(o, totals); o.updatedAt = now();
     res.json(toOrder(o));
@@ -1759,9 +1954,11 @@ export function createDevRouter(io) {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!['open', 'hold'].includes(o.status)) return res.status(400).json({ error: 'order not editable' });
-    const items = (req.body.items || []).map((i) => ({ ...i, status: 'pending' }));
+    const priced = devPriceItems(req.body.items || [], req.body.priceLevel ?? o.priceLevel);
+    const items = priced.items.map((i) => ({ ...i, status: 'pending' }));
     if (!items.length) return res.status(400).json({ error: 'items required' });
     o.items = items;
+    if (req.body.priceLevel !== undefined) o.priceLevel = priced.levelCode;
     const totals = computeOrderTotals(items, req.body.discount ?? o.discount);
     Object.assign(o, totals); o.updatedAt = now();
     res.json(toOrder(o));
@@ -2018,14 +2215,8 @@ export function createDevRouter(io) {
       store.invoices.push({ id: nid(), orderId: o.id, invoiceNo: o.invoiceNo, amount: o.total, tax: o.tax, createdAt: now() });
     }
     // 扣成品库存（全部追踪）
-    const low = [];
-    for (const it of o.items) {
-      const vid = it.variantId || it.itemId;
-      const v = store.variants.find((x) => x.id === String(vid));
-      if (!v) continue;
-      v.stockQty = Math.max(0, Number(v.stockQty) - Number(it.qty));
-      if (v.stockQty < Number(v.stockThreshold || 0)) low.push({ itemId: v.id, name: v.name, quantity: v.stockQty });
-    }
+    // 按销售单位 → 库存单位换算后扣减:整箱进货、按罐零售时卖 1 罐只扣 1/24 箱。
+    const { low } = devStockOut(o.items);
     if (o.tableId) { const t = store.tables.find((x) => x.id === o.tableId); if (t) { t.status = 'needs_clean'; t.currentOrderId = null; } }
 
     // ---- 自动返利：按 settings.rebatePercent 对实付金额计返利（会员单才计） ----
@@ -2164,11 +2355,8 @@ export function createDevRouter(io) {
     const o = store.orders.find((x) => x.id === req.params.id);
     if (!o) return res.status(404).json({ error: 'not found' });
     if (!['paid', 'refunded'].includes(o.status)) return res.status(400).json({ error: 'only settled orders can be unsettled' });
-    // 回补库存
-    for (const it of o.items) {
-      const v = store.variants.find((x) => x.id === String(it.variantId || it.itemId));
-      if (v) v.stockQty = Number(v.stockQty) + Number(it.qty);
-    }
+    // 回补库存(按结账时记下的 stockQty,不按当前包装系数重算)
+    devStockIn(o.items);
     // 作废付款记录
     const voided = store.payments.filter((p) => p.orderId === o.id);
     store.payments = store.payments.filter((p) => p.orderId !== o.id);
@@ -2286,18 +2474,18 @@ export function createDevRouter(io) {
         amount += lineAmt;
         refundItems.push({ code: src.code, name: src.name, qty, unitPrice: src.unitPrice });
         if (restock) {
+          // 按比例回补:部分退款只回补该行的一部分库存
           const v = store.variants.find((x) => x.id === String(src.variantId || src.itemId));
-          if (v) v.stockQty = Number(v.stockQty) + qty;
+          if (v) {
+            const per = stockQtyOfItem(src, v, devUoms());
+            const ratio = Number(src.qty) > 0 ? qty / Number(src.qty) : 0;
+            v.stockQty = round3(Number(v.stockQty || 0) + per * ratio);
+          }
         }
       }
     } else {
       amount = amount || Math.round((Number(o.total) - Number(o.refundedAmount || 0)) * 100) / 100;
-      if (restock) {
-        for (const it of o.items) {
-          const v = store.variants.find((x) => x.id === String(it.variantId || it.itemId));
-          if (v) v.stockQty = Number(v.stockQty) + Number(it.qty);
-        }
-      }
+      if (restock) devStockIn(o.items);
     }
     if (amount <= 0) return res.status(400).json({ error: 'refund amount must be positive' });
     if (Number(o.refundedAmount || 0) + amount > Number(o.total) + 0.001) return res.status(400).json({ error: 'refund exceeds order total' });
@@ -3142,11 +3330,14 @@ export function createDevRouter(io) {
     const c = store.creditNotes.find((x) => x.id === req.params.id);
     if (!c) return res.status(404).json({ error: 'not found' });
     if (c.status !== 'open') return res.status(400).json({ error: 'already posted' });
-    // 过账：可选回补库存
+    // 过账：可选回补库存(按贷项单行自己的计量单位换算回库存单位)
     if (c.restock !== false) {
+      const uoms = devUoms();
       for (const l of c.items || []) {
         const v = store.variants.find((x) => x.code === l.code || (l.barcode && x.barcode === l.barcode));
-        if (v) v.stockQty = Number(v.stockQty) + Number(l.qty || 0);
+        if (!v) continue;
+        const src = l.uom ? { ...v, uom: l.uom } : v;
+        v.stockQty = round3(Number(v.stockQty || 0) + stockDeltaForSale(src, l.qty, uoms).stockQty);
       }
     }
     c.status = 'posted'; c.postedAt = now();

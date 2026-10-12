@@ -7,6 +7,11 @@
 // 关键口径:主分组 / 部门在 SKU 上没填时,**回落到所属分类的默认值**。
 // 这样老商品即使没逐个归口,报表口径依然完整;后台用 *Inherited 标记提示
 // 「这是继承来的,不是这个 SKU 自己设的」。
+//
+// 同时把「销售单位 → 库存单位」的换算与价格覆盖行数一并算好,让后台清单、
+// 报表、收银端三处看到的是同一个口径。
+
+import { resolveVariantStock } from './uomConvert.js';
 
 const byId = (rows) => {
   const m = new Map();
@@ -36,6 +41,14 @@ export function buildProducts(ctx = {}) {
   const spMap = byId(ctx.suppliers);
   const uomMap = byCode(ctx.uoms);
 
+  // 每个 SKU 有几个非默认价格级别的覆盖行 —— 后台用它标「有专属价目」
+  const priceCount = new Map();
+  for (const p of ctx.variantPrices || []) {
+    if (!p || p.variantId == null) continue;
+    const k = String(p.variantId);
+    priceCount.set(k, (priceCount.get(k) || 0) + 1);
+  }
+
   return (ctx.variants || []).map((v) => {
     const c = catMap.get(String(v.categoryId)) || {};
     const b = baseMap.get(String(v.baseId)) || {};
@@ -47,6 +60,9 @@ export function buildProducts(ctx = {}) {
     const dpId = dpOwn ? (c.departmentId ?? null) : v.departmentId;
     const pgId = v.printGroupId == null || v.printGroupId === '' ? null : v.printGroupId;
     const spId = v.supplierId == null || v.supplierId === '' ? null : v.supplierId;
+
+    // 销售单位 → 库存单位换算(整箱进货、按罐零售)
+    const conv = resolveVariantStock(v, ctx.uoms);
 
     return {
       id: v.id,
@@ -81,6 +97,16 @@ export function buildProducts(ctx = {}) {
       packUom: v.packUom || null,
       packUomName: uomNameOf(uomMap, v.packUom),
       packFactor: Number(v.packFactor == null ? 1 : v.packFactor),
+      // 换算结果:库存以 stockUom 计数,卖 1 个 uom 扣 factor 个 stockUom。
+      // unitsPerStock = 1 个库存单位等于多少个销售单位(给「1 箱 = 24 罐」这类展示用)。
+      stockUom: conv.stockUom,
+      stockUomName: uomNameOf(uomMap, conv.stockUom),
+      uomFactor: conv.factor,
+      uomConverted: conv.converted,
+      uomConvertReason: conv.reason,
+      unitsPerStock: conv.converted && conv.factor > 0 ? Math.round((1 / conv.factor) * 1000) / 1000 : 1,
+      // 价格覆盖行数:0 = 各价格级别都回落基础价
+      priceLevelCount: priceCount.get(String(v.id)) || 0,
       // 价格与库存
       price: Number(v.price || 0),
       cost: Number(v.cost || 0),
@@ -96,7 +122,7 @@ export function buildProducts(ctx = {}) {
 /** 支持的过滤条件(全部来自 query string) */
 export const PRODUCT_FILTERS = [
   'q', 'categoryId', 'mainGroupId', 'printGroupId', 'departmentId',
-  'supplierId', 'uom', 'active', 'unassigned',
+  'supplierId', 'uom', 'active', 'unassigned', 'converted',
 ];
 
 const eq = (a, b) => (a == null ? b == null : String(a) === String(b));
@@ -121,19 +147,23 @@ export function matchProduct(p, filters = {}) {
   if (f.active === '0' && p.isActive) return false;
   // 「未归口」:主分组或部门缺一,用于后台快速找出还没分类的商品
   if (f.unassigned === '1' && p.mainGroupId != null && p.departmentId != null) return false;
+  // 「需要单位换算」:销售单位 ≠ 库存单位,卖出时按系数折算
+  if (f.converted === '1' && !p.uomConverted) return false;
   return true;
 }
 
 /** KPI 汇总:给后台清单顶部的指标条用。 */
 export function summarizeProducts(rows = []) {
-  let active = 0, inactive = 0, withSupplier = 0, missingUom = 0, unassigned = 0;
+  let active = 0, inactive = 0, withSupplier = 0, missingUom = 0, unassigned = 0, convertedUom = 0, withPriceLevels = 0;
   for (const p of rows) {
     if (p.isActive) active += 1; else inactive += 1;
     if (p.supplierId != null) withSupplier += 1;
     if (!p.uom) missingUom += 1;
     if (p.mainGroupId == null || p.departmentId == null) unassigned += 1;
+    if (p.uomConverted) convertedUom += 1;
+    if (p.priceLevelCount > 0) withPriceLevels += 1;
   }
-  return { total: rows.length, active, inactive, withSupplier, missingUom, unassigned };
+  return { total: rows.length, active, inactive, withSupplier, missingUom, unassigned, convertedUom, withPriceLevels };
 }
 
 /** 批量修改允许触碰的字段 —— 白名单,避免误改价格/成本等敏感字段 */

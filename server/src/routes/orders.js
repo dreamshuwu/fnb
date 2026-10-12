@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query, getRow, insert, toOrder, toStore, toPayment, toMember, stringifyJSON, parseJSON } from '../db.js';
+import { query, getRow, insert, toOrder, toStore, toPayment, toMember, toVariant, toUom, toPriceLevel, toVariantPrice, stringifyJSON, parseJSON } from '../db.js';
 import { authenticate, rbac, tenant, requirePermission } from '../middleware/auth.js';
 import { createOrderSchema, orderItemSchema, checkoutSchema, voidSchema } from '../validators.js';
 import { emitToStore } from '../sockets.js';
@@ -8,6 +8,9 @@ import {
   checkPointsRedeem, checkCreditLimit, applyPoints, applyCredit, applyMemberSpend,
 } from '../memberEngine.js';
 import { memberAdapter } from '../memberStore.js';
+// 价目解析与单位换算:与 devMode 共用同一份,预览与生产定价口径不会分叉
+import { applyLevelToItems, buildPriceMap, defaultLevelCode } from '../priceEngine.js';
+import { stockDeltaForSale, stockQtyOfItem } from '../uomConvert.js';
 
 const router = Router();
 router.use(authenticate);
@@ -72,18 +75,48 @@ async function getOrder(id, orgId, storeId) {
   return r ? toOrder(r) : null;
 }
 
+// ---------------------------------------------------------------------------
+// 定价与库存换算的取数层 —— 共享模块只吃纯数据,这里负责从 MySQL 取
+// ---------------------------------------------------------------------------
+async function loadPricingContext(orgId, storeId) {
+  const [levels, prices, variants, uoms] = await Promise.all([
+    query('SELECT * FROM price_levels WHERE org_id=? AND store_id=? ORDER BY sort_order ASC, id ASC', [orgId, storeId]),
+    query('SELECT * FROM variant_prices WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM menu_variants WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    query('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [orgId, storeId]),
+  ]);
+  return {
+    levels: levels.map(toPriceLevel),
+    priceMap: buildPriceMap(prices.map(toVariantPrice)),
+    variantById: new Map(variants.map((v) => [String(v.id), toVariant(v)])),
+    uoms: uoms.map(toUom),
+  };
+}
+
+/**
+ * 服务端定价:按价目级别重算订单行单价。
+ * 只有能解析到真实变体的行才会被覆盖 —— Open Item 这类临时商品必须保留收银员输入的价。
+ */
+async function priceOrderItems(items, levelCode, orgId, storeId) {
+  const ctx = await loadPricingContext(orgId, storeId);
+  const r = applyLevelToItems(items || [], ctx.variantById, { levelCode, priceMap: ctx.priceMap, levels: ctx.levels });
+  return { ...r, defaultLevelCode: defaultLevelCode(ctx.levels) };
+}
+
 router.post('/', requirePermission('order.create'), async (req, res) => {
   const p = createOrderSchema.parse(req.body);
   const { orgId, storeId } = tenant(req);
   const settings = await loadSettings(orgId, storeId);
-  const items = p.items.map((i) => ({ ...i, status: 'pending' }));
+  // 服务端定价:客户端传的 unitPrice 只对解析不到真实变体的行生效
+  const priced = await priceOrderItems(p.items, p.priceLevel, orgId, storeId);
+  const items = priced.items.map((i) => ({ ...i, status: 'pending' }));
   const { subtotal, discount, serviceCharge, tax, total } = computeGst(items, p.discount, settings);
   const openShift = await getRow('SELECT id FROM shifts WHERE org_id=? AND store_id=? AND cashier_id=? AND status=? ORDER BY id DESC LIMIT 1', [orgId, storeId, req.user.id, 'open']);
   const held = !!p.hold;
   const id = await insert(
     `INSERT INTO orders
-      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, status, hold_label, held_at, created_by, shift_id, member_id, sales_person_id, discount_type)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      (org_id, store_id, order_no, type, table_id, customer_name, phone, items, subtotal, discount, service_charge, tax, total, status, hold_label, held_at, created_by, shift_id, member_id, sales_person_id, discount_type, price_level)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       orgId, storeId, orderNo(), p.type, p.tableId ? Number(p.tableId) : null,
       p.customerName ?? null, p.phone ?? null, stringifyJSON(items),
@@ -93,6 +126,8 @@ router.post('/', requirePermission('order.create'), async (req, res) => {
       p.memberId ? Number(p.memberId) : null,
       p.salesPersonId ? Number(p.salesPersonId) : (held ? null : req.user.id),
       p.discountType ?? null,
+      // 记的是**生效的**级别编码(不传就是默认级别),报表按它分组不会出现空档
+      priced.levelCode || null,
     ]
   );
   if (!held && p.type === 'dine_in' && p.tableId) {
@@ -223,7 +258,9 @@ router.post('/:id/items', requirePermission('order.create'), async (req, res) =>
   if (!row) return res.status(404).json({ error: 'not found' });
   if (row.status !== 'open') return res.status(400).json({ error: 'order not open' });
   const items = parseJSON(row.items);
-  items.push({ ...p, status: 'pending' });
+  // 加行同样按订单的价目级别定价,否则收银端漏传 unitPrice 就会写进 0 元
+  const pricedOne = await priceOrderItems([p], row.price_level, orgId, storeId);
+  items.push({ ...pricedOne.items[0], status: 'pending' });
   const settings = await loadSettings(orgId, storeId);
   const totals = computeGst(items, row.discount, settings);
   await query(
@@ -239,11 +276,14 @@ router.put('/:id/items', requirePermission('order.create'), async (req, res) => 
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (!['open', 'hold'].includes(row.status)) return res.status(400).json({ error: 'order not editable' });
-  const items = (req.body.items || []).map((i) => ({ ...i, status: 'pending' }));
+  // 允许在取单后换价目级别;不传则沿用订单原来的级别
+  const level = req.body.priceLevel !== undefined ? req.body.priceLevel : row.price_level;
+  const priced = await priceOrderItems(req.body.items || [], level, orgId, storeId);
+  const items = priced.items.map((i) => ({ ...i, status: 'pending' }));
   if (!items.length) return res.status(400).json({ error: 'items required' });
   const settings = await loadSettings(orgId, storeId);
   const totals = computeGst(items, req.body.discount ?? row.discount, settings);
-  await query('UPDATE orders SET items=?, subtotal=?, discount=?, service_charge=?, tax=?, total=? WHERE id=?', [stringifyJSON(items), totals.subtotal, totals.discount, totals.serviceCharge, totals.tax, totals.total, row.id]);
+  await query('UPDATE orders SET items=?, subtotal=?, discount=?, service_charge=?, tax=?, total=?, price_level=? WHERE id=?', [stringifyJSON(items), totals.subtotal, totals.discount, totals.serviceCharge, totals.tax, totals.total, priced.levelCode || null, row.id]);
   res.json(toOrder(await getRow('SELECT * FROM orders WHERE id=?', [row.id])));
 });
 
@@ -268,22 +308,40 @@ router.put('/:id/status', async (req, res) => {
 
 async function deductInventory(order, user, io) {
   const low = [];
+  const converted = [];
+  const uoms = (await query('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [user.orgId, user.storeId])).map(toUom);
   for (const it of order.items) {
     const vid = it.variantId || it.itemId;
     if (!vid) continue;
     const v = await getRow('SELECT * FROM menu_variants WHERE id=?', [Number(vid)]);
     if (!v) continue;
+    // 销售单位 → 库存单位换算:整箱进货、按罐零售时卖 1 罐只扣 1/24 箱。
+    // 换算结果写回订单行,退款/反结算时按同一份数字回补,不因后来改包装系数而漂移。
+    const conv = stockDeltaForSale(toVariant(v), it.qty, uoms);
+    it.stockQty = conv.stockQty;
+    it.uomFactor = conv.factor;
+    it.sellUom = conv.sellUom;
+    it.stockUom = conv.stockUom;
     const before = Number(v.stock_qty || 0);
-    const after = Math.max(0, before - it.qty);
+    const after = Math.max(0, Math.round((before - conv.stockQty) * 1000) / 1000);
     await query('UPDATE menu_variants SET stock_qty=? WHERE id=?', [after, v.id]);
     await insert(
       `INSERT INTO stock_movements (org_id, store_id, item_id, type, delta, before, after, ref_order_id, created_by)
        VALUES (?,?,?,?,?,?,?,?,?)`,
-      [user.orgId, user.storeId, v.id, 'sale', -it.qty, before, after, order.id, user.id]
+      [user.orgId, user.storeId, v.id, 'sale', -conv.stockQty, before, after, order.id, user.id]
     );
+    if (conv.converted) {
+      converted.push({
+        variantId: String(v.id), code: v.code, sellQty: conv.sellQty, stockQty: conv.stockQty,
+        factor: conv.factor, sellUom: conv.sellUom, stockUom: conv.stockUom,
+      });
+    }
     if (after < Number(v.stock_threshold || 0)) low.push({ itemId: String(v.id), name: v.name, quantity: after });
   }
+  // 把换算明细落回订单行,后续退款/反结算直接复用
+  if (converted.length) await query('UPDATE orders SET items=? WHERE id=?', [stringifyJSON(order.items), order.id]);
   if (low.length) emitToStore(io, user.storeId, 'inventory:low', low);
+  return converted;
 }
 
 router.post('/:id/checkout', requirePermission('payment.settle'), async (req, res) => {
@@ -681,8 +739,15 @@ router.post('/:id/unsettle', requirePermission('order.unsettle'), async (req, re
   const row = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (!['paid', 'refunded'].includes(row.status)) return res.status(400).json({ error: 'only settled orders can be unsettled' });
+  // 回补库存:按结账时写回订单行的 stockQty,不按当前包装系数重算(否则库存会漂移)
+  const uoms = (await query('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [orgId, storeId])).map(toUom);
   for (const it of parseJSON(row.items)) {
-    await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=? AND org_id=? AND store_id=?', [Number(it.qty), Number(it.variantId || it.itemId), orgId, storeId]);
+    const vid = Number(it.variantId || it.itemId);
+    if (!vid) continue;
+    const v = await getRow('SELECT * FROM menu_variants WHERE id=? AND org_id=? AND store_id=?', [vid, orgId, storeId]);
+    if (!v) continue;
+    const back = stockQtyOfItem(it, toVariant(v), uoms);
+    await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=? AND org_id=? AND store_id=?', [back, vid, orgId, storeId]);
   }
   const payments = await query('SELECT method,amount FROM payments WHERE order_id=?', [row.id]);
   await query('DELETE FROM payments WHERE order_id=?', [row.id]);

@@ -5,7 +5,7 @@ import {
   toStockTransfer, toStockTransferLine, toPurchaseOrderLine, toOrder,
   toMember, toMemberTier, toPointsLedger, toMemberTopup,
   toMenuCategory, toMenuBase, toVariant, toMainGroup, toPrintGroup,
-  toDepartment, toUom, toSupplier,
+  toDepartment, toUom, toSupplier, toPriceLevel, toVariantPrice,
 } from '../db.js';
 import { authenticate, tenant, requirePermission } from '../middleware/auth.js';
 import { REPORT_CATALOG, REPORT_CATEGORIES, reportColumns } from '../reportCatalog.js';
@@ -13,6 +13,8 @@ import { runReport, reportTitle, makeFilter } from '../reportEngine.js';
 import { buildCsv, buildXlsx, buildPrintHtml } from '../exporters.js';
 // 产品主档拼装(含主分组/部门继承回落)与后台 /menu/products 共用同一份规则
 import { buildProducts } from '../productMaster.js';
+// 价目解析与单位换算:定价与库存扣减的唯一口径
+import { stockDeltaForSale, stockQtyOfItem } from '../uomConvert.js';
 import {
   applyPoints, applyCredit, resolveTier, tierDiscountPercent,
   statementEvents, runStatement, sliceStatement,
@@ -29,6 +31,22 @@ const router = Router();
 router.use(authenticate);
 const dt = (v) => v == null ? null : (v instanceof Date ? v.toISOString() : String(v));
 const dtDate = (v) => v == null ? null : (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
+
+/**
+ * 退款/退货回补的库存数量。
+ * 优先按结账时写回订单行的 stockQty 按比例回补(部分退款只回补对应比例);
+ * 老订单没有 stockQty 时,才按当前包装系数重算 —— 这样结账后改包装不会让库存漂移。
+ */
+async function restockQty(orgId, storeId, item, qty, lineQty) {
+  const vid = Number(item?.variantId || item?.itemId);
+  if (!vid) return 0;
+  const v = await getRow('SELECT * FROM menu_variants WHERE id=? AND org_id=? AND store_id=?', [vid, orgId, storeId]);
+  if (!v) return 0;
+  const uoms = (await query('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [orgId, storeId])).map(toUom);
+  const per = stockQtyOfItem(item, toVariant(v), uoms);
+  const ratio = Number(lineQty) > 0 ? Number(qty) / Number(lineQty) : 1;
+  return Math.round(per * ratio * 1000) / 1000;
+}
 const member = (r) => toMember(r);
 const memberRow = (r) => ({
   ...toMember(r),
@@ -670,8 +688,14 @@ router.post('/finance/credit-notes/:id/post', requirePermission('payment.credit_
   if (!r) return res.status(404).json({ error: 'not found' });
   if (r.status !== 'open') return res.status(400).json({ error: 'already posted' });
   if (r.restock) {
+    // 按贷项单行自己的计量单位换算回库存单位 —— 退货也是按销售单位退的
+    const uoms = (await query('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [orgId, storeId])).map(toUom);
     for (const l of parseJSON(r.items)) {
-      await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE org_id=? AND store_id=? AND (code=? OR (barcode IS NOT NULL AND barcode=?))', [Number(l.qty || 0), orgId, storeId, l.code || '', l.barcode || '']);
+      const v = await getRow('SELECT * FROM menu_variants WHERE org_id=? AND store_id=? AND (code=? OR (barcode IS NOT NULL AND barcode=?))', [orgId, storeId, l.code || '', l.barcode || '']);
+      if (!v) continue;
+      const src = l.uom ? { ...toVariant(v), uom: l.uom } : toVariant(v);
+      const back = stockDeltaForSale(src, l.qty, uoms).stockQty;
+      await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=? AND org_id=? AND store_id=?', [back, v.id, orgId, storeId]);
     }
   }
   await query('UPDATE credit_notes SET status="posted",posted_at=NOW() WHERE id=?', [r.id]);
@@ -757,7 +781,8 @@ async function buildReportDataset(orgId, storeId) {
     invoices, creditNotes, variants, categories, customerStock, stockTakes, suppliers, purchaseOrders,
     attendanceRows, reprintLogs, dayEnds, orderTransfers, vouchers, voucherTxns, rebates, settings,
     inventoryItems, stockMovements, purchaseOrderLines, goodsReceipts, goodsReceiptLines,
-    stockTransfers, stockTransferLines, mainGroups, printGroups, departments, uoms, menuBases] = await Promise.all([
+    stockTransfers, stockTransferLines, mainGroups, printGroups, departments, uoms, menuBases,
+    priceLevels, variantPrices] = await Promise.all([
     query('SELECT o.*, t.number AS table_no, u.name AS cashier_name, sp.name AS sales_person_name, m.member_no, m.name AS member_name FROM orders o LEFT JOIN tables t ON t.id=o.table_id LEFT JOIN users u ON u.id=o.created_by LEFT JOIN users sp ON sp.id=o.sales_person_id LEFT JOIN members m ON m.id=o.member_id WHERE o.org_id=? AND o.store_id=?', [orgId, storeId]),
     query('SELECT * FROM payments WHERE org_id=? AND store_id=?', [orgId, storeId]),
     query('SELECT * FROM refunds WHERE org_id=? AND store_id=?', [orgId, storeId]),
@@ -800,6 +825,9 @@ async function buildReportDataset(orgId, storeId) {
     safe('SELECT * FROM departments WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM uoms WHERE org_id=? AND store_id=?', [orgId, storeId]),
     safe('SELECT * FROM menu_bases WHERE org_id=? AND store_id=?', [orgId, storeId]),
+    // ---- 价格级别(块⑩):价目报表与销售按级别分组 ----
+    safe('SELECT * FROM price_levels WHERE org_id=? AND store_id=? ORDER BY sort_order ASC, id ASC', [orgId, storeId]),
+    safe('SELECT * FROM variant_prices WHERE org_id=? AND store_id=?', [orgId, storeId]),
   ]);
 
   const variantById = new Map(variants.map((v) => [String(v.id), v]));
@@ -815,6 +843,7 @@ async function buildReportDataset(orgId, storeId) {
     departments: departments.map(toDepartment),
     suppliers: suppliers.map(toSupplier),
     uoms: uoms.map(toUom),
+    variantPrices: variantPrices.map(toVariantPrice),
   });
   const productById = new Map(products.map((p) => [String(p.id), p]));
 
@@ -841,12 +870,17 @@ async function buildReportDataset(orgId, storeId) {
   return {
     // 产品主档(供 Product Listing 报表使用),与后台 /menu/products 同源
     products,
+    // 价目级别与 SKU 价格覆盖行(供 Sales By Price Level / Price List 报表使用)
+    priceLevels: priceLevels.map(toPriceLevel),
+    variantPrices: variantPrices.map(toVariantPrice),
     orders: orders.map((o) => ({
       id: o.id, orderNo: o.order_no, createdAt: dt(o.created_at), status: o.status, type: o.type,
       tableNo: o.table_no, cashierName: o.cashier_name || 'Unknown', salesPersonName: o.sales_person_name || o.cashier_name || 'Unknown',
       memberNo: o.member_no || null, memberName: o.member_name || null,
       discountType: o.discount_type || null, voidReason: o.void_reason || null,
-      items: parseJSON(o.items).map(decorate),
+      // 订单头记的是生效的价目级别;订单行上还留了逐行的级别(可能被手工改过)
+      priceLevel: o.price_level || null,
+      items: parseJSON(o.items).map((it) => ({ ...decorate(it), priceLevel: it.priceLevel || o.price_level || null })),
       subtotal: Number(o.subtotal || 0), discount: Number(o.discount || 0),
       serviceCharge: Number(o.service_charge || 0), tax: Number(o.tax || 0), total: Number(o.total || 0),
     })),
@@ -943,7 +977,7 @@ router.post('/orders/:id/split', requirePermission('order.split'), async (req, r
 
 // ---- Refund ----
 router.get('/refunds', async (req, res) => { const { orgId, storeId } = tenant(req); res.json((await query('SELECT * FROM refunds WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId])).map((r) => ({ _id: r.id, id: r.id, refundNo: r.refund_no, orderId: r.order_id, orderNo: r.order_no, amount: Number(r.amount || 0), method: r.method, reason: r.reason, items: parseJSON(r.items), restock: !!r.restock, createdAt: dt(r.created_at) }))); });
-router.post('/orders/:id/refund', requirePermission('payment.refund'), async (req, res) => { const { orgId, storeId } = tenant(req); const o = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!o) return res.status(404).json({ error: 'not found' }); if (!['paid', 'served'].includes(o.status)) return res.status(400).json({ error: 'only paid orders can be refunded' }); const b = req.body || {}; const restock = b.restock !== false; const items = parseJSON(o.items); let amount = Number(b.amount || 0); const refundItems = []; if (Array.isArray(b.items) && b.items.length) { for (const rl of b.items) { const src = items[rl.index] || items.find((i) => i.code === rl.code); if (!src) continue; const qty = Math.min(Number(rl.qty || src.qty), src.qty); amount += Math.round(qty * Number(src.unitPrice) * 100) / 100; refundItems.push({ code: src.code, name: src.name, qty, unitPrice: src.unitPrice }); if (restock) await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=?', [qty, Number(src.variantId || src.itemId)]); } } else { amount = amount || Math.round((Number(o.total) - Number(o.refunded_amount || 0)) * 100) / 100; if (restock) for (const it of items) await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=?', [Number(it.qty), Number(it.variantId || it.itemId)]); } if (amount <= 0) return res.status(400).json({ error: 'refund amount must be positive' }); const newRefunded = Math.round((Number(o.refunded_amount || 0) + amount) * 100) / 100; const newStatus = newRefunded >= Number(o.total) - 0.001 ? 'refunded' : o.status; await query('UPDATE orders SET refunded_amount=?,status=? WHERE id=?', [newRefunded, newStatus, o.id]); const id = await insert('INSERT INTO refunds (org_id,store_id,refund_no,order_id,order_no,amount,method,reason,items,restock,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)', [orgId, storeId, `RF${Date.now()}`, o.id, o.order_no, amount, b.method || 'cash', b.reason || 'customer refund', stringifyJSON(refundItems), restock ? 1 : 0, req.user.id]); res.status(201).json({ orderId: o.id, refundedAmount: newRefunded, status: newStatus, refundId: id }); });
+router.post('/orders/:id/refund', requirePermission('payment.refund'), async (req, res) => { const { orgId, storeId } = tenant(req); const o = await getRow('SELECT * FROM orders WHERE id=? AND org_id=? AND store_id=?', [req.params.id, orgId, storeId]); if (!o) return res.status(404).json({ error: 'not found' }); if (!['paid', 'served'].includes(o.status)) return res.status(400).json({ error: 'only paid orders can be refunded' }); const b = req.body || {}; const restock = b.restock !== false; const items = parseJSON(o.items); let amount = Number(b.amount || 0); const refundItems = []; if (Array.isArray(b.items) && b.items.length) { for (const rl of b.items) { const src = items[rl.index] || items.find((i) => i.code === rl.code); if (!src) continue; const qty = Math.min(Number(rl.qty || src.qty), src.qty); amount += Math.round(qty * Number(src.unitPrice) * 100) / 100; refundItems.push({ code: src.code, name: src.name, qty, unitPrice: src.unitPrice }); if (restock) { const back = await restockQty(orgId, storeId, src, qty, Number(src.qty)); if (back) await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=?', [back, Number(src.variantId || src.itemId)]); } } } else { amount = amount || Math.round((Number(o.total) - Number(o.refunded_amount || 0)) * 100) / 100; if (restock) for (const it of items) { const back = await restockQty(orgId, storeId, it, Number(it.qty), Number(it.qty)); if (back) await query('UPDATE menu_variants SET stock_qty=stock_qty+? WHERE id=?', [back, Number(it.variantId || it.itemId)]); } } if (amount <= 0) return res.status(400).json({ error: 'refund amount must be positive' }); const newRefunded = Math.round((Number(o.refunded_amount || 0) + amount) * 100) / 100; const newStatus = newRefunded >= Number(o.total) - 0.001 ? 'refunded' : o.status; await query('UPDATE orders SET refunded_amount=?,status=? WHERE id=?', [newRefunded, newStatus, o.id]); const id = await insert('INSERT INTO refunds (org_id,store_id,refund_no,order_id,order_no,amount,method,reason,items,restock,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)', [orgId, storeId, `RF${Date.now()}`, o.id, o.order_no, amount, b.method || 'cash', b.reason || 'customer refund', stringifyJSON(refundItems), restock ? 1 : 0, req.user.id]); res.status(201).json({ orderId: o.id, refundedAmount: newRefunded, status: newStatus, refundId: id }); });
 
 // ---- 促销 ----
 router.get('/promotions', async (req, res) => { const { orgId, storeId } = tenant(req); const rows = await query('SELECT * FROM promotions WHERE org_id=? AND store_id=? ORDER BY id DESC', [orgId, storeId]); res.json(rows.map((r) => ({ _id: r.id, id: r.id, code: r.code, name: r.name, type: r.type, value: Number(r.value || 0), minSpend: Number(r.min_spend || 0), validFrom: dt(r.valid_from), validUntil: dt(r.valid_until), isActive: !!r.is_active }))); });

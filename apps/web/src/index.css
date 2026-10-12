@@ -340,18 +340,41 @@ body { margin: 0; background: #f4f6fb; }
 .menu-bulk > b { align-self: center; color: #c2513a; font-size: 12px; }
 .menu-bulk .ops-action { min-height: 32px; }
 /* 产品清单列多,列宽按 1180 内容宽反推,保证 Edit/Delete 不被挤出可视区 */
-.menu-product-table .ops-row { grid-template-columns: 26px 88px minmax(130px, 1.4fr) 106px 98px 106px minmax(84px, 1fr) 72px 62px 46px 54px 104px; min-width: 1086px; }
+.menu-product-table .ops-row { grid-template-columns: 26px 88px minmax(130px, 1.4fr) 106px 98px 106px minmax(84px, 1fr) 74px 62px 64px 46px 54px 104px; min-width: 1086px; }
 .menu-cat-table .ops-row { grid-template-columns: minmax(130px, 1.2fr) 150px 140px 140px 100px 60px 76px 130px; }
 .menu-base-table .ops-row { grid-template-columns: minmax(150px, 1.4fr) 150px 110px 70px 80px 130px; }
 .menu-mod-table .ops-row { grid-template-columns: 90px minmax(150px, 1.4fr) 120px 110px 70px 80px 130px; }
 .menu-link-table .ops-row { grid-template-columns: minmax(160px, 1.3fr) minmax(170px, 1.4fr) 140px 110px; }
 .menu-master-table .ops-row { grid-template-columns: 110px minmax(150px, 1.3fr) 60px 150px 80px minmax(140px, 1.2fr) 190px; }
 .menu-uom-table .ops-row { grid-template-columns: 90px minmax(150px, 1.3fr) 140px 110px 80px 60px 80px 130px; }
+.menu-level-table .ops-row { grid-template-columns: 92px minmax(150px, 1.3fr) 58px 118px 110px 78px minmax(130px, 1.2fr) 252px; }
 .menu-product-table .ops-row span, .menu-cat-table .ops-row span, .menu-base-table .ops-row span,
 .menu-mod-table .ops-row span, .menu-link-table .ops-row span, .menu-master-table .ops-row span,
-.menu-uom-table .ops-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-uom-table .ops-row span, .menu-level-table .ops-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-product-table .ops-row .ops-inline-actions, .menu-cat-table .ops-row .ops-inline-actions,
 .menu-base-table .ops-row .ops-inline-actions, .menu-mod-table .ops-row .ops-inline-actions,
 .menu-link-table .ops-row .ops-inline-actions, .menu-master-table .ops-row .ops-inline-actions,
-.menu-uom-table .ops-row .ops-inline-actions { overflow: visible; }
+.menu-uom-table .ops-row .ops-inline-actions, .menu-level-table .ops-row .ops-inline-actions { overflow: visible; }
 .menu-product-table .ops-row .menu-check, .menu-product-table .ops-row .member-sub { overflow: visible; }
+
+/* 计量单位换算提示:1 BOX = 24 CAN —— 结账扣库存就是按这个口径折算 */
+.menu-conv { color: #6b7f9e; font-weight: 650; }
+/* 商品表单里「默认价格级别」的只读镜像:基础价的真源在 Price 字段,这里只是呼应 */
+.menu-price-mirror:disabled { color: #6b7f9e; border-style: dashed; background: #f2f5fa; cursor: not-allowed; }
+
+/* 价目矩阵:SKU × 价格级别。列数是数据驱动的,网格模板由 JS 内联给出 */
+.menu-matrix-table .ops-row { min-height: 46px; }
+.matrix-head-default { color: #c2513a; font-weight: 800; }
+.matrix-cell { display: flex; align-items: center; overflow: visible; }
+.matrix-value { display: flex; width: 100%; flex-direction: column; align-items: flex-start; gap: 1px; padding: 4px 7px; border: 1px solid transparent; border-radius: 7px; background: transparent; font-size: 11px; font-weight: 750; text-align: left; cursor: pointer; }
+.matrix-value small { font-size: 9px; font-weight: 700; letter-spacing: .3px; }
+.matrix-cell.is-default .matrix-value { color: #c2513a; border-color: #ffd9d0; background: #fff4f1; }
+.matrix-cell.is-override .matrix-value { color: #25324a; border-color: #d6e6fb; background: #eef6ff; }
+.matrix-cell.is-fallback .matrix-value { color: #a6b0c0; border-color: #eef1f6; background: #fafbfc; }
+.matrix-value:hover:not(:disabled) { border-color: #fb6b53; }
+.matrix-value:disabled { cursor: default; }
+.matrix-input { width: 100%; height: 32px; padding: 0 7px; border: 1px solid #fb6b53; border-radius: 7px; color: #25324a; background: #fff; font-size: 11px; font-weight: 750; }
+
+/* 收银端价格级别:会改变成交价,所以用琥珀色让它显眼一点 */
+.cashier-pricelevel select { color: #96690f; border-color: #f0dcae; background: #fdf7ec; font-weight: 750; }
+.cashier-pricelevel select:disabled { color: #a3adbc; border-color: #e1e6ef; background: #f2f5fa; }

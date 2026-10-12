@@ -18,6 +18,7 @@ import { useAuth } from '../auth/AuthContext.jsx';
 
 const TABS = [
   ['products', 'Products'],
+  ['price-matrix', 'Price Matrix'],
   ['categories', 'Categories'],
   ['bases', 'Bases'],
   ['modifiers', 'Modifiers'],
@@ -26,6 +27,7 @@ const TABS = [
   ['print-groups', 'Print Groups'],
   ['departments', 'Departments'],
   ['uoms', 'UOM'],
+  ['price-levels', 'Price Levels'],
 ];
 
 const UOM_DIMENSIONS = [['count', 'Count 计数'], ['weight', 'Weight 重量'], ['volume', 'Volume 容量']];
@@ -44,11 +46,15 @@ const MENU_ERRORS = {
   no_ids: '请先勾选商品',
   no_fields: '请选择要修改的字段',
   too_many_ids: '一次最多修改 500 条',
+  default_level: '默认价格级别不能删除,请先把另一个级别设为默认',
 };
 const errText = (e) => {
-  const code = e?.response?.data?.error;
+  const data = e?.response?.data || {};
+  const code = data.error;
   if (code === 'master_in_use') {
-    const counts = e.response.data.counts || {};
+    // 默认价格级别是「基础价」的落点,删掉整条价格链就断了 —— 服务端会带 reason 区分
+    if (data.reason === 'default_level') return MENU_ERRORS.default_level;
+    const counts = data.counts || {};
     const detail = Object.entries(counts).map(([k, v]) => `${k} × ${v}`).join('、');
     return `${MENU_ERRORS[code]}${detail ? `(${detail})` : ''}`;
   }
@@ -94,16 +100,16 @@ function Empty({ text = 'No records yet' }) { return <div className="ops-empty">
 function useLookups() {
   const [lk, setLk] = useState({
     categories: [], bases: [], modifiers: [], baseModifiers: [],
-    mainGroups: [], printGroups: [], departments: [], suppliers: [], uoms: [],
+    mainGroups: [], printGroups: [], departments: [], suppliers: [], uoms: [], priceLevels: [],
   });
   const reload = async () => {
     const g = (p) => api.get(p).then((r) => r.data || []).catch(() => []);
-    const [categories, bases, modifiers, baseModifiers, mainGroups, printGroups, departments, suppliers, uoms] =
+    const [categories, bases, modifiers, baseModifiers, mainGroups, printGroups, departments, suppliers, uoms, priceLevels] =
       await Promise.all([
         g('/menu/categories'), g('/menu/bases'), g('/menu/modifiers'), g('/menu/base-modifiers'),
-        g('/main-groups'), g('/print-groups'), g('/departments'), g('/suppliers'), g('/uoms'),
+        g('/main-groups'), g('/print-groups'), g('/departments'), g('/suppliers'), g('/uoms'), g('/price-levels'),
       ]);
-    setLk({ categories, bases, modifiers, baseModifiers, mainGroups, printGroups, departments, suppliers, uoms });
+    setLk({ categories, bases, modifiers, baseModifiers, mainGroups, printGroups, departments, suppliers, uoms, priceLevels });
   };
   useEffect(() => { reload(); }, []);
   return [lk, reload];
@@ -125,7 +131,7 @@ export default function MenuPage() {
         <div>
           <div className="modern-eyebrow">SMPOS / BACK OFFICE</div>
           <h1>Menu &amp; Product Master</h1>
-          <p>分类 · 基底 · 修饰 · 产品主档 · 商品大类 · 打印分组 · 部门 · 计量单位</p>
+          <p>分类 · 基底 · 修饰 · 产品主档 · 价目 · 商品大类 · 打印分组 · 部门 · 计量单位</p>
         </div>
         <div className="operations-date">{new Date().toLocaleDateString('en-GB')}</div>
       </div>
@@ -138,6 +144,7 @@ export default function MenuPage() {
 
       <div className="operations-content">
         {active === 'products' && <ProductsPanel lk={lk} reloadLookups={reloadLookups} />}
+        {active === 'price-matrix' && <PriceMatrixPanel lk={lk} />}
         {active === 'categories' && <CategoriesPanel lk={lk} reloadLookups={reloadLookups} />}
         {active === 'bases' && <BasesPanel lk={lk} reloadLookups={reloadLookups} />}
         {active === 'modifiers' && <ModifiersPanel lk={lk} reloadLookups={reloadLookups} />}
@@ -146,25 +153,38 @@ export default function MenuPage() {
         {active === 'print-groups' && <MasterDataPanel kind="print-groups" title="Print Groups" subtitle="打印分组:决定出单路由到哪台打印机(厨房单 / 水吧单 / 柜台单)" lk={lk} reloadLookups={reloadLookups} />}
         {active === 'departments' && <MasterDataPanel kind="departments" title="Departments" subtitle="部门:财务与报表口径,与 KDS 出单站别分开" lk={lk} reloadLookups={reloadLookups} />}
         {active === 'uoms' && <UomPanel lk={lk} reloadLookups={reloadLookups} />}
+        {active === 'price-levels' && <PriceLevelsPanel lk={lk} reloadLookups={reloadLookups} />}
       </div>
     </div>
   );
 }
 
 // ============================================================ 产品主档
+// prices 只装「非默认级别」的覆盖价,默认级别的价格就是 price 字段本身 ——
+// 服务端的不变量是 menu_variants.price === 默认级别价,前端不复制这份真源。
 const emptyProduct = () => ({
   baseId: '', categoryId: '', code: '', name: '', price: '', cost: '',
   barcode: '', sortOrder: '', isActive: true,
   mainGroupId: '', printGroupId: '', departmentId: '', supplierId: '',
   uom: '', packUom: '', packFactor: '1', stockQty: '0', stockThreshold: '0',
+  prices: {},
 });
+
+// 价格级别:挑出默认级别(基础价的落点)与其余可覆盖的级别。
+function splitLevels(levels = []) {
+  const list = (levels || []).filter((l) => l && l.code);
+  const def = list.find((l) => l.isDefault) || list[0] || null;
+  const defCode = def ? String(def.code).toUpperCase() : null;
+  return { list, def, defCode, others: list.filter((l) => l !== def) };
+}
 
 function ProductsPanel({ lk, reloadLookups }) {
   const { can } = useAuth();
   const canEdit = can('menu.edit');
+  const { def: defLevel, defCode, others: otherLevels } = splitLevels(lk.priceLevels);
   const [rows, setRows] = useState([]);
   const [summary, setSummary] = useState({});
-  const [filters, setFilters] = useState({ q: '', categoryId: '', mainGroupId: '', printGroupId: '', departmentId: '', supplierId: '', uom: '', active: '', unassigned: false });
+  const [filters, setFilters] = useState({ q: '', categoryId: '', mainGroupId: '', printGroupId: '', departmentId: '', supplierId: '', uom: '', active: '', unassigned: false, converted: false });
   const [selected, setSelected] = useState([]);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -181,16 +201,17 @@ function ProductsPanel({ lk, reloadLookups }) {
     for (const k of ['categoryId', 'mainGroupId', 'printGroupId', 'departmentId', 'supplierId', 'uom']) if (filters[k]) p[k] = filters[k];
     if (filters.active) p.active = filters.active;
     if (filters.unassigned) p.unassigned = '1';
+    if (filters.converted) p.converted = '1';
     const r = await api.get('/menu/products', { params: p });
     setRows(r.data?.rows || []);
     setSummary(r.data?.summary || {});
   };
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [filters.active, filters.unassigned, filters.categoryId, filters.mainGroupId, filters.printGroupId, filters.departmentId, filters.supplierId, filters.uom]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [filters.active, filters.unassigned, filters.converted, filters.categoryId, filters.mainGroupId, filters.printGroupId, filters.departmentId, filters.supplierId, filters.uom]);
 
   const setF = (k, v) => setFilters((f) => ({ ...f, [k]: v }));
 
   const openNew = () => { setEditingId(null); setForm(emptyProduct()); setShowForm(true); };
-  const openEdit = (p) => {
+  const openEdit = async (p) => {
     setEditingId(p.id);
     setForm({
       baseId: p.baseId == null ? '' : String(p.baseId),
@@ -207,15 +228,41 @@ function ProductsPanel({ lk, reloadLookups }) {
       uom: p.uom || '', packUom: p.packUom || '',
       packFactor: String(p.packFactor ?? 1),
       stockQty: String(p.stockQty ?? 0), stockThreshold: String(p.stockThreshold ?? 0),
+      prices: {},
     });
     setShowForm(true);
+    // 各价格级别当前是「有覆盖行」还是「回落基础价」只有矩阵接口能说清:
+    // source === 'level' 才代表存了覆盖行,否则留空让用户继续看到「回落」。
+    try {
+      const r = await api.get('/menu/price-matrix');
+      const row = (r.data?.rows || []).find((x) => String(x.variantId) === String(p.id));
+      if (row) {
+        const next = {};
+        for (const lv of otherLevels) {
+          const code = String(lv.code).toUpperCase();
+          const cell = (row.cells || {})[code];
+          next[code] = cell && cell.source === 'level' ? String(cell.price) : '';
+        }
+        setForm((f) => ({ ...f, prices: next }));
+      }
+    } catch { /* 价目拉取失败不该阻塞主档编辑 */ }
   };
+
+  // 非默认级别的价目条目。留空 = 传 null = 删除覆盖行,回落默认级别的基础价。
+  const priceEntries = () => otherLevels
+    .filter((lv) => form.prices[String(lv.code).toUpperCase()] !== undefined)
+    .map((lv) => {
+      const code = String(lv.code).toUpperCase();
+      const raw = form.prices[code];
+      return { levelCode: code, price: raw === '' || raw == null ? null : Number(raw) };
+    });
 
   const save = async () => {
     if (!form.name.trim()) { alert('请填写商品名称'); return; }
     if (!form.code.trim()) { alert('请填写商品编码'); return; }
     if (!form.baseId) { alert('请选择所属基底'); return; }
     if (form.price === '' || Number.isNaN(Number(form.price))) { alert('请填写有效售价'); return; }
+    const entries = priceEntries();
     const payload = {
       baseId: form.baseId,
       categoryId: form.categoryId || undefined,
@@ -232,8 +279,14 @@ function ProductsPanel({ lk, reloadLookups }) {
       stockQty: num(form.stockQty) ?? 0, stockThreshold: num(form.stockThreshold) ?? 0,
     };
     try {
-      if (editingId) await api.put(`/menu/variants/${editingId}`, payload);
-      else await api.post('/menu/variants', payload);
+      if (editingId) {
+        await api.put(`/menu/variants/${editingId}`, payload);
+        // PUT 刻意不收 prices —— 改价目走专用接口,避免「基础价」被两条路径同时写
+        if (entries.length) await api.put(`/menu/variants/${editingId}/prices`, { prices: entries });
+      } else {
+        if (entries.length) payload.prices = entries;   // 建商品时一并写覆盖价
+        await api.post('/menu/variants', payload);
+      }
       flash(editingId ? '商品已更新' : '商品已创建');
       setShowForm(false); setEditingId(null); setForm(emptyProduct());
       await load(); await reloadLookups();
@@ -283,6 +336,16 @@ function ProductsPanel({ lk, reloadLookups }) {
   const assignOptions = (rows, label) => [[NO_CHANGE, '— 不修改 —'], [CLEAR, '— 清空 —'], ...idOptions(rows, label)];
   const allChecked = rows.length > 0 && selected.length === rows.length;
 
+  // 换算口径预览:packFactor 的语义是「1 个 packUom = packFactor 个 uom」。
+  // 与单位相同或系数留 1 都视为「不换算」—— 与 uomConvert.js 的回落策略一致。
+  const convPreview = (() => {
+    const u = String(form.uom || '').toUpperCase();
+    const pk = String(form.packUom || '').toUpperCase();
+    const f = Number(form.packFactor || 1);
+    if (!u || !pk || pk === u || !(f > 0) || f === 1) return false;
+    return true;
+  })();
+
   return <>
     <Panel title="Product Master" subtitle="扁平产品清单:主分组 / 打印组 / 部门 / 供应商 / 计量单位 一览,支持批量归口">
       <div className="report-kpis voucher-kpis">
@@ -292,6 +355,8 @@ function ProductsPanel({ lk, reloadLookups }) {
         <span>With Supplier <b>{summary.withSupplier ?? 0}</b></span>
         <span>Missing UOM <b>{summary.missingUom ?? 0}</b></span>
         <span>Unassigned <b>{summary.unassigned ?? 0}</b></span>
+        <span>Unit Converted <b>{summary.convertedUom ?? 0}</b></span>
+        <span>Price Levels <b>{summary.withPriceLevels ?? 0}</b></span>
       </div>
 
       <div className="ops-form inline">
@@ -304,6 +369,7 @@ function ProductsPanel({ lk, reloadLookups }) {
         <Select label="UOM" value={filters.uom} onChange={(v) => setF('uom', v)} options={codeOptions(lk.uoms)} placeholder="All" />
         <Select label="Status" value={filters.active} onChange={(v) => setF('active', v)} options={[['1', 'Active'], ['0', 'Inactive']]} placeholder="All" />
         <label className="ops-checkbox"><input type="checkbox" checked={filters.unassigned} onChange={(e) => setF('unassigned', e.target.checked)} /> 仅看未归口</label>
+        <label className="ops-checkbox"><input type="checkbox" checked={filters.converted} onChange={(e) => setF('converted', e.target.checked)} /> 仅看需换算</label>
         <Action tone="secondary" onClick={load}>Search</Action>
         {canEdit && <Action onClick={openNew}>+ New Product</Action>}
         {msg && <span className="ops-saved">{msg}</span>}
@@ -328,7 +394,7 @@ function ProductsPanel({ lk, reloadLookups }) {
         <div className="ops-row ops-head">
           <span className="menu-check"><input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} /></span>
           <span>Code</span><span>Product</span><span>Main Group</span><span>Print Group</span>
-          <span>Department</span><span>Supplier</span><span>UOM</span><span>Price</span><span>Stock</span><span>Status</span><span>Action</span>
+          <span>Department</span><span>Supplier</span><span>UOM</span><span>Price</span><span>Prices</span><span>Stock</span><span>Status</span><span>Action</span>
         </div>
         {rows.map((p) => <div className="ops-row" key={p.id}>
           <span className="menu-check"><input type="checkbox" checked={selected.includes(String(p.id))} onChange={(e) => toggleOne(p.id, e.target.checked)} /></span>
@@ -339,8 +405,11 @@ function ProductsPanel({ lk, reloadLookups }) {
           <span>{p.departmentName || <em className="menu-missing">未归口</em>}{p.departmentInherited && <small className="member-sub">继承自分类</small>}</span>
           <span>{p.supplierName || '—'}</span>
           <span>{p.uom ? <>{p.uom}<small className="member-sub">{p.uomName || ''}</small></> : <em className="menu-missing">—</em>}
-            {Number(p.packFactor) > 1 && <small className="member-sub">×{p.packFactor} {p.packUom || ''}</small>}</span>
-          <span>{money2(p.price)}</span>
+            {p.uomConverted && <small className="member-sub menu-conv" title={p.uomConvertReason || ''}>1 {p.stockUom} = {p.unitsPerStock} {p.uom}</small>}</span>
+          <span>{money2(p.price)}<small className="member-sub">{defLevel ? defLevel.code : ''}</small></span>
+          <span>{p.priceLevelCount > 0
+            ? <span className="menu-default" title={`${p.priceLevelCount} 个非默认级别设有专属价`}>+{p.priceLevelCount}</span>
+            : <em className="menu-missing">基础价</em>}</span>
           <span>{p.stockQty}</span>
           <span className={p.isActive ? 'staff-on' : 'staff-off'}>{p.isActive ? 'active' : 'inactive'}</span>
           <span className="ops-inline-actions">
@@ -383,6 +452,30 @@ function ProductsPanel({ lk, reloadLookups }) {
           <Input label="Stock Threshold" type="number" value={form.stockThreshold} onChange={(v) => setForm({ ...form, stockThreshold: v })} placeholder="0" />
           <label className="ops-checkbox"><input type="checkbox" checked={form.isActive} onChange={(e) => setForm({ ...form, isActive: e.target.checked })} /> Active</label>
         </div>
+        <p className="menu-hint">
+          {convPreview
+            ? <>换算口径:<b>1 {String(form.packUom).toUpperCase()} = {Number(form.packFactor)} {String(form.uom).toUpperCase()}</b>,结账时按此把销售单位折算成库存单位扣减。</>
+            : '销售单位与库存单位相同(或 Pack Factor 留 1)时不换算,卖出即按 1:1 扣库存。'}
+        </p>
+
+        <h3 className="menu-subhead">价格级别 Pricing</h3>
+        {defLevel ? <>
+          <p className="menu-hint">
+            默认级别 <b>{defLevel.code} · {defLevel.name}</b> 的价格就是上方的 Price 字段 —— 基础价只有这一处真源,
+            收据 / 报表 / 小票都读它。其余级别留空表示「回落基础价」,填写才会存一条专属价。
+          </p>
+          <div className="ops-form inline">
+            <label className="ops-field"><span>{defLevel.code} · {defLevel.name}(基础价)</span>
+              <input className="menu-price-mirror" value={form.price} readOnly disabled placeholder="见上方 Price" /></label>
+            {otherLevels.map((lv) => {
+              const code = String(lv.code).toUpperCase();
+              return <Input key={code} label={`${lv.code} · ${lv.name}`} type="number"
+                value={form.prices[code] ?? ''}
+                onChange={(v) => setForm({ ...form, prices: { ...form.prices, [code]: v } })}
+                placeholder="留空 = 基础价" />;
+            })}
+          </div>
+        </> : <p className="menu-hint">还没有配置任何价格级别,请先到 <b>Price Levels</b> 页签建立(第一个会自动成为默认级别)。</p>}
 
         <div className="ops-actions">
           <Action onClick={save}>{editingId ? 'Save Changes' : 'Create Product'}</Action>
@@ -782,5 +875,269 @@ function UomPanel({ lk, reloadLookups }) {
       </div>)}
       {!rows.length && <Empty />}
     </div>
+  </Panel>;
+}
+
+// ============================================================ 价格级别
+// 不变量:每个 (org, store) 有且只有一个默认价格级别,它的价就是商品的基础价
+// (menu_variants.price)。因此:
+//   - 当前默认级别不允许被降级(要换默认,先把别的级别设为默认)
+//   - 当前默认级别不允许被删除(删了「基础价」就无处安放,服务端返回 reason:'default_level')
+const emptyLevel = () => ({ code: '', name: '', sortOrder: '', note: '', isActive: true, isDefault: false });
+
+function PriceLevelsPanel({ lk, reloadLookups }) {
+  const { can } = useAuth();
+  const canWrite = can('settings.edit');
+  const [rows, setRows] = useState([]);
+  const [byLevel, setByLevel] = useState({});
+  const [form, setForm] = useState(emptyLevel());
+  const [editingId, setEditingId] = useState(null);
+  const [msg, setMsg] = useState('');
+  const flash = (t) => { setMsg(t); setTimeout(() => setMsg(''), 2200); };
+
+  const load = async () => {
+    const [lv, mx] = await Promise.all([
+      api.get('/price-levels').then((r) => r.data || []).catch(() => []),
+      // 每个级别被多少个 SKU 设了专属价 —— 只有价目矩阵的 summary 会算这个
+      api.get('/menu/price-matrix').then((r) => r.data?.summary?.byLevel || {}).catch(() => ({})),
+    ]);
+    setRows(lv); setByLevel(mx);
+  };
+  useEffect(() => { load(); }, []);
+
+  const defRow = rows.find((r) => r.isDefault) || null;
+  const isEditingDefault = !!editingId && !!defRow && String(defRow.id) === String(editingId);
+
+  const submit = async () => {
+    if (!form.name.trim()) { alert('请填写名称'); return; }
+    const payload = {
+      code: form.code.trim() || undefined, name: form.name.trim(),
+      sortOrder: num(form.sortOrder), note: form.note || undefined, isActive: form.isActive,
+      // 正在编辑默认级别时强制保持默认,避免表单状态把「基础价落点」改没了
+      isDefault: isEditingDefault ? true : form.isDefault,
+    };
+    try {
+      if (editingId) await api.put(`/price-levels/${editingId}`, payload);
+      else await api.post('/price-levels', payload);
+      flash(editingId ? '价格级别已更新' : '价格级别已创建');
+      setForm(emptyLevel()); setEditingId(null); await load(); await reloadLookups();
+    } catch (e) { alert(errText(e)); }
+  };
+  const makeDefault = async (r) => {
+    if (!window.confirm(`把「${r.name}」设为默认价格级别?\n\n商品的基础价会以该级别为准,原默认级别将变为普通级别。`)) return;
+    try { await api.put(`/price-levels/${r.id}`, { isDefault: true }); flash(`「${r.name}」已设为默认`); await load(); await reloadLookups(); }
+    catch (e) { alert(errText(e)); }
+  };
+  const toggle = async (r) => {
+    try { await api.put(`/price-levels/${r.id}/status`, { isActive: !r.isActive }); await load(); await reloadLookups(); }
+    catch (e) { alert(errText(e)); }
+  };
+  const remove = async (r) => {
+    // 默认级别不给删 —— 先本地拦一次给出准确文案,服务端同样会拦(409 reason:'default_level')
+    if (r.isDefault) { alert(MENU_ERRORS.default_level); return; }
+    if (!window.confirm(`确定删除价格级别「${r.name}」?该级别下所有商品的专属价会一并清除,此后这些商品回落基础价。`)) return;
+    try { await api.delete(`/price-levels/${r.id}`); flash('价格级别已删除'); await load(); await reloadLookups(); }
+    catch (e) { alert(errText(e)); }
+  };
+
+  const overridesOf = (code) => byLevel[String(code).toUpperCase()]?.overrides ?? 0;
+
+  return <Panel title="Price Levels" subtitle="价目分级:零售 / 会员 / 批发 / 员工…默认级别承载基础价,其余级别按 SKU 存专属价">
+    <div className="ops-form inline">
+      <Input label="Code" value={form.code} onChange={(v) => setForm({ ...form, code: v })} placeholder="留空自动派生" />
+      <Input label="Name" value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="会员价 Member" />
+      <Input label="Sort Order" type="number" value={form.sortOrder} onChange={(v) => setForm({ ...form, sortOrder: v })} placeholder="自动" />
+      <Input label="Note" value={form.note} onChange={(v) => setForm({ ...form, note: v })} placeholder="可选" />
+      <label className="ops-checkbox"><input type="checkbox" checked={form.isActive} onChange={(e) => setForm({ ...form, isActive: e.target.checked })} /> Active</label>
+      <label className="ops-checkbox"><input type="checkbox" checked={isEditingDefault || form.isDefault} disabled={isEditingDefault}
+        onChange={(e) => setForm({ ...form, isDefault: e.target.checked })} /> 设为默认级别</label>
+      {canWrite && <Action onClick={submit}>{editingId ? 'Save' : '+ Add'}</Action>}
+      {editingId && <Action tone="secondary" onClick={() => { setEditingId(null); setForm(emptyLevel()); }}>Cancel</Action>}
+      {msg && <span className="ops-saved">{msg}</span>}
+    </div>
+
+    <div className="report-kpis voucher-kpis">
+      <span>Levels <b>{rows.length}</b></span>
+      <span>Default <b>{defRow ? defRow.code : '—'}</b></span>
+      <span>SKUs With Overrides <b>{Object.values(byLevel).reduce((s, v) => s + (v?.overrides || 0), 0)}</b></span>
+    </div>
+
+    {!canWrite && <p className="menu-hint">当前账号没有 settings.edit 权限,只能查看。</p>}
+    <p className="menu-hint">
+      默认级别是「基础价」的唯一落点 —— 商品表单里的 Price 字段写的就是它。要换默认级别,先把目标级别设为默认;
+      默认级别不允许停用或删除。其余级别在商品表单里留空 = 回落基础价。
+    </p>
+
+    <div className="ops-table menu-level-table">
+      <div className="ops-row ops-head"><span>Code</span><span>Name</span><span>Sort</span><span>Default</span><span>SKU Overrides</span><span>Status</span><span>Note</span><span>Action</span></div>
+      {rows.map((r) => <div className="ops-row" key={r.id}>
+        <span><b>{r.code}</b></span>
+        <span>{r.name}</span>
+        <span>{r.sortOrder ?? '—'}</span>
+        <span>{r.isDefault ? <span className="menu-default">基础价落点</span> : '—'}</span>
+        <span>{r.isDefault ? <em className="menu-missing">基础价</em> : `${overridesOf(r.code)} 个`}</span>
+        <span className={r.isActive ? 'staff-on' : 'staff-off'}>{r.isActive ? 'active' : 'inactive'}</span>
+        <span>{r.note || '—'}</span>
+        <span className="ops-inline-actions">
+          {canWrite && <button className="mini-action" onClick={() => { setEditingId(r.id); setForm({ code: r.code || '', name: r.name || '', sortOrder: r.sortOrder == null ? '' : String(r.sortOrder), note: r.note || '', isActive: !!r.isActive, isDefault: !!r.isDefault }); }}>Edit</button>}
+          {canWrite && !r.isDefault && <button className="mini-action" onClick={() => makeDefault(r)}>Set Default</button>}
+          {canWrite && !r.isDefault && <button className="mini-action" onClick={() => toggle(r)}>{r.isActive ? 'Disable' : 'Enable'}</button>}
+          {canWrite && <button className="mini-action danger" onClick={() => remove(r)}>Delete</button>}
+        </span>
+      </div>)}
+      {!rows.length && <Empty text="No price levels yet" />}
+    </div>
+  </Panel>;
+}
+
+// ============================================================ 价目矩阵
+// SKU × 价格级别 一览。每格显示最终价与来源:
+//   基础 = 默认级别(就是 menu_variants.price)
+//   专属 = 该级别存了覆盖行(variant_prices)
+//   继承 = 没有覆盖行,回落基础价
+// 有 menu.edit 权限时可直接点格子改价 —— 清空即删除覆盖行。
+function PriceMatrixPanel({ lk }) {
+  const { can } = useAuth();
+  const canEdit = can('menu.edit');
+  const [data, setData] = useState({ rows: [], levels: [], summary: {} });
+  const [filters, setFilters] = useState({ q: '', categoryId: '', onlyOverrides: false });
+  const [edit, setEdit] = useState(null);        // { variantId, code }
+  const [draft, setDraft] = useState('');
+  const [cancelling, setCancelling] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const flash = (t) => { setMsg(t); setTimeout(() => setMsg(''), 2200); };
+
+  const load = async () => {
+    const r = await api.get('/menu/price-matrix');
+    setData({ rows: r.data?.rows || [], levels: r.data?.levels || [], summary: r.data?.summary || {} });
+  };
+  useEffect(() => { load(); }, []);
+
+  const levels = data.levels;
+  const defCode = (() => {
+    const d = levels.find((l) => l.isDefault) || levels[0];
+    return d ? String(d.code).toUpperCase() : null;
+  })();
+  const cellOf = (row, code) => (row.cells || {})[code] || { price: row.basePrice, source: 'base' };
+
+  const shown = data.rows.filter((r) => {
+    if (filters.categoryId && String(r.categoryId) !== String(filters.categoryId)) return false;
+    if (filters.q.trim()) {
+      const q = filters.q.trim().toLowerCase();
+      if (!`${r.code || ''} ${r.name || ''}`.toLowerCase().includes(q)) return false;
+    }
+    if (filters.onlyOverrides && !levels.some((l) => cellOf(r, String(l.code).toUpperCase()).source === 'level')) return false;
+    return true;
+  });
+
+  const startEdit = (row, code, cell) => {
+    if (!canEdit) return;
+    setCancelling(false);
+    setEdit({ variantId: row.variantId, code });
+    setDraft(cell.source === 'level' ? String(cell.price) : '');
+  };
+  const commit = async (row, code) => {
+    const raw = String(draft).trim();
+    if (raw !== '' && (Number.isNaN(Number(raw)) || Number(raw) < 0)) { alert('请输入有效价格'); return; }
+    setBusy(true);
+    try {
+      // 单个级别一条:price 传 null = 删除覆盖行,回落基础价
+      await api.put(`/menu/variants/${row.variantId}/prices`, { prices: [{ levelCode: code, price: raw === '' ? null : Number(raw) }] });
+      setEdit(null); setDraft('');
+      await load();
+      flash(raw === '' ? '已清除专属价,回落基础价' : '专属价已保存');
+    } catch (e) { alert(errText(e)); }
+    finally { setBusy(false); }
+  };
+
+  const overrideCount = (row) => levels.filter((l) => cellOf(row, String(l.code).toUpperCase()).source === 'level').length;
+  const lowestOf = (row) => {
+    const ps = levels.map((l) => Number(cellOf(row, String(l.code).toUpperCase()).price || 0)).filter((n) => n > 0);
+    return ps.length ? Math.min(...ps) : Number(row.basePrice || 0);
+  };
+
+  // 列数是数据驱动的(价格级别可增删),所以网格模板在运行时拼,不写死 CSS 类
+  const grid = ['86px', 'minmax(140px, 1.6fr)', '104px', '70px', ...levels.map(() => '94px'), '96px'].join(' ');
+
+  return <Panel title="Price Matrix" subtitle="SKU × 价格级别 价目一览,点格子即可改价(清空 = 回落基础价)"
+    right={<Action tone="secondary" onClick={load}>Reload</Action>}>
+    <div className="report-kpis voucher-kpis">
+      <span>Levels <b>{data.summary.levels ?? levels.length}</b></span>
+      <span>SKUs <b>{data.summary.variants ?? data.rows.length}</b></span>
+      <span>Override Cells <b>{data.summary.overrides ?? 0}</b></span>
+      <span>Fallback Cells <b>{data.summary.fallbacks ?? 0}</b></span>
+      <span>Override Rows <b>{data.summary.overrideRows ?? 0}</b></span>
+    </div>
+
+    <div className="ops-form inline">
+      <Input label="Search" value={filters.q} onChange={(v) => setFilters({ ...filters, q: v })} placeholder="编码 / 名称" />
+      <Select label="Category" value={filters.categoryId} onChange={(v) => setFilters({ ...filters, categoryId: v })} options={idOptions(lk.categories)} placeholder="All" />
+      <label className="ops-checkbox"><input type="checkbox" checked={filters.onlyOverrides} onChange={(e) => setFilters({ ...filters, onlyOverrides: e.target.checked })} /> 仅看有专属价</label>
+      {msg && <span className="ops-saved">{msg}</span>}
+    </div>
+    {!canEdit && <p className="menu-hint">当前账号没有 menu.edit 权限,只能查看价目。</p>}
+
+    {!levels.length
+      ? <Empty text="还没有价格级别,请先到 Price Levels 页签建立" />
+      : <div className="ops-table tall menu-matrix-table">
+        <div className="ops-row ops-head" style={{ gridTemplateColumns: grid }}>
+          <span>Code</span><span>Product</span><span>Category</span><span>Cost</span>
+          {levels.map((l) => {
+            const code = String(l.code).toUpperCase();
+            return <span key={code} className={code === defCode ? 'matrix-head-default' : ''} title={l.name}>
+              {l.code}{code === defCode ? ' *' : ''}
+            </span>;
+          })}
+          <span>Pricing</span>
+        </div>
+        {shown.map((row) => {
+          const n = overrideCount(row);
+          const lowest = lowestOf(row);
+          const margin = Number(row.cost) > 0 && lowest > 0 ? ((lowest - Number(row.cost)) / lowest) * 100 : null;
+          return <div className="ops-row" key={row.variantId} style={{ gridTemplateColumns: grid }}>
+            <span><b>{row.code}</b></span>
+            <span>{row.name}{!row.isActive && <small className="member-sub">已停用</small>}</span>
+            <span>{row.categoryName || '—'}</span>
+            <span>{money2(row.cost)}</span>
+            {levels.map((l) => {
+              const code = String(l.code).toUpperCase();
+              const cell = cellOf(row, code);
+              const isDef = code === defCode;
+              const editing = !!edit && edit.variantId === row.variantId && edit.code === code;
+              const kind = isDef ? 'is-default' : cell.source === 'level' ? 'is-override' : 'is-fallback';
+              return <span key={code} className={`matrix-cell ${kind}`}>
+                {editing
+                  ? <input autoFocus className="matrix-input" value={draft} disabled={busy}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onBlur={() => {
+                      if (cancelling) { setCancelling(false); setEdit(null); setDraft(''); return; }
+                      commit(row, code);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
+                      if (e.key === 'Escape') { e.preventDefault(); setCancelling(true); e.currentTarget.blur(); }
+                    }} />
+                  : <button type="button" className="matrix-value" disabled={!canEdit}
+                    title={isDef ? '默认级别:改这里等于改商品基础价' : cell.source === 'level' ? '专属价:存了覆盖行' : '继承:回落基础价,点击可设专属价'}
+                    onClick={() => startEdit(row, code, cell)}>
+                    {money2(cell.price)}
+                    <small>{isDef ? '基础' : cell.source === 'level' ? '专属' : '继承'}</small>
+                  </button>}
+              </span>;
+            })}
+            <span>{n > 0
+              ? <span className="menu-default">{n}/{levels.length} 专属</span>
+              : <em className="menu-missing">全部基础</em>}
+              {margin != null && <small className="member-sub">毛利 {margin.toFixed(1)}%</small>}</span>
+          </div>;
+        })}
+        {!shown.length && <Empty text="No products match the filters" />}
+      </div>}
+    <p className="menu-hint">
+      带 <b>*</b> 的列是默认价格级别 —— 改它等于直接改商品基础价(收据 / 报表 / 小票都读这个价)。
+      「专属」表示该 SKU 在这个级别存了覆盖价;「继承」表示没有覆盖行、按基础价成交。
+      毛利率按该 SKU 所有级别里的最低售价估算,是保守口径。
+    </p>
   </Panel>;
 }

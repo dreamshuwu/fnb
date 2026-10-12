@@ -4,6 +4,8 @@
 import { getReport } from './reportCatalog.js';
 // 台账类型的中文标签复用库存引擎的同一张表,避免两处维护漂移。
 import { movementLabel } from './inventoryEngine.js';
+// 价目解析与后台 /menu/price-matrix 共用同一份规则,报表与界面不会各算一套
+import { resolveVariantPrice, buildPriceMap, defaultLevelCode, normCode } from './priceEngine.js';
 
 const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
 const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
@@ -55,7 +57,7 @@ function groupSum(list, keyFn, numFields) {
 /** 报表主金额列(用于顶部 KPI 合计)。 */
 const TOTAL_COLUMN = {
   sales_by_date: 'net', sales_by_product: 'amount', sales_by_category: 'amount', sales_by_department: 'amount',
-  sales_by_main_group: 'amount', sales_by_print_group: 'amount',
+  sales_by_main_group: 'amount', sales_by_print_group: 'amount', sales_by_price_level: 'amount',
   sales_by_payment: 'amount', sales_by_hour: 'total', sales_by_cashier: 'total', sales_by_salesperson: 'total',
   sales_by_table: 'total', sales_by_member: 'total', sales_by_discount: 'discount', top_products: 'amount',
   bottom_products: 'amount', avg_spend: 'net', sales_trend_7day: 'total', monthly_sales: 'total',
@@ -141,6 +143,20 @@ function computeRows(type, ds, inRange, range) {
         .map((g) => ({ printGroup: g._key, qty: g.qty, amount: round2(g.amount) }))
         .sort((a, b) => b.amount - a.amount);
     }
+    // 价目级别:优先取订单行上记录的生效级别(结账时写死的),
+    // 老订单没有该字段才回落到订单头,再没有就归到默认级别 —— 不出现空档。
+    case 'sales_by_price_level': {
+      const def = defaultLevelCode(ds.priceLevels) || 'DEFAULT';
+      const its = itemsOf(paid).map((i) => ({ ...i, __level: normCode(i.priceLevel) || normCode(i.__order && i.__order.priceLevel) || def }));
+      return groupSum(its, (i) => i.__level, ['qty', 'amount'])
+        .map((g) => ({
+          priceLevel: g._key,
+          orders: new Set(its.filter((i) => i.__level === g._key).map((i) => i.__order && i.__order.id)).size,
+          qty: g.qty,
+          amount: round2(g.amount),
+        }))
+        .sort((a, b) => b.amount - a.amount);
+    }
     // 产品主数据清单:不按订单汇总,直接列出商品主档(与后台 /menu/products 同口径)。
     // 启用与停用都列出,由 Status 列区分 —— 主数据清单的价值就在于看清全貌。
     case 'product_listing': {
@@ -156,10 +172,61 @@ function computeRows(type, ds, inRange, range) {
           uom: p.uomName || p.uom || '',
           packUom: p.packUomName || p.packUom || '',
           packFactor: Number(p.packFactor || 1),
+          // 库存单位与「1 个库存单位 = 多少个销售单位」:整箱进货、按罐零售时一眼看出换算
+          stockUom: p.stockUomName || p.stockUom || p.uomName || '',
+          unitsPerStock: Number(p.unitsPerStock == null ? 1 : p.unitsPerStock),
+          priceLevels: Number(p.priceLevelCount || 0),
           price: round2(p.price), cost: round2(p.cost),
           stockQty: Number(p.stockQty || 0),
           active: p.isActive ? 'Active' : 'Inactive',
         }))
+        .sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
+    }
+    // 价目表:每个 SKU 在各价格级别下的售价与毛利。
+    // 与后台 /menu/price-matrix 走同一份 resolveVariantPrice —— 界面看到的价就是报表里的价。
+    case 'price_list': {
+      const list = ds.products || [];
+      const levels = ds.priceLevels || [];
+      const priceMap = buildPriceMap(ds.variantPrices || []);
+      const def = defaultLevelCode(levels);
+      // 列是固定契约(Retail / Member / Wholesale / Staff);主数据里没有该级别就留空,
+      // 而不是显示基础价 —— 否则报表会让人以为配了会员价,其实根本没配。
+      const codeOf = (want) => {
+        const hit = levels.find((l) => normCode(l.code) === want);
+        return hit ? hit.code : null;
+      };
+      const lvMember = codeOf('MEMBER');
+      const lvWholesale = codeOf('WHOLESALE');
+      const lvStaff = codeOf('STAFF');
+      return list
+        .map((p) => {
+          const retailR = resolveVariantPrice(p, def, priceMap, levels);
+          const pick = (code) => (code ? resolveVariantPrice(p, code, priceMap, levels) : null);
+          const rMember = pick(lvMember);
+          const rWholesale = pick(lvWholesale);
+          const rStaff = pick(lvStaff);
+          const retail = round2(retailR.price);
+          // 注意:retail 是数字,其余是解析结果对象 —— 必须统一成对象再取 price,
+          // 否则 `r.price` 取到 undefined,lowest 会被算成 0、margin 永远为空。
+          const all = [retailR, rMember, rWholesale, rStaff].filter(Boolean).map((r) => round2(r.price));
+          const lowest = all.length ? Math.min(...all) : retail;
+          const cost = round2(p.cost);
+          // 只统计**真的写了覆盖行**的级别:source==='level' 才算
+          const overrides = [rMember, rWholesale, rStaff].filter((r) => r && r.source === 'level').length;
+          return {
+            code: p.code, name: p.name,
+            category: p.categoryName || 'Uncategorised',
+            cost,
+            retail,
+            member: rMember ? round2(rMember.price) : '',
+            wholesale: rWholesale ? round2(rWholesale.price) : '',
+            staff: rStaff ? round2(rStaff.price) : '',
+            lowest,
+            // 毛利率按最低售价算 —— 最保守的口径,不会让人误以为很赚
+            margin: lowest > 0 ? `${Math.round(((lowest - cost) / lowest) * 1000) / 10}%` : '',
+            source: overrides > 0 ? `Override ×${overrides}` : 'Base price',
+          };
+        })
         .sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
     }
     case 'sales_by_payment': {

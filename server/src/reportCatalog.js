@@ -26,6 +26,7 @@ export const REPORT_CATALOG = [
   { key: 'sales_by_department', label: 'Sales By Department', category: 'sales', desc: '按部门(财务口径,取自部门主数据)汇总', columns: [['department', 'Department', 'text'], ['qty', 'Qty', 'int'], ['amount', 'Amount', 'money']] },
   { key: 'sales_by_main_group', label: 'Sales By Main Group', category: 'sales', desc: '按商品大类汇总', columns: [['mainGroup', 'Main Group', 'text'], ['qty', 'Qty', 'int'], ['amount', 'Amount', 'money']] },
   { key: 'sales_by_print_group', label: 'Sales By Print Group', category: 'sales', desc: '按打印分组汇总(与出单路由同口径)', columns: [['printGroup', 'Print Group', 'text'], ['qty', 'Qty', 'int'], ['amount', 'Amount', 'money']] },
+  { key: 'sales_by_price_level', label: 'Sales By Price Level', category: 'sales', desc: '按价目级别(零售/会员/批发/员工)汇总', columns: [['priceLevel', 'Price Level', 'text'], ['orders', 'Orders', 'int'], ['qty', 'Qty', 'int'], ['amount', 'Amount', 'money']] },
   { key: 'sales_by_payment', label: 'Sales By Payment Type', category: 'sales', desc: '按支付方式汇总', columns: [['method', 'Method', 'text'], ['count', 'Count', 'int'], ['amount', 'Amount', 'money']] },
   { key: 'sales_by_hour', label: 'Sales By Hour', category: 'sales', desc: '按小时客流与营业额', columns: [['hour', 'Hour', 'text'], ['orders', 'Orders', 'int'], ['total', 'Total', 'money']] },
   { key: 'sales_by_cashier', label: 'Sales By Cashier', category: 'sales', desc: '收银员业绩', columns: [['cashier', 'Cashier', 'text'], ['orders', 'Orders', 'int'], ['total', 'Total', 'money']] },
@@ -104,7 +105,9 @@ export const REPORT_CATALOG = [
   { key: 'day_end_history', label: 'Day End History', category: 'dayend', desc: '日结历史', columns: [['date', 'Date', 'date'], ['expectedCash', 'Expected', 'money'], ['countedCash', 'Counted', 'money'], ['difference', 'Difference', 'money'], ['closedAt', 'Closed', 'date']] },
 
   // ---------- Menu / 产品主数据 ----------
-  { key: 'product_listing', label: 'Product Listing', category: 'menu', desc: '产品主数据清单(含主分组 / 打印组 / 部门 / 供应商 / 计量单位)', columns: [['code', 'Code', 'text'], ['name', 'Product', 'text'], ['category', 'Category', 'text'], ['mainGroup', 'Main Group', 'text'], ['printGroup', 'Print Group', 'text'], ['department', 'Department', 'text'], ['supplier', 'Supplier', 'text'], ['uom', 'UOM', 'text'], ['packUom', 'Pack UOM', 'text'], ['packFactor', 'Pack Factor', 'qty'], ['price', 'Price', 'money'], ['cost', 'Cost', 'money'], ['stockQty', 'On Hand', 'qty'], ['active', 'Status', 'text']] },
+  { key: 'product_listing', label: 'Product Listing', category: 'menu', desc: '产品主数据清单(含主分组 / 打印组 / 部门 / 供应商 / 计量单位)', columns: [['code', 'Code', 'text'], ['name', 'Product', 'text'], ['category', 'Category', 'text'], ['mainGroup', 'Main Group', 'text'], ['printGroup', 'Print Group', 'text'], ['department', 'Department', 'text'], ['supplier', 'Supplier', 'text'], ['uom', 'UOM', 'text'], ['packUom', 'Pack UOM', 'text'], ['packFactor', 'Pack Factor', 'qty'], ['stockUom', 'Stock UOM', 'text'], ['unitsPerStock', 'Units / Stock', 'qty'], ['priceLevels', 'Price Levels', 'int'], ['price', 'Price', 'money'], ['cost', 'Cost', 'money'], ['stockQty', 'On Hand', 'qty'], ['active', 'Status', 'text']] },
+  // 价目表:每个 SKU 在各价格级别下的售价与毛利,采购/定价复核用
+  { key: 'price_list', label: 'Price List', category: 'menu', desc: '价目表(各价格级别售价与毛利)', columns: [['code', 'Code', 'text'], ['name', 'Product', 'text'], ['category', 'Category', 'text'], ['cost', 'Cost', 'money'], ['retail', 'Retail', 'money'], ['member', 'Member', 'money'], ['wholesale', 'Wholesale', 'money'], ['staff', 'Staff', 'money'], ['lowest', 'Lowest', 'money'], ['margin', 'Margin %', 'text'], ['source', 'Pricing', 'text']] },
 ];
 
 export const REPORT_KEYS = REPORT_CATALOG.map((r) => r.key);

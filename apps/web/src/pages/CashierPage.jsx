@@ -5,7 +5,7 @@ import { useAuth } from '../auth/AuthContext.jsx';
 
 const CATEGORY_COLORS = ['#d7e48e', '#f4bd63', '#f3e95d', '#ef9cca', '#9ed6e9', '#52d065', '#60a4eb', '#e79bd1', '#a99ece'];
 const PAGE_SIZE = 12;
-const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null, salesPersonId: '', memberId: '', memberLabel: '' });
+const newPage = (id) => ({ id, label: `Page ${id}`, cart: [], discount: 0, status: 'draft', orderId: null, salesPersonId: '', memberId: '', memberLabel: '', priceLevel: '' });
 
 export default function CashierPage() {
   // 按键权限:收银端的作废/折扣/退款/拆单/转台等按钮按权限显隐,服务端同样会拦。
@@ -43,12 +43,21 @@ export default function CashierPage() {
   const [payMember, setPayMember] = useState(null);     // 正在结账的订单所属会员
   const [payPoints, setPayPoints] = useState('');       // 结账时抵扣的积分(整数分)
   const [appSettings, setAppSettings] = useState({});   // 积分汇率/最小抵扣等会员设置
+  const [priceLevels, setPriceLevels] = useState([]);   // 价格级别主数据(零售/会员/批发/员工)
 
   const activePage = pages.find((p) => p.id === activePageId) || pages[0];
   const cart = activePage?.cart || [];
   const discount = Number(activePage?.discount || 0);
   const grossTotal = cart.reduce((s, c) => s + c.unitPrice * c.qty, 0);
   const total = Math.max(0, grossTotal - discount);
+
+  // 价格级别:'' 表示「跟随默认级别」。默认级别的价就是商品基础价,
+  // 因此不选时服务端会按默认级别定价,与旧行为完全一致。
+  const defLevelCode = (() => {
+    const d = priceLevels.find((l) => l.isDefault) || priceLevels[0];
+    return d ? String(d.code).toUpperCase() : '';
+  })();
+  const activeLevelCode = activePage?.priceLevel || defLevelCode;
 
   const loadTree = async () => {
     const r = await api.get('/menu/tree');
@@ -61,6 +70,7 @@ export default function CashierPage() {
   const loadSalesPersons = async () => { const r = await api.get('/sales-persons'); setSalesPersons(r.data); };
   const loadMembers = async () => { try { const r = await api.get('/members'); setMembers(r.data); } catch { setMembers([]); } };
   const loadTransfers = async () => { const r = await api.get('/transfers'); setTransferLog(r.data.slice(0, 8)); };
+  const loadPriceLevels = async () => { try { const r = await api.get('/price-levels?active=1'); setPriceLevels(r.data || []); } catch { setPriceLevels([]); } };
 
   useEffect(() => {
     loadTree();
@@ -70,6 +80,7 @@ export default function CashierPage() {
     loadSalesPersons();
     loadMembers();
     loadTransfers();
+    loadPriceLevels();
     // 积分抵扣需要知道 1 分抵多少元 / 最小抵扣分数,统一从 /settings 取。
     api.get('/settings').then((r) => setAppSettings(r.data || {})).catch(() => {});
     const socketUrl = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || undefined;
@@ -134,14 +145,15 @@ export default function CashierPage() {
   const sendCurrentPage = async () => {
     if (!cart.length) return;
     if (mode === 'dine_in' && !tableId && !activePage.orderId) { alert('请选择桌台'); return; }
+    const level = activeLevelCode || undefined;
     let orderId = activePage.orderId;
     if (orderId) {
-      await api.put(`/orders/${orderId}/items`, { items: cart, discount });
+      await api.put(`/orders/${orderId}/items`, { items: cart, discount, priceLevel: level });
       if (activePage.salesPersonId) await api.put(`/orders/${orderId}/sales-person`, { salesPersonId: activePage.salesPersonId });
       if (activePage.memberId) await api.put(`/orders/${orderId}/member`, { memberId: activePage.memberId });
       await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
     } else {
-      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, salesPersonId: activePage.salesPersonId || undefined, memberId: activePage.memberId || undefined });
+      const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, priceLevel: level, salesPersonId: activePage.salesPersonId || undefined, memberId: activePage.memberId || undefined });
       orderId = r.data._id;
       await api.put(`/orders/${orderId}/status`, { status: 'kitchen' });
     }
@@ -157,7 +169,7 @@ export default function CashierPage() {
   const holdCurrentPage = async () => {
     if (!cart.length) { alert('当前页面没有点单'); return; }
     const label = `${tableId ? `T${tableId} ` : ''}${cart.reduce((s, c) => s + c.qty, 0)} items`;
-    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, hold: true, holdLabel: label, memberId: activePage.memberId || undefined });
+    const r = await api.post('/orders', { type: mode, tableId: mode === 'dine_in' ? tableId : undefined, items: cart, discount, priceLevel: activeLevelCode || undefined, hold: true, holdLabel: label, memberId: activePage.memberId || undefined });
     const nextId = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
     setPages((prev) => [...prev.map((p) => p.id === activePageId ? { ...p, status: 'held', orderId: r.data._id, label: `${p.label} · Held` } : p), newPage(nextId)]);
     setActivePageId(nextId);
@@ -170,6 +182,7 @@ export default function CashierPage() {
     const id = pages.reduce((max, p) => Math.max(max, p.id), 0) + 1;
     setPages((prev) => [...prev, {
       ...newPage(id), label: `Recall ${o.orderNo}`, orderId: o._id, discount: Number(o.discount || 0),
+      priceLevel: o.priceLevel || '',
       cart: o.items.map((i) => ({ variantId: i.variantId || i.itemId, code: i.code, name: i.name, unitPrice: Number(i.unitPrice), qty: Number(i.qty) })),
     }]);
     setActivePageId(id);
@@ -285,6 +298,29 @@ export default function CashierPage() {
       try { await api.put(`/orders/${activePage.orderId}/sales-person`, { salesPersonId: id || null }); } catch { /* 静默失败,下次 Send 会带上 */ }
     }
   };
+  // 切换价格级别。服务端才是定价权威,但本地也要同步重算展示价 ——
+  // 否则收银员看到的小计是基础价、送厨房后订单变成会员价,数字会「跳」。
+  const setPriceLevel = async (code) => {
+    setPages((prev) => prev.map((p) => p.id === activePageId ? { ...p, priceLevel: code } : p));
+    if (activePage.orderId) {
+      try {
+        await api.put(`/orders/${activePage.orderId}/items`, { items: cart, discount, priceLevel: code });
+        await loadActive();
+      } catch (e) { alert(e.response?.data?.error || '价格级别切换失败'); }
+      return;
+    }
+    if (!cart.length) return;
+    try {
+      const r = await api.get('/menu/price-matrix');
+      const byVid = new Map((r.data?.rows || []).map((x) => [String(x.variantId), x]));
+      const key = String(code || '').toUpperCase();
+      updateActiveCart((prev) => prev.map((c) => {
+        const row = byVid.get(String(c.variantId));
+        const cell = row && row.cells ? row.cells[key] : null;
+        return cell && cell.price != null ? { ...c, unitPrice: Number(cell.price) } : c;
+      }));
+    } catch { /* 拉不到价目矩阵就保持原价,服务端仍会按级别定价 */ }
+  };
   const setMember = async (m) => {
     const id = m ? String(m.id) : '';
     const label = m ? `${m.memberNo} · ${m.name}` : '';
@@ -362,7 +398,17 @@ export default function CashierPage() {
               {salesPersons.map((u) => <option key={u.id} value={u.id}>{u.name} ({u.role})</option>)}
             </select>
           </div>
-          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}{tableId && <span> · Table {tableLabel(tableId)}</span>}{activePage.memberLabel && <span> · Member {activePage.memberLabel}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
+          {priceLevels.length > 0 && <div className="cashier-salesperson cashier-pricelevel">
+            <span>Price Level</span>
+            {/* 已送厨房的页面不允许再切级别,避免用页面上的旧明细把订单覆盖掉 */}
+            <select value={activeLevelCode} disabled={activePage.status === 'sent'} onChange={(e) => setPriceLevel(e.target.value)}>
+              {priceLevels.map((l) => {
+                const code = String(l.code).toUpperCase();
+                return <option key={l.id} value={code}>{code} · {l.name}{l.isDefault ? ' (默认)' : ''}</option>;
+              })}
+            </select>
+          </div>}
+          <div className="cashier-totals"><div>Pax: {cart.reduce((s, c) => s + c.qty, 0)} {discount > 0 && <span> · Discount −¥{discount.toFixed(2)}</span>}{tableId && <span> · Table {tableLabel(tableId)}</span>}{activePage.memberLabel && <span> · Member {activePage.memberLabel}</span>}{activeLevelCode && <span> · Price {activeLevelCode}</span>}</div><strong>Total: ¥{total.toFixed(2)}</strong></div>
           <div className="cashier-keypad">{['Enter', '7', '8', '9', 'Back', '4', '5', '6', 'Up', '1', '2', '3', 'Down', '0', '.', 'Clear'].map((n) => <button key={n}>{n}</button>)}</div>
         </div>
       </div>
@@ -392,7 +438,7 @@ export default function CashierPage() {
         <h3>收银端待处理订单 / Kitchen 已收到</h3>
         <div className="cashier-open-orders">
           {active.map((o) => <div key={o._id} className="cashier-open-card"><b>{o.orderNo}</b> · ¥{o.total}<br />{o.items.reduce((s, i) => s + i.qty, 0)} items
-            <small className="cashier-open-meta">Table {tableLabel(o.tableId)}{o.salesPersonId ? ` · ${(salesPersons.find((u) => String(u.id) === String(o.salesPersonId)) || {}).name || ''}` : ''}{o.memberId ? ` · ${(members.find((m) => String(m.id) === String(o.memberId)) || {}).memberNo || 'Member'}` : ''}</small>
+            <small className="cashier-open-meta">Table {tableLabel(o.tableId)}{o.salesPersonId ? ` · ${(salesPersons.find((u) => String(u.id) === String(o.salesPersonId)) || {}).name || ''}` : ''}{o.memberId ? ` · ${(members.find((m) => String(m.id) === String(o.memberId)) || {}).memberNo || 'Member'}` : ''}{o.priceLevel ? ` · ${o.priceLevel}` : ''}</small>
             <button onClick={() => openPayment(o)}>Payment</button>
             <button onClick={() => setMemberPicker(o)}>Member</button>
             {can('order.split') && <button onClick={() => setSplitOrder(o)}>Split</button>}

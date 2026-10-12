@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import {
   pool, query, insert, stringifyJSON,
   DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS,
-  DEFAULT_MAIN_GROUPS, DEFAULT_PRINT_GROUPS, DEFAULT_DEPARTMENTS, DEFAULT_UOMS,
+  DEFAULT_MAIN_GROUPS, DEFAULT_PRINT_GROUPS, DEFAULT_DEPARTMENTS, DEFAULT_UOMS, DEFAULT_PRICE_LEVELS,
   CATEGORY_MASTER_MAP, CATEGORY_UOM_MAP,
 } from './db.js';
 import { ROLES, defaultPermissions } from './permissions.js';
@@ -145,6 +145,14 @@ export async function seedIfEmpty() {
       [orgId, storeId, code, name, dimension, factor, isBase, sort]
     );
   }
+  // 价格级别(价目表):RETAIL 是默认级别,它的价格就存在 menu_variants.price 里
+  const priceLevelIds = {};
+  for (const [code, name, sort, isDefault] of DEFAULT_PRICE_LEVELS) {
+    priceLevelIds[code] = await insert(
+      'INSERT INTO price_levels (org_id, store_id, code, name, sort_order, is_default) VALUES (?,?,?,?,?,?)',
+      [orgId, storeId, code, name, sort, isDefault]
+    );
+  }
 
   const catIds = {};
   for (const [name, color, sort] of CATS) {
@@ -195,10 +203,12 @@ export async function seedIfEmpty() {
   }
 
   // 变体(产品主档 SKU):分组/部门/打印组/单位按分类继承,分类没配就留空
+  // MEMBER 级价目按 95% 预置,演示「非默认级别存覆盖行」;
+  // WHOLESALE / STAFF 故意留空,演示「没有覆盖行 = 回落基础价」。
   let vsort = 1;
   const addVariant = async (bname, baseId, cat, code, name, price) => {
     const map = CATEGORY_MASTER_MAP[cat] || {};
-    await insert(
+    const vid = await insert(
       `INSERT INTO menu_variants
         (org_id, store_id, base_id, category_id, code, name, modifier_ids, price, cost, stock_qty, stock_threshold, sort_order,
          main_group_id, print_group_id, department_id, uom)
@@ -211,6 +221,10 @@ export async function seedIfEmpty() {
         map.department ? deptIds[map.department] ?? null : null,
         CATEGORY_UOM_MAP[cat] || null,
       ]
+    );
+    await insert(
+      'INSERT INTO variant_prices (org_id, store_id, variant_id, level_code, price) VALUES (?,?,?,?,?)',
+      [orgId, storeId, vid, 'MEMBER', +(price * 0.95).toFixed(2)]
     );
   };
   for (const [name, cat, price] of DRINK_BASES) {

@@ -63,9 +63,16 @@ export const variantSchema = z.object({
   uom: z.string().optional(),
   packUom: z.string().optional(),
   packFactor: z.number().positive().optional(),
+  // 价格级别覆盖:建商品时一并写入非默认级别的价目。
+  // 默认级别的价格请直接写 price —— 基础价只有 menu_variants.price 这一处真源。
+  prices: z.array(z.object({
+    levelCode: z.string().min(1),
+    price: z.number().min(0),
+  })).optional(),
 });
-// PUT 走部分更新(与本项目其它 update schema 一致),否则改一个字段也得把整份商品传回来
-export const variantUpdateSchema = variantSchema.partial();
+// PUT 走部分更新(与本项目其它 update schema 一致),否则改一个字段也得把整份商品传回来。
+// prices 刻意排除:改价目走专用的 PUT /variants/:id/prices,避免同一件事有两条路径。
+export const variantUpdateSchema = variantSchema.omit({ prices: true }).partial();
 
 // ---- Smcin 主数据:商品大类 / 打印分组 / 部门 ----
 // 三者字段完全一致,共用同一份 shape;CRUD 也共用同一套路由工厂。
@@ -92,6 +99,24 @@ export const uomSchema = z.object({
   isBase: z.boolean().optional(),
 });
 export const uomUpdateSchema = uomSchema.partial();
+
+// 价格级别(价目表):结构与其它主数据一致,多一个「默认级别」标记。
+// 默认级别是 menu_variants.price 的落点 —— 每个 (org,store) 有且只有一个。
+export const priceLevelSchema = z.object({
+  ...masterFields,
+  isDefault: z.boolean().optional(),
+});
+export const priceLevelUpdateSchema = priceLevelSchema.partial();
+
+// SKU 价格覆盖:批量设置某个商品在各价格级别下的价格。
+// price 传 null 或省略 = 删除该级别的覆盖行(回落基础价);
+// 传默认级别的价格 = 直接改 menu_variants.price(基础价只有一处真源)。
+export const variantPricesSchema = z.object({
+  prices: z.array(z.object({
+    levelCode: z.string().min(1),
+    price: z.number().min(0).nullable().optional(),
+  })).min(1),
+});
 
 export const tableSchema = z.object({
   number: z.string().min(1),
@@ -122,6 +147,9 @@ export const createOrderSchema = z.object({
   holdLabel: z.string().optional(),
   memberId: z.string().optional(),
   salesPersonId: z.string().optional(),
+  // 价目级别:不传 = 用默认级别。服务端会按这一级重算每个变体行的单价,
+  // 客户端传来的 unitPrice 只对「解析不到真实变体」的行(Open Item)生效。
+  priceLevel: z.string().optional(),
   items: z.array(orderItemSchema).min(1),
 });
 

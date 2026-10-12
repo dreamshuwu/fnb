@@ -35,9 +35,26 @@ export const MASTER_TYPES = {
       { collection: 'variants', field: 'packUom', byCode: true },
     ],
   },
+  'price-levels': {
+    label: 'Price Level',
+    // SKU 价格覆盖行按级别**编码**引用(与 uoms 同理)。
+    // 但这条引用是 **cascade** 而不是「阻止删除」—— 见下方 blockingRefs 的说明。
+    refs: [{ collection: 'variantPrices', field: 'levelCode', byCode: true, cascade: true }],
+    // 默认级别是「基础价」的落点(menu_variants.price),删掉它整条价格链就断了
+    undeletable: 'default_level',
+  },
 };
 
 export const MASTER_PATHS = Object.keys(MASTER_TYPES);
+
+/**
+ * 会**阻止删除**的引用。带 `cascade: true` 的引用不算 —— 它们会在删除时被一并清理。
+ *
+ * 为什么价格级别的覆盖行可以是级联引用:删除一个价格级别后,那些 SKU 会回落
+ * 到默认级别的基础价,而「有基础价」永远成立 —— 不会出现无价可卖的商品。
+ * 主分组/部门/计量单位则相反:删掉会留下悬空外键,所以必须拦住。
+ */
+export const blockingRefs = (refs = []) => refs.filter((r) => !r.cascade);
 
 /** 由名称派生编码:大写、非字母数字转 -、截 24 位;重复则追加 -2/-3… */
 export function makeMasterCode(name, existing = []) {
@@ -56,11 +73,12 @@ export function isDuplicateCode(rows, code, excludeId = null) {
 
 /**
  * 统计引用数:删除主数据前先看有没有分类/商品在用,避免留下悬空引用。
+ * 只统计 blockingRefs —— 级联引用不该拦下删除。
  * @param {{[collection: string]: any[]}} collections 例:{ categories: [...], variants: [...] }
  */
 export function countRefs(collections, refs, row) {
   const counts = {};
-  for (const r of refs) {
+  for (const r of blockingRefs(refs)) {
     const val = r.byCode ? row.code : row.id;
     if (val == null) continue;
     const n = (collections[r.collection] || []).filter((x) => {
@@ -82,4 +100,17 @@ export function baseUnitRule(payload, existing) {
   if (!isBase) return { clearOthers: null, forceFactorOne: false };
   const dimension = payload.dimension || (existing && existing.dimension) || 'count';
   return { clearOthers: dimension, forceFactorOne: true };
+}
+
+/**
+ * 每个 (org, store) 有且只有一个默认价格级别 —— 它是 menu_variants.price 的落点。
+ * 把某个级别设为默认时,其余级别自动降级;把当前默认级别改成非默认则被忽略
+ * (必须始终有一个默认级别,否则「基础价存在哪一级」就没有答案了)。
+ * @returns {{ clearOthers: boolean, forceDefault: boolean }}
+ */
+export function defaultLevelRule(payload, existing) {
+  const isDefaultNow = !!(existing && existing.isDefault);
+  const wantsDefault = payload.isDefault !== undefined ? !!payload.isDefault : isDefaultNow;
+  if (!wantsDefault) return { clearOthers: false, forceDefault: isDefaultNow };
+  return { clearOthers: true, forceDefault: true };
 }

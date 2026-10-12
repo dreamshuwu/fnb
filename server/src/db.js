@@ -109,12 +109,27 @@ export const DEFAULT_UOMS = [
   ['L', '升 Litre', 'volume', 1, 1, 30],
   ['ML', '毫升 Millilitre', 'volume', 0.001, 0, 31],
 ];
-// 四类主数据共用一套「编码+名称」结构,这里集中描述以便一次性建表/回填/暴露 CRUD。
+// ---- 价格级别(价目表) ----
+// Smcin 的商品主档支持多价目:零售/会员/批发/员工。
+// 关键不变量:`menu_variants.price` **永远等于默认价格级别的价格**。
+// 非默认级别才在 variant_prices 里存覆盖行;没有覆盖行 = 回落基础价。
+// 这样老代码(报表、收据、小票)只读 variant.price 依然正确,不需要到处改。
+// [code, name, sortOrder, isDefault]
+export const DEFAULT_PRICE_LEVELS = [
+  ['RETAIL', '零售价 Retail', 1, 1],
+  ['MEMBER', '会员价 Member', 2, 0],
+  ['WHOLESALE', '批发价 Wholesale', 3, 0],
+  ['STAFF', '员工价 Staff', 4, 0],
+];
+export const PRICE_LEVEL_DEFAULT_CODE = 'RETAIL';
+
+// 五类主数据共用一套「编码+名称」结构,这里集中描述以便一次性建表/回填/暴露 CRUD。
 export const MASTER_KINDS = {
   'main-groups': { table: 'main_groups', label: 'Main Group', defaults: DEFAULT_MAIN_GROUPS },
   'print-groups': { table: 'print_groups', label: 'Print Group', defaults: DEFAULT_PRINT_GROUPS },
   departments: { table: 'departments', label: 'Department', defaults: DEFAULT_DEPARTMENTS },
   uoms: { table: 'uoms', label: 'UOM', defaults: DEFAULT_UOMS },
+  'price-levels': { table: 'price_levels', label: 'Price Level', defaults: DEFAULT_PRICE_LEVELS, hasDefaultFlag: true },
 };
 
 // 分类 -> 默认主分组 / 部门 / 打印分组。dev 预览与生产 seed 共用,避免两边种子不一致。
@@ -300,6 +315,28 @@ export async function initSchema() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX (org_id, store_id), INDEX (code)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // 价格级别(价目表):RETAIL / MEMBER / WHOLESALE / STAFF。
+    // is_default 标记哪一级是「基础价」—— menu_variants.price 存的就是它。
+    `CREATE TABLE IF NOT EXISTS price_levels (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      code VARCHAR(64) NOT NULL, name VARCHAR(255) NOT NULL, sort_order INT,
+      is_default TINYINT(1) DEFAULT 0,
+      is_active TINYINT(1) DEFAULT 1, note VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX (org_id, store_id), INDEX (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // SKU 价格覆盖:只存非默认级别的价格。默认级别的价格写回 menu_variants.price,
+    // 避免「同一个价格存两处」这种迟早对不上的设计。
+    `CREATE TABLE IF NOT EXISTS variant_prices (
+      id INT AUTO_INCREMENT PRIMARY KEY, org_id INT NOT NULL, store_id INT NOT NULL,
+      variant_id INT NOT NULL, level_code VARCHAR(64) NOT NULL,
+      price DECIMAL(10,2) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_variant_level (variant_id, level_code),
+      INDEX (org_id, store_id), INDEX (level_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS tables (
       id INT AUTO_INCREMENT PRIMARY KEY,
       org_id INT NOT NULL,
@@ -342,6 +379,7 @@ export async function initSchema() {
       member_id INT,
       sales_person_id INT,
       discount_type VARCHAR(64),
+      price_level VARCHAR(64),
       void_requested_by INT,
       void_approved_by INT,
       void_reason TEXT,
@@ -860,6 +898,9 @@ export async function initSchema() {
     "ALTER TABLE menu_variants ADD COLUMN pack_factor DECIMAL(12,4) DEFAULT 1",
     "ALTER TABLE menu_variants ADD INDEX idx_var_main_group (main_group_id)",
     "ALTER TABLE menu_variants ADD INDEX idx_var_department (department_id)",
+    // ---- 价格级别:订单记录用的是哪一级价目(为空 = 默认级别) ----
+    "ALTER TABLE orders ADD COLUMN price_level VARCHAR(64)",
+    "ALTER TABLE orders ADD INDEX idx_order_price_level (price_level)",
   ];
   for (const a of alters) {
     try { await query(a); } catch { /* 列已存在或不支持，忽略 */ }
@@ -898,6 +939,13 @@ export async function initSchema() {
               `INSERT INTO uoms (org_id, store_id, code, name, dimension, factor, is_base, sort_order, is_active)
                VALUES (?,?,?,?,?,?,?,?,1)`,
               [p.org_id, p.store_id, code, name, dimension, factor, isBase, sortOrder],
+            );
+          } else if (key === 'price-levels') {
+            const [code, name, sortOrder, isDefault] = row;
+            await query(
+              `INSERT INTO price_levels (org_id, store_id, code, name, sort_order, is_default, is_active)
+               VALUES (?,?,?,?,?,?,1)`,
+              [p.org_id, p.store_id, code, name, sortOrder, isDefault],
             );
           } else {
             const [code, name, sortOrder] = row;
@@ -968,6 +1016,17 @@ export const toUom = (r) => ({
   factor: Number(r.factor == null ? 1 : r.factor),
   isBase: !!r.is_base,
 });
+export const toPriceLevel = (r) => ({
+  ...masterRow(r),
+  isDefault: !!r.is_default,
+});
+// SKU 价格覆盖行。默认级别不会有行(它的价就是 menu_variants.price)。
+export const toVariantPrice = (r) => ({
+  _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
+  variantId: String(r.variant_id), levelCode: r.level_code,
+  price: Number(r.price || 0),
+  createdAt: dt(r.created_at), updatedAt: dt(r.updated_at),
+});
 export const toMenuBase = (r) => ({
   _id: r.id, id: r.id, orgId: r.org_id, storeId: r.store_id,
   categoryId: r.category_id == null ? null : String(r.category_id),
@@ -1029,6 +1088,8 @@ export const toOrder = (r) => ({
   salesPersonId: r.sales_person_id == null ? null : String(r.sales_person_id),
   memberId: r.member_id == null ? null : String(r.member_id),
   discountType: r.discount_type || null,
+  // 价目级别:为空表示用的是默认级别(基础价)
+  priceLevel: r.price_level || null,
   mergedIntoOrderId: r.merged_into_order_id == null ? null : String(r.merged_into_order_id),
   voucherDiscount: Number(r.voucher_discount || 0), rebateRedeemed: Number(r.rebate_redeemed || 0),
   // 会员结账明细:等级折扣 / 积分抵扣与累积 / 挂账金额
