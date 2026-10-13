@@ -60,6 +60,27 @@ async function get(p, opts = {}) {
 const DOC_ROOT_HINT = 'cPanel → Domains → ' + base.replace(/^https?:\/\//, '')
   + ' → Manage → Document Root 改成 <Application root 的绝对路径>（cPanel → Setup Node.js App 页面上显示的那串，形如 /home/<cPanel用户>/fnb-pos/server）';
 
+// Document Root 改对之后，还会剩一个**完全不同的**故障：目录里没有 Node 应用。
+// 此时再喊「Document Root 指错」就是误诊。用目录列表的内容判断 doc root 到底停在哪一层。
+const NO_APP_HINT = 'Document Root 已经对了 —— 缺的是 Node 应用本身。'
+  + 'cPanel → Software → Setup Node.js App → CREATE APPLICATION：'
+  + 'Node.js version 选最新（20.x/22.x，最低 16.x 也可）、Application mode 选 Production、'
+  + 'Application root 填 server 目录（相对家目录，形如 public_html/fnb/server）、'
+  + 'Application URL 从下拉框选 ' + base.replace(/^https?:\/\//, '') + ' 且路径框留空、'
+  + 'Application startup file 填 src/index.js，再补上 DB_*/JWT_SECRET/CLIENT_ORIGIN 环境变量；'
+  + '建好后 Run NPM Install，然后 Restart。';
+
+function guessDocRoot(body) {
+  if (!/Index of \//i.test(body)) return null;
+  const has = (s) => body.includes(s);
+  if (has('DEPLOY.md') && has('docker-compose.yml') && has('apps')) return 'repo-root';
+  if (has('package.json') && has('src') && has('public') && !has('DEPLOY.md')) return 'server';
+  return 'unknown';
+}
+function docRootHint(body) {
+  return guessDocRoot(body) === 'server' ? NO_APP_HINT : DOC_ROOT_HINT;
+}
+
 if (!JSON_OUT) {
   console.log(`\n${C.bold}=== F&B POS 部署自检 ===${C.reset}`);
   console.log(`目标：${C.cyan}${base}${C.reset}\n`);
@@ -82,9 +103,11 @@ if (!home.ok) {
   if (isSpa) {
     record('home', '首页返回前端 SPA', 'pass', `${home.status} · ${home.body.length}B · 含 id="root"`);
   } else if (isAutoindex) {
+    const where = guessDocRoot(home.body);
+    const label = where === 'repo-root' ? '仓库根' : where === 'server' ? 'server/ 目录（这一层是对的）' : '未知目录';
     record('home', '首页返回前端 SPA', 'fail',
-      `${home.status} · 返回的是 LiteSpeed 目录列表「Index of /」`,
-      DOC_ROOT_HINT);
+      `${home.status} · 返回 LiteSpeed 目录列表「Index of /」—— 它列的是 ${label}`,
+      docRootHint(home.body));
   } else if (isPassengerErr) {
     record('home', '首页返回前端 SPA', 'fail', `${home.status} · 返回 Passenger/服务器错误页`, '看 cPanel → Setup Node.js App → 日志；确认 npm install 已跑、点过 Restart。');
   } else {
@@ -104,7 +127,7 @@ if (!health.ok) {
   } else if (health.status === 404 || health.status === 403) {
     record('health', 'API 健康检查 /api/health', 'fail',
       `${health.status} · 服务器自带 404 —— 请求根本没交给 Node`,
-      'Document Root 指错 + Node App 的 Application URL 没选域名根，两个都要改；改完在 Node.js App 页面点 Restart。');
+      docRootHint(home.body));
   } else if (health.status === 502 || health.status === 503) {
     record('health', 'API 健康检查 /api/health', 'fail',
       `${health.status} · Passenger 代理到了但 Node 没起来`,
@@ -114,31 +137,40 @@ if (!health.ok) {
   }
 }
 
-// ---- 3. 仓库根有没有被公开？ -------------------------------------------
+// ---- 3. 源码有没有被公开？ ---------------------------------------------
+// 探测路径要跟着 doc root 走：doc root 是仓库根时源码在 /server/src/，
+// doc root 已经是 server/ 时源码直接落在 /src/。
+const atServerRoot = guessDocRoot(home.body) === 'server';
+const srcProbes = atServerRoot
+  ? ['/package.json', '/src/index.js', '/src/db.js']
+  : ['/DEPLOY.md', '/package.json', '/server/src/index.js', '/docker-compose.yml'];
 // 只有「200 且返回的确实是源文件本体」才算泄露；SPA fallback 不算。
 const exposed = [];
-for (const p of ['/DEPLOY.md', '/package.json', '/server/src/index.js', '/docker-compose.yml']) {
+for (const p of srcProbes) {
   const r = await get(p);
   if (r.ok && r.status === 200 && r.body.trim() && !sameAsHome(r.body) && !looksLikeSpa(r.body)) exposed.push(p);
 }
 if (exposed.length === 0) {
-  record('expose', '仓库根未被公开', 'pass', 'DEPLOY.md / package.json / server/src 均不可直连');
+  record('expose', '源码未被公开', 'pass', `${srcProbes.length} 个探测路径均不可直连`);
 } else {
-  record('expose', '仓库根未被公开', 'fail',
+  record('expose', '源码未被公开', 'fail',
     `源码可被公网直接下载：${exposed.join('、')}`,
-    '同一个根因：Document Root 指到了仓库根。改对之后自然消失；改之前先 git pull 拿到仓库根的 .htaccess（含 Options -Indexes）。');
+    atServerRoot
+      ? 'Document Root 已经是 server/ 了，所以 src/ 直接落在 web 根下。把 Node 应用建起来后 Passenger 会接管全部请求，这一项自动消失。'
+      : '同一个根因：Document Root 指到了仓库根。改对之后自然消失；改之前先 git pull 拿到仓库根的 .htaccess（含 Options -Indexes）。');
 }
 
 // ---- 4. 前端是不是被埋在子目录里？ -------------------------------------
-// 判据：/ 不是 SPA，但 /server/public/index.html 能取到一份真的 index.html。
-const buried = await get('/server/public/index.html');
+// 判据：/ 不是 SPA，但某个「错误 URL」能直接取到真的 index.html。
+const buriedProbe = atServerRoot ? '/public/index.html' : '/server/public/index.html';
+const buried = await get(buriedProbe);
 const buriedReal = buried.ok && buried.status === 200 && looksLikeSpa(buried.body) && !homeIsSpa;
 if (buriedReal) {
   record('buried', '前端没有被埋在子目录', 'fail',
-    'GET /server/public/index.html 返回了真的 index.html —— 说明 doc root 是仓库根，前端在 /server/public/ 下',
+    `GET ${buriedProbe} 返回了真的 index.html —— 前端文件在，但只能从这个子路径取到`,
     '就算手改 URL 访问到它也没用：它引用的是根绝对路径 /assets/*.js，在子目录里永远加载不出来。');
 } else {
-  record('buried', '前端没有被埋在子目录', 'pass', `/server/public/index.html → ${buried.status}（非真 index.html）`);
+  record('buried', '前端没有被埋在子目录', 'pass', `${buriedProbe} → ${buried.status}（非真 index.html）`);
 }
 
 // ---- 5. 前端资源真的能加载吗？ -----------------------------------------
@@ -154,7 +186,10 @@ if (assetRefs.length === 0) {
     if (!r.ok || r.status !== 200 || !/javascript|css/.test(ct)) bad.push(`${a} → ${r.ok ? r.status + ' ' + ct : r.error}`);
   }
   if (bad.length === 0) record('assets', '前端 JS/CSS 可加载', 'pass', `${assetRefs.length} 个资源全部 200`);
-  else record('assets', '前端 JS/CSS 可加载', 'fail', bad.join('；'), '静态资源 404 说明 doc root 不对（或前端构建产物没传上去）。');
+  else record('assets', '前端 JS/CSS 可加载', 'fail', bad.join('；'),
+    atServerRoot
+      ? 'Node 应用还没起来，所以 /assets/* 直接落到 web 根下找不到（文件其实在 server/public/assets/）。建好应用即恢复。'
+      : '静态资源 404 说明 doc root 不对（或前端构建产物没传上去）。');
 }
 
 // ---- 6. 线上前端是不是旧版？ -------------------------------------------
@@ -196,15 +231,37 @@ if (JSON_OUT) {
   } else {
     console.log(`${fails.length} 项失败 / ${warns.length} 项警告\n`);
     if (fails.length) {
+      const steps = atServerRoot
+        ? [
+          [
+            'cPanel → Software → Setup Node.js App → CREATE APPLICATION（目录里还没有 Node 应用）：',
+            '   · Node.js version：选最新的 LTS（20.x / 22.x；只有 16.x 也能跑，本项目没用新语法）',
+            '   · Application mode：Production',
+            '   · Application root：server 目录，相对家目录（若仓库在 public_html/fnb 下 → public_html/fnb/server）',
+            `   · Application URL：下拉框选 ${base.replace(/^https?:\/\//, '')}，右侧路径框留空`,
+            '   · Application startup file：src/index.js',
+            '   · Environment variables：DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME /',
+            '     JWT_SECRET / CLIENT_ORIGIN（不要填 PORT，Passenger 会自己给；不要填 DEV_NO_DB）',
+            '   · 点 CREATE → 回到该应用点 Run NPM Install → 再点 Restart',
+          ].join('\n'),
+          'Document Root 已经是 server/ 了，不用再改。',
+          'cPanel → LiteSpeed Web Cache Manager → Flush All。',
+          '服务器上 cd <Application root> && git pull && npm install，再 Restart。',
+        ]
+        : [
+          [
+            'cPanel → Software → Setup Node.js App：Application root = server/、Application URL = 域名根、',
+            '   Startup file = src/index.js、环境变量已填、已 npm install，然后点 Restart。',
+            '   把这一页显示的 Application root 绝对路径复制下来。',
+          ].join('\n'),
+          'cPanel → Domains → Manage → Document Root = 上面那串绝对路径。',
+          '回 Node.js App 页面再点一次 Restart（让代理 .htaccess 重新写对位置）。',
+          'cPanel → LiteSpeed Web Cache Manager → Flush All。',
+          '服务器上 cd <Application root> && git pull && npm install，再 Restart。',
+        ];
       console.log(`${C.bold}按顺序修：${C.reset}`);
-      console.log('  1. cPanel → Setup Node.js App：Application root = server/、Application URL = 域名根、');
-      console.log('     Startup file = src/index.js、环境变量已填、已 npm install，然后点 Restart。');
-      console.log('     把这一页显示的 Application root 绝对路径复制下来。');
-      console.log('  2. cPanel → Domains → Manage → Document Root = 上面那串绝对路径。');
-      console.log('  3. 回 Node.js App 页面再点一次 Restart（让代理 .htaccess 重新写对位置）。');
-      console.log('  4. cPanel → LiteSpeed Web Cache Manager → Flush All。');
-      console.log('  5. 服务器上 cd <Application root> && git pull && npm install，再 Restart。');
-      console.log(`  6. 重跑本脚本：${C.cyan}node scripts/deploy-check.mjs${C.reset}\n`);
+      steps.forEach((s, i) => console.log(`  ${i + 1}. ${s}`));
+      console.log(`  ${steps.length + 1}. 重跑本脚本：${C.cyan}node scripts/deploy-check.mjs${C.reset}\n`);
       console.log(`${C.dim}判定标准只有一个：GET ${base}/api/health 返回 {"ok":true}。${C.reset}\n`);
     }
   }

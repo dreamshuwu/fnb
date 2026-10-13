@@ -77,6 +77,56 @@ node scripts/deploy-check.mjs https://fnb.beyourdiary.com --json
 
 ---
 
+## 0.6 创建 Node.js App：逐栏照抄
+
+**入口**：cPanel → **SOFTWARE（软件）区** → **Setup Node.js App** → **CREATE APPLICATION**。
+（不在「Files」也不在「Advanced」；如果 SOFTWARE 区里没有这一项，说明主机没给你的套餐启用
+Node.js Selector，需要开工单让主机打开。）
+
+填表对照：
+
+| 表单栏 | 填什么 | 为什么 |
+| --- | --- | --- |
+| **Node.js version** | 下拉里**最新的 LTS**（20.x / 22.x）。只有 `16.20.2` 也能跑 —— 本项目没用 Node 17+ 的新语法，依赖（express 4 / socket.io 4 / mysql2 3 / helmet 7 / zod 3）都支持 16 | 16 已 EOL，能用但不推荐 |
+| **Application mode** | **Production** | 它只负责设 `NODE_ENV`；本项目代码不读 `NODE_ENV`，但 Production 会跳过 devDependencies，更干净 |
+| **Application root** | `server` 目录，**相对家目录**。若仓库在 `public_html/fnb` 下 → `public_html/fnb/server` | cPanel 官方文档原话：*the entry will be appended to `/home/username`*。所以**不要**填 `/home/...` 全路径，也不要以 `/` 开头 |
+| **Application URL** | 下拉框**必须换成 `fnb.beyourdiary.com`**，右侧路径框**留空** | 下拉默认选中的是 `beyourdiary.com` —— 不换就等于把主域名劫持到这个应用上 |
+| **Application startup file** | `src/index.js` | Passenger 的入口，相对 Application root |
+| **Environment variables** | 见下表，点 **ADD VARIABLE** 逐个加 | |
+
+环境变量（**只加这些**）：
+
+| 变量 | 值 |
+| --- | --- |
+| `DB_HOST` | `127.0.0.1` |
+| `DB_PORT` | `3306` |
+| `DB_USER` | `beyourdi_cms` |
+| `DB_PASSWORD` | 该 MySQL 用户的真实密码 |
+| `DB_NAME` | `beyourdi_fnb` |
+| `JWT_SECRET` | 一长串随机字符（生产务必换掉 `change-me-in-prod`） |
+| `CLIENT_ORIGIN` | `https://fnb.beyourdiary.com` |
+
+**两个千万别填的变量**：
+
+- **`PORT`** —— Passenger 通过 `process.env.PORT` 把端口交给你（代码里 `process.env.PORT || 4000` 已经正确处理）。自己填了会和 Passenger 抢端口。
+- **`WEB_DIST_PATH`** —— 它是**相对进程工作目录**的，而 cPanel/Passenger 的 CWD 就是 Application root（`server/`）。填 `server/public` 会让 Node 去找 `server/server/public`，**不存在 → 前端整块不挂载**，页面白屏但 API 正常，极难排查。一体化部署不设它就对了（默认 `path.join(__dirname,'..','public')`）。
+
+**创建之后**（这三步一个都不能少）：
+
+1. 回到 **WEB APPLICATIONS** 列表 → 找到刚建的应用 → 点铅笔图标 → **Run NPM Install**，等它成功。
+2. 同一页点 **Restart**。
+3. cPanel → **LiteSpeed Web Cache Manager** → **Flush All**。
+
+然后重跑 `npm run deploy:check`。
+
+> **Document Root 与 Application root 的关系**：cPanel 会把 Passenger 代理指令自动写进
+> **Application root 的 `.htaccess`**。只有 Document Root 也指向同一个目录，这份 `.htaccess`
+> 才会被读到，代理才生效 —— 这就是「两个 root 必须一致」的根本原因。
+> 注意：**不要手动在 `server/` 里放 `.htaccess`**，会和 cPanel 生成的那份冲突。
+> 仓库根那份 `.htaccess` 是给「Document Root 还指在仓库根」的临时状态用的，改对之后它就失效了。
+
+---
+
 ## 方案 A（推荐）：一体化部署，一个 Node App 托管一切
 1. 把仓库代码放到 cPanel（git clone 或上传）。重点是里面的 `server/` 目录。
    - `server/public/` 已经包含构建好的前端（由 CI/本地 `npm run build` 生成并随仓库发布），
@@ -136,6 +186,13 @@ node scripts/deploy-check.mjs https://fnb.beyourdiary.com --json
 生产前务必改密码（`server/src/seed.js` 里，或直接在数据库 `users` 表改 `password_hash`）。
 
 ## 常见问题
+- **Document Root 改对了，但打开域名还是 "Index of /"，而且列表里只有 `public` `src` `package.json`**：
+  这是**第二个坑**，和第一个坑长得像但原因完全不同 —— 目录列表已经停在 `server/` 这一层了，
+  说明 Document Root 是**对的**；缺的是**Node 应用本身**：cPanel 里压根还没建这个 App，
+  所以没有 Passenger 代理来接管请求，LiteSpeed 就照旧列目录。
+  判据：列表里出现 `DEPLOY.md` / `docker-compose.yml` / `apps` → 还是第一个坑（doc root 指到仓库根）；
+  只有 `public` / `src` / `package.json` → 第二个坑（去 0.6 建应用）。
+  自检脚本会直接告诉你现在卡在哪个坑。
 - **打开域名看到 "Index of /"（LiteSpeed 把整个仓库目录列出来了，例如 `apps/` `server/` `DEPLOY.md` 都被公开）**：
   这是**最常见的坑**，意味着你的域名 Document Root 指到了仓库根 `fnb-pos/`，而不是 `server/`，
   所以 cPanel 的 Node.js App 代理根本没参与。修复三步：
@@ -173,6 +230,10 @@ node scripts/deploy-check.mjs https://fnb.beyourdiary.com --json
   （`Cmd/Ctrl+Shift+R`）；④ 重跑 `npm run deploy:check`。若仍是 `Index of /`，多半是绝对路径填错
   （见「0. 先拿到 Application root 的绝对路径」里"填错的样子"）。
 - **页面打不开 / 一直转圈**：Node App 没起来。看 cPanel Node.js App 的日志；确认 `npm install` 已跑过、点过 Restart。
+- **页面白屏（空白），但 `/api/health` 是通的**：八成是 `WEB_DIST_PATH` 被设成了相对路径
+  （如 `server/public`）→ Node 去 `server/server/public` 找前端，找不到就整块不挂载。
+  删掉这个环境变量再 Restart 即可（见 0.6 的「两个千万别填的变量」）。
+  自检脚本的「前端 JS/CSS 可加载」那一项会红。
 - **登录报错 401 / 接口 404**：确认 Application URL 是域名根（方案 A），且 Document Root 已改为 `server/`（参见上一条）。
 - **数据库连不上**：确认 `beyourdi_cms` 已授权 `beyourdi_fnb`，且 `DB_HOST` 用 `127.0.0.1`（cPanel 内网）。
 - **健康检查**：访问 `https://<你的域名>/api/health` 应返回 `{"ok":true}`。
