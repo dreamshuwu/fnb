@@ -206,6 +206,55 @@ SSH 需要主机开启 —— 看 cPanel → **Security → SSH Access**；没�
 
 ---
 
+## 0.8 终极兜底：单文件部署（完全不需要 npm install）
+
+如果 **Run NPM Install 怎么都失败** —— cPanel 一直报
+`An error occured during installation of modules`，`workspaces` 也删了、按钮也反复点了还是不行 ——
+就**别再和它纠缠**了：用一个打包好的单文件直接跑后端。
+
+原理：`scripts/build-server.mjs` 用 esbuild 把 `server/src/index.js` 连同**全部 npm 依赖**
+（express / mysql2 / socket.io / bcryptjs / jsonwebtoken / zod / helmet / cors …）
+打进一个 ESM 文件。服务器上**没有 `node_modules` 也能跑**。
+
+### 产物
+
+```
+server/dist/index.mjs   ← 约 4 MB，已随仓库提交（.gitignore 里有例外规则放行）
+server/public/          ← 前端静态文件，本来就在仓库里
+```
+
+### 服务器上怎么做（三步）
+
+1. **拿到 bundle**
+   - 有 Git™ Version Control：点 **Update from Remote**（`server/dist/index.mjs` 会一起下来）；
+   - 没有：从 GitHub 下载这个文件，用 File Manager 上传到 `public_html/fnb/server/dist/`。
+2. **改启动文件**：cPanel → **Setup Node.js App** → 该应用 → **Application startup file**
+   从 `src/index.js` 改成 **`dist/index.mjs`** → **Save**。
+3. **生效**：点 **Restart**，再 LiteSpeed Web Cache Manager → **Flush All**。
+
+验证：访问 `https://<你的域名>/api/health`，返回 `{"ok":true}` 就成功了。
+
+> ⚠️ 切到单文件模式后，**`Run NPM Install` 就不用再点了**，也不要再因为它报错而怀疑自己的操作 ——
+> 单文件模式根本不读 `node_modules`。
+
+### 本地怎么重新生成这个 bundle
+
+```bash
+npm run build:server     # 需要 esbuild（已在根 devDependencies，npm install 会装上）
+# 依赖没装全时的兜底：
+NODE_PATH=<装了 esbuild 的目录>/node_modules node scripts/build-server.mjs
+```
+
+**产物落点必须是 `server/dist/index.mjs`**：`index.js` 用 `path.join(__dirname, '..', 'public')`
+定位前端，如果 bundle 放在 `server/` 根下，就会解析成仓库根的 `public`，前端整块挂不上（表现为 API 正常但白屏）。
+
+> 打包脚本会在产物里扫描「`import.meta.url` 与入口路径相等」这种**裸守卫**并**直接让构建失败**。
+> 原因：单文件里两者会同时指向 `dist/index.mjs`，守卫会误判为真，服务一启动就执行 CLI 逻辑。
+> 本项目真实踩过这个坑：`seed.js` 的「直接运行就播种」守卫被误触发，dev 模式进程跑去连 MySQL 崩溃。
+> 现在 `seed.js` 已改成 bundle-safe 写法（额外校验入口文件名，并用 `pathToFileURL` 做比较）。
+
+---
+
 ## 方案 A（推荐）：一体化部署，一个 Node App 托管一切
 1. 把仓库代码放到 cPanel（git clone 或上传）。重点是里面的 `server/` 目录。
    - `server/public/` 已经包含构建好的前端（由 CI/本地 `npm run build` 生成并随仓库发布），
@@ -334,6 +383,13 @@ SSH 需要主机开启 —— 看 cPanel → **Security → SSH Access**；没�
   （`Cmd/Ctrl+Shift+R`）；④ 重跑 `npm run deploy:check`。若仍是 `Index of /`，多半是绝对路径填错
   （见「0. 先拿到 Application root 的绝对路径」里"填错的样子"）。
 - **页面打不开 / 一直转圈**：Node App 没起来。看 cPanel Node.js App 的日志；确认 `npm install` 已跑过、点过 Restart。
+- **Run NPM Install 反复失败、就是装不上依赖**：别再重试了，直接切到**单文件部署**（见上文 **0.8**）——
+  服务器上完全不需要 `node_modules`。
+- **本地 `npm run seed` 什么都不输出、直接退出**：这是 2026-10-14 修掉的一个真 bug。
+  `seed.js` 末尾判断「是否被直接运行」原来写的是 ``import.meta.url === `file://${process.argv[1]}` ``，
+  而 `import.meta.url` 会把路径里的空格编码成 `%20`（本仓库路径含空格），拼接出来的字符串**永远对不上**，
+  守卫静默失效 —— 也就是说 `npm run seed` 一直什么都没做。现已改用 `pathToFileURL()` 做同样的编码比较，
+  相对/绝对路径都能正确触发。同一个守卫现在还额外校验入口文件名，避免被打进单文件 bundle 后误触发（见 0.8）。
 - **页面白屏（空白），但 `/api/health` 是通的**：八成是 `WEB_DIST_PATH` 被设成了相对路径
   （如 `server/public`）→ Node 去 `server/server/public` 找前端，找不到就整块不挂载。
   删掉这个环境变量再 Restart 即可（见 0.6 的「两个千万别填的变量」）。

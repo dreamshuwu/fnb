@@ -1,4 +1,5 @@
 import bcrypt from 'bcryptjs';
+import { pathToFileURL } from 'url';
 import {
   pool, query, insert, stringifyJSON,
   DEFAULT_MEMBER_TIERS, DEFAULT_MEMBER_SETTINGS,
@@ -305,7 +306,19 @@ export async function seedIfEmpty() {
 }
 
 // 单独运行:node src/seed.js
-if (import.meta.url === `file://${process.argv[1]}`) {
+// ⚠️ 两个坑:
+//  1) 不能写成 `file://${process.argv[1]}` 字符串拼接 —— import.meta.url 会把空格等字符
+//     百分号编码(本仓库路径含空格 → %20),拼接出来的永远对不上,守卫会静默失效
+//     (即 `npm run seed` 什么都不做)。必须用 pathToFileURL 做同样的编码。
+//  2) 打成单文件 bundle(scripts/build-server.mjs)后,import.meta.url 与入口文件路径会同时
+//     指向 bundle 入口(dist/index.mjs),只比较相等的话守卫会误判为真 → 服务一启动就跑
+//     去连 MySQL 播种(连 DEV_NO_DB=1 的内存模式都会被拖垮)。所以还要校验入口文件名。
+const cliEntry = process.argv[1] || '';
+const invokedAsSeedCli =
+  cliEntry.endsWith('/seed.js') &&
+  pathToFileURL(cliEntry).href === import.meta.url;
+
+if (invokedAsSeedCli) {
   (async () => {
     await seedIfEmpty();
     await pool.end();

@@ -1,5 +1,13 @@
 node_modules
-dist
+dist/
 .env
 *.log
 .DS_Store
+
+# 例外：后端单文件 bundle 要随仓库分发。
+# 原因：cPanel 的 Run NPM Install 在共享主机上不可靠（本项目实测报
+# "An error occured during installation of modules"），服务器上没有终端也没法手动装依赖。
+# 把打好的 server/dist/index.mjs 提交进来，服务器只要 git pull 就能拿到，
+# 再把 Startup file 指向 dist/index.mjs 即可，完全不需要 node_modules。
+!server/dist/
+!server/dist/index.mjs

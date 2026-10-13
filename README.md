@@ -35,6 +35,20 @@ npm run dev
 - 首次启动会自动建表 + 写入演示组织/门店与 5 个账号(见 `server/src/seed.js`)。
 - 后端使用 **MySQL**,不再依赖 MongoDB。
 
+## 构建与部署产物
+
+| 命令 | 作用 |
+| --- | --- |
+| `npm run build:web` | 构建前端到 `apps/web/dist` |
+| `npm run build` | 构建前端 + 复制到 `server/public/`(一体化部署用) |
+| `npm run build:server` | 用 esbuild 把后端连同**全部 npm 依赖**打成单文件 `server/dist/index.mjs` —— 这是「服务器上不需要 `node_modules`」的部署方式,详见 `DEPLOY.md` 0.8 |
+| `npm run deploy:check` | 部署自检(只读探测,可直接对线上域名跑) |
+
+> `server/dist/index.mjs`(约 4 MB)**是要提交进仓库的** —— `.gitignore` 里专门放行了它。
+> 原因:cPanel 的 Run NPM Install 在共享主机上不可靠,而服务器上也没有终端。
+> 改了后端代码后重新跑一次 `npm run build:server` 并一起提交即可。
+> 打包脚本会扫描产物里的「直接运行」裸守卫并让构建失败,防止 bundle 启动时误执行 CLI 逻辑。
+
 ## 默认账号
 
 | 角色 | 手机 | 密码 |

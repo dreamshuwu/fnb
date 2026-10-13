@@ -37,7 +37,17 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 // 这样无需单独静态服务器、子域或 .htaccess;前端用同源 /api 调接口。
 // 静态目录默认 server/public(构建后复制进来),可用 WEB_DIST_PATH 覆盖。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const publicDir = process.env.WEB_DIST_PATH || path.join(__dirname, '..', 'public');
+// 静态目录候选，按序取第一个含 index.html 的：
+//   1) WEB_DIST_PATH（显式指定，必须给绝对路径）
+//   2) <入口所在目录>/../public  —— src/index.js 与 dist/index.mjs 两种布局都对
+//   3) <入口所在目录>/public     —— bundle 直接放在应用根目录时
+// 多候选是为了让「打成单文件 bundle 后无需 npm install」的部署方式也能正确定位前端。
+const publicDir = [
+  process.env.WEB_DIST_PATH,
+  path.join(__dirname, '..', 'public'),
+  path.join(__dirname, 'public'),
+].filter(Boolean).find((p) => fs.existsSync(path.join(p, 'index.html')))
+  || path.join(__dirname, '..', 'public');
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
   // SPA 回退:非 /api、非 /socket.io 的请求都返回 index.html

@@ -7,10 +7,12 @@
     "dev": "concurrently -n server,web -c blue,green \"npm --prefix server run dev\" \"npm --prefix apps/web run dev\"",
     "seed": "npm --prefix server run seed",
     "build:web": "npm --prefix apps/web run build",
+    "build:server": "node scripts/build-server.mjs",
     "build": "npm run build:web && node scripts/copy-dist.mjs",
     "deploy:check": "node scripts/deploy-check.mjs"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "esbuild": "^0.21.5"
   }
 }

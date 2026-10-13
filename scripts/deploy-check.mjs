@@ -107,10 +107,14 @@ function lastErrorOf(body) {
 function adviceFor(err = '') {
   if (/Cannot find package '?([a-z0-9@/._-]+)'?/i.test(err)) {
     const pkg = err.match(/Cannot find package '?([a-z0-9@/._-]+)'?/i)[1];
-    return `依赖没装（缺 ${pkg}）。先确认仓库根的 package.json 里没有 "workspaces" 段 —— 有的话 npm 会把依赖装到`
+    return `依赖没装（缺 ${pkg}）。两条路，任选一条：`
+      + ' 【A 装依赖】先确认仓库根的 package.json 里没有 "workspaces" 段 —— 有的话 npm 会把依赖装到'
       + ' Application root 之外，cPanel 的 Run NPM Install 必然失败；用 File Manager 编辑根 package.json 删掉它，'
       + '或直接把根 package.json 重命名成 package.json.old（零风险）。'
-      + ' 然后 cPanel → 该应用 → Run NPM Install。没有这个按钮又没有 Terminal 的话，见 DEPLOY.md「没有 Terminal 怎么办」。';
+      + ' 然后 cPanel → 该应用 → Run NPM Install。没有这个按钮又没有 Terminal 的话，见 DEPLOY.md「没有 Terminal 怎么办」。'
+      + ' 【B 不装依赖】Run NPM Install 反复失败就别再试了 —— 改用单文件部署：把 server/dist/index.mjs 传到'
+      + ' Application root 下的 dist/，把 Startup file 改成 dist/index.mjs，Restart 即可，完全不需要 node_modules'
+      + '（详见 DEPLOY.md 0.8）。';
   }
   if (/Access denied for user|ER_ACCESS_DENIED_ERROR/i.test(err)) {
     return 'MySQL 拒绝登录：DB_USER / DB_PASSWORD 填错了，或者该用户还没被授权给这个库。'
@@ -129,7 +133,7 @@ function adviceFor(err = '') {
     return 'Node 版本或模块格式不兼容：换一个 Node.js version（推荐 20.x LTS）后 Restart。';
   }
   return '看完整日志：cPanel → Setup Node.js App → 该应用 → 日志，或 File Manager 打开 Application root 下的 stderr.log。'
-    + '确认已 Run NPM Install、Startup file = src/index.js、然后 Restart。';
+    + '确认已 Run NPM Install、Startup file = src/index.js（单文件部署时是 dist/index.mjs）、然后 Restart。';
 }
 
 if (!JSON_OUT) {
@@ -329,17 +333,21 @@ if (JSON_OUT) {
           'Document Root 已经是 server/ 了，不用再改。',
           'cPanel → LiteSpeed Web Cache Manager → Flush All。',
           '服务器上 cd <Application root> && git pull && npm install，再 Restart。',
+          '若 Run NPM Install 一直失败：改走单文件部署（DEPLOY.md 0.8）—— 传 server/dist/index.mjs，'
+            + 'Startup file 改成 dist/index.mjs，不需要 node_modules。',
         ]
         : [
           [
             'cPanel → Software → Setup Node.js App：Application root = server/、Application URL = 域名根、',
-            '   Startup file = src/index.js、环境变量已填、已 npm install，然后点 Restart。',
+            '   Startup file = src/index.js（或单文件部署的 dist/index.mjs）、环境变量已填、已 npm install，然后点 Restart。',
             '   把这一页显示的 Application root 绝对路径复制下来。',
           ].join('\n'),
           'cPanel → Domains → Manage → Document Root = 上面那串绝对路径。',
           '回 Node.js App 页面再点一次 Restart（让代理 .htaccess 重新写对位置）。',
           'cPanel → LiteSpeed Web Cache Manager → Flush All。',
           '服务器上 cd <Application root> && git pull && npm install，再 Restart。',
+          '若 Run NPM Install 一直失败：改走单文件部署（DEPLOY.md 0.8）—— 传 server/dist/index.mjs，'
+            + 'Startup file 改成 dist/index.mjs，不需要 node_modules。',
         ];
       console.log(`${C.bold}按顺序修：${C.reset}`);
       steps.forEach((s, i) => console.log(`  ${i + 1}. ${s}`));
