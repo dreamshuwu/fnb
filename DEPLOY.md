@@ -103,7 +103,7 @@ Node.js Selector，需要开工单让主机打开。）
 | `DB_USER` | `beyourdi_cms` |
 | `DB_PASSWORD` | 该 MySQL 用户的真实密码 |
 | `DB_NAME` | `beyourdi_fnb` |
-| `JWT_SECRET` | 一长串随机字符（生产务必换掉 `change-me-in-prod`） |
+| `JWT_SECRET` | 一长串随机字符。**仓库里从来没有过真值** —— `.env` / `.env.example` 一直是 `change-me-in-prod` 占位符，必须自己生成：在 cPanel Terminal 跑 `openssl rand -base64 48`，把输出整串粘进去 |
 | `CLIENT_ORIGIN` | `https://fnb.beyourdiary.com` |
 
 **两个千万别填的变量**：
