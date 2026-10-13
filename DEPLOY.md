@@ -153,6 +153,59 @@ cd ~/public_html/fnb/server && npm install --no-audit --no-fund
 
 ---
 
+## 0.7 没有 Terminal 怎么办
+
+cPanel 的 **Terminal** 很多共享主机会关闭（它通常在 **Advanced** 或 **Security** 区；
+如果两个区都没有，就是主机禁用了）。**不用终端也能完成全部操作。**
+
+### 1) 先用 File Manager 改仓库根的 `package.json`
+
+根 `package.json` 里的 `"workspaces": ["server","apps/web"]` 会让 npm 把依赖装到
+**Application root 之外**，cPanel 的 Run NPM Install 必然失败。两种改法任选：
+
+**改法 A（推荐）** cPanel → **File Manager** → 进入 `public_html/fnb/` → 右键 `package.json`
+→ **Edit** → 把下面这段**整段删掉**（连末尾的逗号一起）→ **Save Changes**：
+
+```json
+  "workspaces": [
+    "server",
+    "apps/web"
+  ],
+```
+
+**改法 B（零风险，完全不用编辑 JSON）** 同一个位置，把 `public_html/fnb/package.json`
+**重命名**为 `package.json.old`。没有根 `package.json`，npm 就不会再向上合并到仓库根。
+（以后能 `git pull` 时，新的 `package.json` 会自动出现且已不含 workspaces，那时把 `.old` 删掉。）
+
+### 2) 装依赖
+
+cPanel → **Setup Node.js App** → 该应用 → **Run NPM Install**。
+
+### 3) 生效
+
+点 **Restart**，再 cPanel → **LiteSpeed Web Cache Manager** → **Flush All**。
+
+### 4) 连 Run NPM Install 按钮也没有 / 想用命令行
+
+用 **Mac 自带的「终端」**（访达 → 应用程序 → 实用工具 → 终端）走 SSH：
+
+```bash
+ssh <cPanel用户名>@<服务器域名>
+cd ~/public_html/fnb/server && npm install --no-audit --no-fund
+```
+
+SSH 需要主机开启 —— 看 cPanel → **Security → SSH Access**；没有这一项就开工单让主机启用。
+
+### 5) 想更新代码但没有终端
+
+- cPanel → **Git™ Version Control**（若主机提供）：把该仓库添加进去后点 **Update from Remote**；
+- 或者从 GitHub 下载仓库 ZIP，用 File Manager 上传到 `public_html/fnb/` 后 **Extract** 覆盖。
+
+> 只改根 `package.json` 就能让站点先跑起来；代码更新（线上还是 9/28 快照，缺区块⑨⑩⑪）
+> 是**另一件事**，可以稍后再做。
+
+---
+
 ## 方案 A（推荐）：一体化部署，一个 Node App 托管一切
 1. 把仓库代码放到 cPanel（git clone 或上传）。重点是里面的 `server/` 目录。
    - `server/public/` 已经包含构建好的前端（由 CI/本地 `npm run build` 生成并随仓库发布），

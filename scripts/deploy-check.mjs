@@ -107,8 +107,10 @@ function lastErrorOf(body) {
 function adviceFor(err = '') {
   if (/Cannot find package '?([a-z0-9@/._-]+)'?/i.test(err)) {
     const pkg = err.match(/Cannot find package '?([a-z0-9@/._-]+)'?/i)[1];
-    return `依赖没装（缺 ${pkg}）：cPanel → 该应用 → Run NPM Install，等它成功后再点 Restart。`
-      + ' Run NPM Install 报错的话，用 Terminal 跑 `cd <Application root> && npm install`。';
+    return `依赖没装（缺 ${pkg}）。先确认仓库根的 package.json 里没有 "workspaces" 段 —— 有的话 npm 会把依赖装到`
+      + ' Application root 之外，cPanel 的 Run NPM Install 必然失败；用 File Manager 编辑根 package.json 删掉它，'
+      + '或直接把根 package.json 重命名成 package.json.old（零风险）。'
+      + ' 然后 cPanel → 该应用 → Run NPM Install。没有这个按钮又没有 Terminal 的话，见 DEPLOY.md「没有 Terminal 怎么办」。';
   }
   if (/Access denied for user|ER_ACCESS_DENIED_ERROR/i.test(err)) {
     return 'MySQL 拒绝登录：DB_USER / DB_PASSWORD 填错了，或者该用户还没被授权给这个库。'
