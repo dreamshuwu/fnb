@@ -81,6 +81,55 @@ function docRootHint(body) {
   return guessDocRoot(body) === 'server' ? NO_APP_HINT : DOC_ROOT_HINT;
 }
 
+// Passenger 把应用的 stderr 写在 Application root 下（cPanel 默认 stderr.log）。
+// 而 Application root 就是 doc root，于是这个日志能被公网直接下载 —— 既是一处泄露，
+// 也是**唯一能说清「Node 为什么起不来」的地方**。503 时优先读它。
+const APP_LOG_PATHS = ['/stderr.log', '/app.log', '/passenger.log', '/nodeapp.log'];
+async function fetchAppLog() {
+  for (const p of APP_LOG_PATHS) {
+    const r = await get(p);
+    if (r.ok && r.status === 200 && r.body.trim().length > 20) return { path: p, body: r.body };
+  }
+  return null;
+}
+
+function lastErrorOf(body) {
+  const idx = body.lastIndexOf('Error [');
+  if (idx >= 0) {
+    const lines = body.slice(idx, idx + 500).split('\n').map((l) => l.trim()).filter(Boolean);
+    const msg = lines.find((l) => /Cannot find|not found|ECONNREFUSED|Access denied|Unknown database|EADDRINUSE|denied|does not exist/i.test(l)) || lines[0];
+    return msg.slice(0, 240);
+  }
+  return body.trim().split('\n').map((l) => l.trim()).filter(Boolean).slice(-2).join(' | ').slice(0, 240) || '(日志为空)';
+}
+
+// 把 Passenger/Node 的报错翻译成「下一步点哪里」。
+function adviceFor(err = '') {
+  if (/Cannot find package '?([a-z0-9@/._-]+)'?/i.test(err)) {
+    const pkg = err.match(/Cannot find package '?([a-z0-9@/._-]+)'?/i)[1];
+    return `依赖没装（缺 ${pkg}）：cPanel → 该应用 → Run NPM Install，等它成功后再点 Restart。`
+      + ' Run NPM Install 报错的话，用 Terminal 跑 `cd <Application root> && npm install`。';
+  }
+  if (/Access denied for user|ER_ACCESS_DENIED_ERROR/i.test(err)) {
+    return 'MySQL 拒绝登录：DB_USER / DB_PASSWORD 填错了，或者该用户还没被授权给这个库。'
+      + 'cPanel → MySQL® Databases → Add User To Database 把 DB_USER 加到 DB_NAME 上并给 ALL PRIVILEGES。';
+  }
+  if (/Unknown database|ER_BAD_DB_ERROR/i.test(err)) {
+    return '库名不对或库还没建：cPanel → MySQL® Databases 确认 DB_NAME 那个库存在，且环境变量里的名字一模一样。';
+  }
+  if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND/i.test(err)) {
+    return '连不上 MySQL：DB_HOST 用 `127.0.0.1`（不是 localhost，也不是外网地址），DB_PORT 用 3306。';
+  }
+  if (/EADDRINUSE/i.test(err)) {
+    return '端口被占用：八成是你在环境变量里填了 PORT。删掉它 —— Passenger 会通过 process.env.PORT 把端口交给你。';
+  }
+  if (/ERR_REQUIRE_ESM|Cannot use import statement|Unexpected token/i.test(err)) {
+    return 'Node 版本或模块格式不兼容：换一个 Node.js version（推荐 20.x LTS）后 Restart。';
+  }
+  return '看完整日志：cPanel → Setup Node.js App → 该应用 → 日志，或 File Manager 打开 Application root 下的 stderr.log。'
+    + '确认已 Run NPM Install、Startup file = src/index.js、然后 Restart。';
+}
+
 if (!JSON_OUT) {
   console.log(`\n${C.bold}=== F&B POS 部署自检 ===${C.reset}`);
   console.log(`目标：${C.cyan}${base}${C.reset}\n`);
@@ -89,6 +138,28 @@ if (!JSON_OUT) {
 // Node 的 SPA fallback 会把任何非 /api 路径都返回 index.html，
 // 所以「200」不等于「文件被公开」——必须比对响应体。
 const looksLikeSpa = (body) => /<div id="root">/.test(body);
+
+// 应用日志要早读：503 时它是唯一能说清原因的地方。
+const appLog = await fetchAppLog();
+const appLogErr = appLog ? lastErrorOf(appLog.body) : '';
+
+// ---- 0. 先定 doc root：不依赖首页长什么样 -------------------------------
+// 判据是「哪一组源码路径能取到真文件」：
+//   /src/index.js 取到 → doc root 已经是 server/
+//   /server/src/index.js 取到 → doc root 还是仓库根
+// 这样即使首页是 503 / SPA / 目录列表，判定都成立。
+const isRealFile = (r) => r.ok && r.status === 200 && r.body.trim().length > 10
+  && !looksLikeSpa(r.body) && !/^\s*<!doctype html>/i.test(r.body);
+
+async function detectDocRoot() {
+  const fromListing = guessDocRoot((await get('/')).body);
+  const [serverSide, repoRootSide] = [await get('/src/index.js'), await get('/server/src/index.js')];
+  if (isRealFile(serverSide) && !isRealFile(repoRootSide)) return 'server';
+  if (isRealFile(repoRootSide) && !isRealFile(serverSide)) return 'repo-root';
+  return fromListing || 'unknown';
+}
+const docRoot = await detectDocRoot();
+const atServerRoot = docRoot === 'server';
 
 // ---- 1. 首页：是 SPA 还是目录列表？ -------------------------------------
 const home = await get('/');
@@ -99,26 +170,39 @@ if (!home.ok) {
 } else {
   const isSpa = looksLikeSpa(home.body);
   const isAutoindex = /Index of \//i.test(home.body);
-  const isPassengerErr = /Passenger|Application error|Internal Server Error/i.test(home.body);
   if (isSpa) {
     record('home', '首页返回前端 SPA', 'pass', `${home.status} · ${home.body.length}B · 含 id="root"`);
   } else if (isAutoindex) {
-    const where = guessDocRoot(home.body);
-    const label = where === 'repo-root' ? '仓库根' : where === 'server' ? 'server/ 目录（这一层是对的）' : '未知目录';
+    const label = docRoot === 'repo-root' ? '仓库根' : docRoot === 'server' ? 'server/ 目录（这一层是对的）' : '未知目录';
     record('home', '首页返回前端 SPA', 'fail',
       `${home.status} · 返回 LiteSpeed 目录列表「Index of /」—— 它列的是 ${label}`,
-      docRootHint(home.body));
-  } else if (isPassengerErr) {
-    record('home', '首页返回前端 SPA', 'fail', `${home.status} · 返回 Passenger/服务器错误页`, '看 cPanel → Setup Node.js App → 日志；确认 npm install 已跑、点过 Restart。');
+      docRoot === 'server' ? NO_APP_HINT : DOC_ROOT_HINT);
+  } else if (home.status === 502 || home.status === 503) {
+    record('home', '首页返回前端 SPA', 'fail',
+      `${home.status} · Passenger 代理已生效，但 Node 进程没起来`
+      + (appLogErr ? ` —— 应用日志：${appLogErr}` : ''),
+      appLogErr ? adviceFor(appLogErr) : adviceFor());
   } else {
     record('home', '首页返回前端 SPA', 'warn', `${home.status} · ${home.body.length}B · 既不是 SPA 也不是目录列表`, '把响应体存下来看看是什么。');
   }
 }
 
+// ---- 1.5 应用日志有没有被公开 -------------------------------------------
+if (appLog) {
+  record('applog', '应用日志未公开', 'fail',
+    `GET ${appLog.path} 可被公网直接下载（${appLog.body.length}B）—— 最后一条错误：${appLogErr}`,
+    'Passenger 把 stderr 写在 Application root 下，而 Application root 就是 doc root，所以日志文件能被直接读取。'
+    + '它通常只有堆栈，但一旦打印出数据库报错就可能带出凭据，也会泄露服务器绝对路径。'
+    + '要挡住它需要主机侧配合（把日志指到 doc root 之外），详见 DEPLOY.md。');
+} else {
+  record('applog', '应用日志未公开', 'pass', `${APP_LOG_PATHS.join(' / ')} 均不可直连`);
+}
+
 // ---- 2. API 健康检查：请求有没有到 Node？ -------------------------------
 const health = await get('/api/health');
 if (!health.ok) {
-  record('health', 'API 健康检查 /api/health', 'fail', `请求失败：${health.error}`, DOC_ROOT_HINT);
+  record('health', 'API 健康检查 /api/health', 'fail', `请求失败：${health.error}`,
+    atServerRoot ? NO_APP_HINT : DOC_ROOT_HINT);
 } else {
   let json = null;
   try { json = JSON.parse(health.body); } catch { /* 非 JSON */ }
@@ -130,17 +214,17 @@ if (!health.ok) {
       docRootHint(home.body));
   } else if (health.status === 502 || health.status === 503) {
     record('health', 'API 健康检查 /api/health', 'fail',
-      `${health.status} · Passenger 代理到了但 Node 没起来`,
-      'cPanel → Setup Node.js App：确认 Application root = server/、Startup file = src/index.js、环境变量已填、已 npm install，然后 Restart。');
+      `${health.status} · Passenger 代理到了，但 Node 进程没起来`
+      + (appLogErr ? ` —— 应用日志：${appLogErr}` : '（读不到应用日志）'),
+      appLogErr ? adviceFor(appLogErr) : adviceFor());
   } else {
     record('health', 'API 健康检查 /api/health', 'warn', `${health.status} · ${health.body.slice(0, 120)}`, '期望 200 + {"ok":true}。');
   }
 }
 
 // ---- 3. 源码有没有被公开？ ---------------------------------------------
-// 探测路径要跟着 doc root 走：doc root 是仓库根时源码在 /server/src/，
+// 探测路径跟着 doc root 走：doc root 是仓库根时源码在 /server/src/，
 // doc root 已经是 server/ 时源码直接落在 /src/。
-const atServerRoot = guessDocRoot(home.body) === 'server';
 const srcProbes = atServerRoot
   ? ['/package.json', '/src/index.js', '/src/db.js']
   : ['/DEPLOY.md', '/package.json', '/server/src/index.js', '/docker-compose.yml'];
@@ -148,7 +232,7 @@ const srcProbes = atServerRoot
 const exposed = [];
 for (const p of srcProbes) {
   const r = await get(p);
-  if (r.ok && r.status === 200 && r.body.trim() && !sameAsHome(r.body) && !looksLikeSpa(r.body)) exposed.push(p);
+  if (isRealFile(r) && !sameAsHome(r.body)) exposed.push(p);
 }
 if (exposed.length === 0) {
   record('expose', '源码未被公开', 'pass', `${srcProbes.length} 个探测路径均不可直连`);
@@ -156,7 +240,8 @@ if (exposed.length === 0) {
   record('expose', '源码未被公开', 'fail',
     `源码可被公网直接下载：${exposed.join('、')}`,
     atServerRoot
-      ? 'Document Root 已经是 server/ 了，所以 src/ 直接落在 web 根下。把 Node 应用建起来后 Passenger 会接管全部请求，这一项自动消失。'
+      ? 'Document Root 是 server/，所以 src/ 落在 web 根下；而 Node 进程没起来时 Passenger 不接管，'
+        + 'LiteSpeed 就把这些文件直接吐出来。Node 跑起来后这一项自动消失。'
       : '同一个根因：Document Root 指到了仓库根。改对之后自然消失；改之前先 git pull 拿到仓库根的 .htaccess（含 Options -Indexes）。');
 }
 
@@ -214,8 +299,8 @@ if (sio.ok && sio.status === 200 && /^0\{/.test(sio.body.trim())) {
   record('socket', 'Socket.IO 端点可握手', 'pass', 'GET /socket.io/?EIO=4&transport=polling → 0{...}');
 } else {
   record('socket', 'Socket.IO 端点可握手', 'fail',
-    sio.ok ? `${sio.status} · ${sio.body.slice(0, 80)}` : sio.error,
-    '和 /api/health 同源问题：请求没到 Node。');
+    sio.ok ? `${sio.status} · ${sio.body.replace(/\s+/g, ' ').slice(0, 80)}` : sio.error,
+    appLogErr ? adviceFor(appLogErr) : '和 /api/health 同源问题：请求没到 Node。');
 }
 
 // ---- 汇总 ---------------------------------------------------------------
@@ -230,20 +315,15 @@ if (JSON_OUT) {
     console.log(`${C.green}全部通过 —— 站点已按预期由 Node 托管（API + Socket.IO + 前端）。${C.reset}\n`);
   } else {
     console.log(`${fails.length} 项失败 / ${warns.length} 项警告\n`);
+    if (appLogErr) {
+      console.log(`${C.bold}${C.red}应用日志（${appLog.path}）最后一条错误：${C.reset}`);
+      console.log(`  ${appLogErr}\n`);
+      console.log(`${C.bold}→ ${C.reset}${adviceFor(appLogErr)}\n`);
+    }
     if (fails.length) {
       const steps = atServerRoot
         ? [
-          [
-            'cPanel → Software → Setup Node.js App → CREATE APPLICATION（目录里还没有 Node 应用）：',
-            '   · Node.js version：选最新的 LTS（20.x / 22.x；只有 16.x 也能跑，本项目没用新语法）',
-            '   · Application mode：Production',
-            '   · Application root：server 目录，相对家目录（若仓库在 public_html/fnb 下 → public_html/fnb/server）',
-            `   · Application URL：下拉框选 ${base.replace(/^https?:\/\//, '')}，右侧路径框留空`,
-            '   · Application startup file：src/index.js',
-            '   · Environment variables：DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME /',
-            '     JWT_SECRET / CLIENT_ORIGIN（不要填 PORT，Passenger 会自己给；不要填 DEV_NO_DB）',
-            '   · 点 CREATE → 回到该应用点 Run NPM Install → 再点 Restart',
-          ].join('\n'),
+          appLogErr ? `先解决应用起不来的问题 —— ${adviceFor(appLogErr)}` : NO_APP_HINT,
           'Document Root 已经是 server/ 了，不用再改。',
           'cPanel → LiteSpeed Web Cache Manager → Flush All。',
           '服务器上 cd <Application root> && git pull && npm install，再 Restart。',

@@ -89,7 +89,7 @@ Node.js Selector，需要开工单让主机打开。）
 | --- | --- | --- |
 | **Node.js version** | 下拉里**最新的 LTS**（20.x / 22.x）。只有 `16.20.2` 也能跑 —— 本项目没用 Node 17+ 的新语法，依赖（express 4 / socket.io 4 / mysql2 3 / helmet 7 / zod 3）都支持 16 | 16 已 EOL，能用但不推荐 |
 | **Application mode** | **Production** | 它只负责设 `NODE_ENV`；本项目代码不读 `NODE_ENV`，但 Production 会跳过 devDependencies，更干净 |
-| **Application root** | `server` 目录，**相对家目录**。若仓库在 `public_html/fnb` 下 → `public_html/fnb/server` | cPanel 官方文档原话：*the entry will be appended to `/home/username`*。所以**不要**填 `/home/...` 全路径，也不要以 `/` 开头 |
+| **Application root** | `server` 目录，**相对家目录**。若仓库在 `public_html/fnb` 下 → `public_html/fnb/server` | cPanel 官方文档原话：*the entry will be appended to `/home/username`*。所以**不要**填 `/home/...` 全路径，也不要以 `/` 开头。本项目的实际值：`public_html/fnb/server`（绝对路径 `/home/beyourdi/public_html/fnb/server`） |
 | **Application URL** | 下拉框**必须换成 `fnb.beyourdiary.com`**，右侧路径框**留空** | 下拉默认选中的是 `beyourdiary.com` —— 不换就等于把主域名劫持到这个应用上 |
 | **Application startup file** | `src/index.js` | Passenger 的入口，相对 Application root |
 | **Environment variables** | 见下表，点 **ADD VARIABLE** 逐个加 | |
@@ -186,6 +186,30 @@ Node.js Selector，需要开工单让主机打开。）
 生产前务必改密码（`server/src/seed.js` 里，或直接在数据库 `users` 表改 `password_hash`）。
 
 ## 常见问题
+- **打开域名是 503（`Service Unavailable`，LiteSpeed 那个大白页）**：
+  **这是好消息** —— 说明 Passenger 代理已经生效了，只是 Node 进程起不来。
+  唯一能说清原因的地方是 **Application root 下的 `stderr.log`**，它同时也是公网可读的
+  （见下方「日志被公开」），所以你可以直接看：
+  ```bash
+  curl -s https://fnb.beyourdiary.com/stderr.log | tail -30
+  ```
+  最常见的两条：
+  - `Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'X'` → **依赖没装**。
+    cPanel → Setup Node.js App → 该应用 → **Run NPM Install**；报错就用 Terminal：
+    ```bash
+    cd ~/public_html/fnb/server && npm install --workspaces=false
+    ```
+    （`--workspaces=false` 很重要：仓库根是个 npm workspaces 单仓，不加这个参数 npm 会
+    连 `apps/web` 的 vite/react 一起装，又慢又没必要。）
+  - `Access denied for user ...` → MySQL 用户/密码不对，或该用户没被授权给这个库。
+  改完点 **Restart**，再跑 `npm run deploy:check`。
+- **`https://<域名>/stderr.log` 能被公网直接下载**：
+  Passenger 把应用的 stderr 写在 **Application root** 下，而 Application root 就是 Document Root，
+  所以这个日志文件能被直接读取。它会泄露**服务器绝对路径**（如 `/home/<用户>/...`）和完整堆栈；
+  目前里面只有堆栈、没有口令，但**一旦应用打印出数据库报错就可能带出凭据**。
+  挡住它需要主机侧配合（把 Passenger 日志指到 Document Root 之外，例如设
+  `PassengerAppLogFile /home/<用户>/logs/fnb-app.log`），或在应用能正常跑起来后
+  请主机确认是否可关闭日志目录的直读。自检脚本的「应用日志未公开」那一项会持续盯着它。
 - **Document Root 改对了，但打开域名还是 "Index of /"，而且列表里只有 `public` `src` `package.json`**：
   这是**第二个坑**，和第一个坑长得像但原因完全不同 —— 目录列表已经停在 `server/` 这一层了，
   说明 Document Root 是**对的**；缺的是**Node 应用本身**：cPanel 里压根还没建这个 App，
