@@ -3,11 +3,33 @@
 #
 # Without this, LiteSpeed happily lists apps/, deploy/, scripts/, server/,
 # DEPLOY.md, docker-compose.yml, package.json to the whole internet
-# (this has happened — see screenshot of "Index of /" at fnb.beyourdiary.com).
+# (this has happened — see "Index of /" at fnb.beyourdiary.com).
 #
 # The PROPER fix is to change the domain Document Root to `server/` in
 # cPanel → Domains → Manage (see DEPLOY.md → "看到 Index of /"). This .htaccess
-# only stops the directory listing while you fix that; it does NOT proxy to
-# the Node App — the cPanel-generated proxy lives in `server/.htaccess`.
+# only stops the directory listing and source-code download while you fix that;
+# it does NOT proxy to the Node App — the cPanel-generated proxy lives in
+# `server/.htaccess`, which is only read once the Document Root is correct.
+#
+# Verify with:  npm run deploy:check
+#
+# NOTE: this file is only honoured when the Document Root IS the repo root.
+# Once you fix the Document Root, Apache never reads this file and it is inert.
 
+# 1) 关掉目录列表（"Index of /"）
 Options -Indexes
+
+# 2) 挡住源码 / 配置 / 脚本的直连下载。
+#    只禁具体路径，不做全站拦截，避免误伤。
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # 源码与依赖目录
+  RewriteRule ^(apps|scripts|deploy|node_modules)(/|$) - [F,L]
+  RewriteRule ^server/(src|node_modules)(/|$) - [F,L]
+
+  # 仓库根的各种说明 / 配置文件
+  RewriteRule ^(DEPLOY|README)\.md$ - [F,L]
+  RewriteRule ^(package(-lock)?\.json|docker-compose\.ya?ml)$ - [F,L]
+  RewriteRule ^\.(env|git|gitignore) - [F,L]
+</IfModule>

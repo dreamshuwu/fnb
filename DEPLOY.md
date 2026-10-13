@@ -18,6 +18,65 @@
 
 ---
 
+## 0. 先拿到 Application root 的绝对路径
+
+Document Root 那一栏要的是**绝对路径**。三种拿法，任选一种：
+
+**方法 1（最准，推荐）** —— cPanel → **Setup Node.js App** → 点开该应用 →
+页面上 **Application root** 那一栏显示的就是绝对路径，例如 `/home/beyourdi/fnb-pos/server`。
+**直接复制这一串**，粘到 Document Root 里。
+
+**方法 2（Terminal）** —— cPanel → **Terminal**（或 SSH），粘这一行：
+
+```bash
+find ~ -maxdepth 5 -type d -path '*/fnb-pos/server' 2>/dev/null | head -1 | sed 's/^/Document Root 填这个: /'
+```
+
+输出形如 `Document Root 填这个: /home/beyourdi/fnb-pos/server` —— 冒号后面整串复制走。
+
+**方法 3（File Manager）** —— cPanel → **File Manager** → 进入 `fnb-pos/server`，
+地址栏 / 顶部路径面包屑显示的就是绝对路径。
+
+> **填错的样子**：填成 `server`、`fnb-pos/server`、`public_html/fnb-pos/server` 都算错。
+> cPanel 会把相对路径拼到 `public_html` 下面，得到 `/home/<用户>/public_html/fnb-pos/server` 这种
+> 根本不存在的位置，于是又回到「Index of /」。
+>
+> 如果 cPanel 拒绝绝对路径（少数老版本只收相对 `public_html` 的路径），用软链绕过：
+> ```bash
+> ln -s ~/fnb-pos/server ~/public_html/fnb-app
+> ```
+> 然后把 Document Root 填 `public_html/fnb-app`。
+
+---
+
+## 0.5 改完之后怎么自证（一条命令）
+
+仓库自带自检脚本，**只读探测、不写任何东西**：
+
+```bash
+npm run deploy:check
+# 或指定域名 / 输出 JSON
+node scripts/deploy-check.mjs https://fnb.beyourdiary.com
+node scripts/deploy-check.mjs https://fnb.beyourdiary.com --json
+```
+
+它逐项判定，全绿则退出码 0（可以挂 CI）：
+
+| 检查项 | 通过条件 | 挂了说明什么 |
+| --- | --- | --- |
+| 首页返回前端 SPA | `/` 返回含 `id="root"` 的页面 | 返回「Index of /」→ Document Root 指到了仓库根 |
+| API 健康检查 | `/api/health` → `{"ok":true}` | 404 = 请求根本没到 Node；502/503 = 代理到了但 Node 没起来 |
+| 仓库根未被公开 | `/DEPLOY.md`、`/package.json`、`/server/src/index.js` 取不到源码 | Document Root 指错，源码在公网上 |
+| 前端没有被埋在子目录 | `/server/public/index.html` 不是真 index.html | 前端在 `/server/public/` 下，子目录里永远加载不出来（它引用根绝对路径 `/assets/*.js`） |
+| 前端 JS/CSS 可加载 | index.html 引用的 `/assets/*` 全部 200 | doc root 不对，或前端产物没传上去 |
+| 线上前端与本地构建一致 | asset hash 与本地 `server/public` 相同 | 线上跑的是旧构建 → 服务器要 `git pull` |
+| Socket.IO 端点可握手 | `0{...}` | 同 `/api/health`，请求没到 Node |
+
+**唯一的判定标准**：`https://fnb.beyourdiary.com/api/health` 返回 `{"ok":true}`。
+这一条过了，其余基本都是通的。
+
+---
+
 ## 方案 A（推荐）：一体化部署，一个 Node App 托管一切
 1. 把仓库代码放到 cPanel（git clone 或上传）。重点是里面的 `server/` 目录。
    - `server/public/` 已经包含构建好的前端（由 CI/本地 `npm run build` 生成并随仓库发布），
@@ -30,6 +89,8 @@
 3. **⚠️ 把域名的 Document Root 也指到 `server/`**（这是最容易踩的坑 —— 见下方"看到 Index of /"）。
    cPanel → **Domains** → 找到 `fnb.beyourdiary.com` → **Manage** → 把
    **Document Root** 改成 `/home/<你的cPanel用户>/fnb-pos/server`（即 Application root 的绝对路径）。
+   **这一栏必须填绝对路径（以 `/` 开头）**，不能填 `server` 或 `fnb-pos/server` 这种相对写法 ——
+   绝对路径怎么拿见下方「0. 先拿到 Application root 的绝对路径」。
    改完后再到 Node.js App 页面点一次 **Restart**，让 cPanel 把代理 `.htaccess` 重新写到正确的 document root。
 4. 在该应用的 **Environment Variables** 里填：
    - `DB_HOST=127.0.0.1`  `DB_PORT=3306`  `DB_USER=beyourdi_cms`  `DB_PASSWORD=<密码>`  `DB_NAME=beyourdi_fnb`
@@ -88,9 +149,29 @@
      - 已 `npm install`、已点过 **Restart**
   3. cPanel → **LiteSpeed Web Cache Manager**（或 Cachewall）→ Flush All，清缓存后再访问。
   
-  应急缓解（在改 Document Root 之前）：仓库根已自带 `.htaccess`（含 `Options -Indexes`），
-  `git pull` 后即可立即阻止目录列表暴露公网 —— 但这只是止血，Node App 仍不会被代理，
+  应急缓解（在改 Document Root 之前）：仓库根已自带 `.htaccess`（`Options -Indexes` +
+  屏蔽 `apps/ scripts/ deploy/ node_modules/ server/src/ DEPLOY.md README.md package.json docker-compose.yml`），
+  `git pull` 后即可立即阻止目录列表与源码下载暴露公网 —— 但这只是止血，Node App 仍不会被代理，
   真正看到界面必须做完上面三步。
+  > 注意：这个文件**只有在 Document Root 是仓库根时才会被读到**；改对之后它就彻底失效、也无害。
+
+  **2026-10-13 实测证据**（`npm run deploy:check` 输出，可复现）：
+  | 请求 | 返回 | 含义 |
+  | --- | --- | --- |
+  | `GET /` | 200，LiteSpeed `Index of /`（列出 apps/deploy/scripts/server） | Document Root = 仓库根 |
+  | `GET /api/health` | **404**（LiteSpeed 自带错误页） | 请求没交给 Node，Passenger 完全没参与 |
+  | `GET /server/public/index.html` | 200，引用 `/assets/index-DCSPCojG.js` | 前端被埋在子目录，且引用根绝对路径 → 永远加载不出 |
+  | `GET /assets/index-DCSPCojG.js` | 404 | 印证上一条 |
+  | `GET /DEPLOY.md`、`/package.json`、`/server/src/index.js` | 200，**源码可公网下载** | 仓库根被公开 |
+  | `GET /.env`、`/.htaccess` | 403 | LiteSpeed 拦 dotfile，口令未泄露 |
+  | `/server/src/routes/` | 只有 8 个文件（本地 11 个） | 线上是 **9/28 的旧快照**，落后 9 个功能区块 |
+
+  最后一行说明：**改完 Document Root 之后，服务器还要 `git pull && npm install` + Restart**，
+  否则跑起来的仍是 9/28 那版代码。
+- **改了 Document Root 但没生效**：按顺序重来一遍 —— ① 先在 Node.js App 页面点 Restart（让 cPanel 把
+  代理 `.htaccess` 重新写到新的 document root）；② 再 Flush All 清 LiteSpeed 缓存；③ 浏览器硬刷新
+  （`Cmd/Ctrl+Shift+R`）；④ 重跑 `npm run deploy:check`。若仍是 `Index of /`，多半是绝对路径填错
+  （见「0. 先拿到 Application root 的绝对路径」里"填错的样子"）。
 - **页面打不开 / 一直转圈**：Node App 没起来。看 cPanel Node.js App 的日志；确认 `npm install` 已跑过、点过 Restart。
 - **登录报错 401 / 接口 404**：确认 Application URL 是域名根（方案 A），且 Document Root 已改为 `server/`（参见上一条）。
 - **数据库连不上**：确认 `beyourdi_cms` 已授权 `beyourdi_fnb`，且 `DB_HOST` 用 `127.0.0.1`（cPanel 内网）。
