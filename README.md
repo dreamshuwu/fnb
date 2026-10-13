@@ -11,8 +11,8 @@
 ## 快速开始(本地)
 
 ```bash
-# 1. 安装依赖(根目录,workspaces 会自动装 server 与 web)
-npm install
+# 1. 安装依赖(一条命令装齐根 / server / apps/web 三处)
+npm run install:all
 
 # 2. 准备一个本地 MySQL,建库 fnbpos,然后配置环境变量
 cp .env.example .env
@@ -21,6 +21,16 @@ cp .env.example .env
 # 3. 启动开发(后端 4000 + 前端 5173)
 npm run dev
 ```
+
+> **为什么不用 npm workspaces**:`server/` 要单独部署到 cPanel(共享主机),而 npm 的
+> workspaces 会把依赖装到**仓库根**的 `node_modules` 里 —— 那在 cPanel 的 Application root
+> **之外**,Node.js Selector 的 Run NPM Install 会直接失败。所以三个包各自独立安装,
+> 根脚本用 `npm --prefix <dir>` 转发。改 `package.json` 的 scripts 时请沿用这个写法。
+> 只装某一个:`npm --prefix server install` / `npm --prefix apps/web install`。
+>
+> 若 `npm run build` / `npm run dev` 报 `vite: command not found`,说明该包的
+> `node_modules/.bin` 软链没建起来(常见于把 node_modules 从别处拷来、或安装被中断),
+> 重新 `npm --prefix apps/web install` 即可。
 
 - 首次启动会自动建表 + 写入演示组织/门店与 5 个账号(见 `server/src/seed.js`)。
 - 后端使用 **MySQL**,不再依赖 MongoDB。

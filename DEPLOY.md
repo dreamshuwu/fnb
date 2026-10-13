@@ -119,6 +119,32 @@ Node.js Selector，需要开工单让主机打开。）
 
 然后重跑 `npm run deploy:check`。
 
+### ⚠️ 如果 Run NPM Install 报「An error occured during installation of modules」
+
+这是**本项目历史上真实踩过的坑**，根因是 **npm workspaces**：
+
+仓库根 `package.json` 曾经声明了 `workspaces: ["server","apps/web"]`。在 `server/` 里跑
+`npm install` 时，npm 会向上识别出「workspace 根在 `../`」，于是把 `node_modules` 和
+`package-lock.json` 装到**仓库根** `~/public_html/fnb/` —— 那在 cPanel 的 **Application root 之外**。
+Node.js Selector 只允许在应用目录内安装，于是直接失败，而且**两边都不留 `node_modules`**，
+表现就是应用一直起不来（`stderr.log` 里是 `Cannot find package 'dotenv'`）。
+
+**已修复**：根 `package.json` 去掉了 `workspaces`，三个包各自独立安装；根脚本改用
+`npm --prefix <dir>` 转发。所以现在 `server/` 里**裸跑 `npm install` 就会装进 `server/node_modules`**，
+cPanel 的按钮也能正常工作。
+
+**服务器上要做的**：先 `git pull` 拿到这个修复，再 Run NPM Install。
+
+```bash
+git -C ~/public_html/fnb pull
+cd ~/public_html/fnb/server && npm install --no-audit --no-fund
+```
+
+> 万一还没 pull、想临时绕过：`npm install --workspaces=false` 也能把包装进 `server/node_modules`
+> （已验证有效）。注意**不能用环境变量** `NPM_CONFIG_WORKSPACES=false` —— npm 会同时注入
+> `--workspace`，两者冲突直接报错；`.npmrc` 里写 `workspaces=false` 也会被 npm 忽略
+> （`npm warn config ignoring workspace config`）。
+
 > **Document Root 与 Application root 的关系**：cPanel 会把 Passenger 代理指令自动写进
 > **Application root 的 `.htaccess`**。只有 Document Root 也指向同一个目录，这份 `.htaccess`
 > 才会被读到，代理才生效 —— 这就是「两个 root 必须一致」的根本原因。
@@ -197,10 +223,11 @@ Node.js Selector，需要开工单让主机打开。）
   - `Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'X'` → **依赖没装**。
     cPanel → Setup Node.js App → 该应用 → **Run NPM Install**；报错就用 Terminal：
     ```bash
-    cd ~/public_html/fnb/server && npm install --workspaces=false
+    git -C ~/public_html/fnb pull          # 先拿到 workspaces 修复
+    cd ~/public_html/fnb/server && npm install --no-audit --no-fund
     ```
-    （`--workspaces=false` 很重要：仓库根是个 npm workspaces 单仓，不加这个参数 npm 会
-    连 `apps/web` 的 vite/react 一起装，又慢又没必要。）
+    若还没 pull，临时用 `npm install --workspaces=false` 也行 —— 原因见上文
+    「如果 Run NPM Install 报 An error occured during installation of modules」。
   - `Access denied for user ...` → MySQL 用户/密码不对，或该用户没被授权给这个库。
   改完点 **Restart**，再跑 `npm run deploy:check`。
 - **`https://<域名>/stderr.log` 能被公网直接下载**：
